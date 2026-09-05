@@ -191,6 +191,7 @@ export interface SourceView {
   config: {
     urls?: string[];
     feed_url?: string;
+    content_mode?: "feed" | "full_new_items";
     endpoint?: string;
     /** github_issues：owner/name */
     repo?: string;
@@ -210,6 +211,14 @@ export interface SourceView {
   last_sync_added: number;
   doc_count: number;
   missing_count: number;
+  rss_full_content_state: "pending" | "active" | "disabled" | null;
+  rss_full_content_generation: number | null;
+  rss_full_content_baseline_count: number | null;
+  rss_full_content_pending_count: number;
+  rss_full_content_queued_count: number;
+  rss_full_content_retrying_count: number;
+  rss_full_content_complete_count: number;
+  rss_full_content_terminal_count: number;
 }
 
 export interface SearchResult {
@@ -308,16 +317,65 @@ export interface ChunkFact {
  *
  * `premises` 是这一档存在的理由：不给出前提的话，一条派生边跟一条普通的边
  * 在界面上看不出区别，而那正是「推理污染知识」的样子。 */
+/** 一条条件：这个属性、这样比、跟这个值比 */
+export interface RuleCondition {
+  predicate_id: string;
+  /** gt | gte | lt | lte | between | in | present */
+  op: string;
+  /** 数字 / [lo,hi] / 字符串数组；present 不带 */
+  operand?: unknown;
+  predicate_label?: string;
+}
+
+export interface RuleInput {
+  name: string;
+  description?: string;
+  subject_type_id: string;
+  /** typing = 推出一个类；attribute = 推出一个属性值 */
+  conclusion: "typing" | "attribute";
+  conclude_type_id?: string;
+  conclude_predicate_id?: string;
+  conclude_value?: unknown;
+  conditions: RuleCondition[];
+}
+
+/** 一条规则标住的一个实体，连同让它成立的那几条读数 */
+export interface RuleMatch {
+  derived_id: string;
+  entity_id: string;
+  entity: string;
+  concluded: string | null;
+  valid_from: string | null;
+  valid_to: string | null;
+  /** 「全烃 = 12.3」这种可读形态，按前提顺序 */
+  premises: string[];
+}
+
+export interface BusinessRule extends RuleInput {
+  id: string;
+  enabled: boolean;
+  subject_label: string;
+  conclude_type_label: string | null;
+  conclude_predicate_label: string | null;
+  /** 此刻凭它成立的结论条数 */
+  derived_count: number;
+  /** 上次跑的时候有几个实体的读数组合没展开完。**大于零就意味着少推了** */
+  capped: number;
+}
+
 export interface DerivedFact {
   id: string;
   subject_id: string;
   subject: string;
-  object_id: string;
+  /** 字面值结论（规则推出的归类与属性）没有实体宾语 */
+  object_id: string | null;
   object: string;
   predicate: string;
   /** 靠哪条规则推的 */
   /** 靠哪条规则推的。后两种是 0017 补上的跨谓词规则 */
-  rule: "transitive" | "symmetric" | "inverse" | "sub_property";
+  rule: "transitive" | "symmetric" | "inverse" | "sub_property" | "business";
+  /** 业务规则的名字。公理推的为 null——公理没有名字 */
+  rule_name?: string | null;
   valid_from: string | null;
   valid_to: string | null;
   confidence: number;
@@ -638,6 +696,42 @@ export interface ReviewHistoryEvent {
   created_at: string;
 }
 
+/** 一档队列里等着的：多少条、最老的一条从什么时候起等（空队列是 null） */
+export interface QueueWait {
+  count: number;
+  oldest_at: string | null;
+}
+
+/** 一个时间窗口里的决定 */
+export interface DecidedWindow {
+  total: number;
+  /** 其中台账上没有 actor 的——AI 裁决器自己办的 */
+  automatic: number;
+  by_action: { action: string; count: number }[];
+  /** actor_id 为 null 的一行是裁决器；label 是台账里的身份快照 */
+  by_actor: { actor_id: string | null; label: string | null; count: number }[];
+}
+
+/** 审核台总览（#377）：等着办的、办过的、库的成色。与左栏计数同一套口径 */
+export interface ReviewSummary {
+  waiting: Record<
+    "pending" | "duplicates" | "conflicts" | "unconfirmed" | "lowconf" | "violations" | "defects",
+    QueueWait
+  >;
+  decided: {
+    last_7d: DecidedWindow;
+    last_30d: DecidedWindow;
+    /** 近 14 天，一天一条，含零 */
+    daily: { day: string; count: number }[];
+  };
+  health: {
+    facts: number;
+    low_confidence: number;
+    unconfirmed: number;
+    contested: number;
+  };
+}
+
 export interface MergeLog {
   id: string;
   source_name: string;
@@ -669,6 +763,11 @@ export interface GraphEdge {
   premises: string[];
   valid_from: string | null;
   valid_to: string | null;
+  /** **读出来的**区间（0022）：没起点的事实从最早的证据起，结束了不知哪天的到说出
+   *  它的那份文档为止。滑杆按这两个过滤；上面那两个是原文说了什么，只用来显示。
+   *  前端不自己解释 NULL——规则只在服务端的 world_axis 里有一份 */
+  holds_from: string | null;
+  holds_to: string | null;
   confidence: number;
   /** 有争议（0017 §3）：有一条 open 的公理违规或时态冲突指着它。整条边画成警戒色 */
   contested: boolean;
@@ -693,6 +792,9 @@ export interface EntityFact {
   object_value: Record<string, unknown> | null;
   valid_from: string | null;
   valid_to: string | null;
+  /** 读出来的区间（0022），与 GraphEdge 同义：「此刻成立」按它判 */
+  holds_from: string | null;
+  holds_to: string | null;
   valid_from_precision: string | null;
   /** year | month | day，外加 unknown = 原文说它结束了但没说哪天 */
   valid_to_precision: string | null;
@@ -823,6 +925,37 @@ export interface OntologyMiss {
   key: string;
   example: string | null;
   count: number;
+}
+
+/** 一条谓词的一端挂着两个以上开放值（#341）。
+ *
+ *  本体自己长出来的库里没人声明过唯一性，于是接任不闭合前任：两条 `leads`
+ *  都开着，"六月谁在管"两个都答。引擎不自动推断这个公理（它驱动账本改写），
+ *  所以只能把证据摆出来问人。 */
+export interface UniquenessCandidate {
+  predicate_id: string;
+  key: string;
+  label: string;
+  kind: string;
+  /** subject = 主语侧（functional）；object = 宾语侧（inverse functional） */
+  side: "subject" | "object";
+  axiom: "functional" | "inverse_functional";
+  /** 已经声明过、只是还没对过账（导入的，或声明之前就在的行） */
+  declared: boolean;
+  holders: number;
+  open_facts: number;
+  /** 对账会闭合几条，几条拿不准要进人审 */
+  would_close: number;
+  would_review: number;
+  examples: {
+    holder: string;
+    values: {
+      fact_id: string;
+      name: string | null;
+      valid_from: string | null;
+      confidence: number;
+    }[];
+  }[];
 }
 
 /** `description` 与 `reason` 不是一回事：description 逐字进抽取提示词，是模型判断
@@ -1477,6 +1610,52 @@ export const api = {
   readiness: (kbId: string) =>
     request<Readiness>(`/api/v1/kbs/${kbId}/readiness`),
 
+  /* ---- 业务规则（0021 / #277）：人写下的判据，引擎按物化的节奏跑 ---- */
+  rules: (kbId: string) =>
+    request<{ rules: BusinessRule[] }>(`/api/v1/kbs/${kbId}/rules`),
+  createRule: (kbId: string, body: RuleInput) =>
+    request<{ id: string }>(`/api/v1/kbs/${kbId}/rules`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateRule: (
+    kbId: string,
+    ruleId: string,
+    body: {
+      name?: string;
+      description?: string;
+      enabled?: boolean;
+      conditions?: RuleCondition[];
+      /** 结论整组替换：三格互相定义，只改一格会留下半截状态 */
+      conclusion?: "typing" | "attribute";
+      conclude_type_id?: string;
+      conclude_predicate_id?: string;
+      conclude_value?: unknown;
+    },
+  ) =>
+    request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/rules/${ruleId}`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  /** 一条规则此刻标了谁。规则卡片上那个数字点开就是它 */
+  ruleMatches: (kbId: string, ruleId: string, page = 0, per = 20) =>
+    request<{ matches: RuleMatch[]; total: number }>(
+      `/api/v1/kbs/${kbId}/rules/${ruleId}/matches?page=${page}&per=${per}`,
+    ),
+  deleteRule: (kbId: string, ruleId: string) =>
+    request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/rules/${ruleId}`, {
+      method: "DELETE",
+    }),
+  /** 立刻跑一遍。物化默认一小时一轮，而写规则的人想马上看见它推出了什么 */
+  runRules: (kbId: string) =>
+    request<{
+      rules: number;
+      hits: number;
+      capped: number;
+      inserted: number;
+      invalidated: number;
+    }>(`/api/v1/kbs/${kbId}/rules/run`, { method: "POST" }),
+
   entityHistory: (kbId: string, entityId: string, page: number, per = 30) =>
     request<{ events: EntityHistoryEvent[]; total: number }>(
       `/api/v1/kbs/${kbId}/entities/${entityId}/history?page=${page}&per=${per}`,
@@ -1562,6 +1741,19 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  /** 一端挂着两个以上开放值的谓词（#341）：本体没人声明唯一性时接任不闭合前任 */
+  uniquenessCandidates: (kbId: string) =>
+    request<{ candidates: UniquenessCandidate[] }>(
+      `/api/v1/kbs/${kbId}/ontology/uniqueness`,
+    ),
+
+  /** 补上声明之后把已经在账上的开放行对一遍。声明本身走 updateRelationType */
+  reconcileRelationType: (kbId: string, id: string) =>
+    request<{ corrected: number; conflicts: number }>(
+      `/api/v1/kbs/${kbId}/ontology/relation-types/${id}/reconcile`,
+      { method: "POST" },
+    ),
+
   updateRelationType: (
     kbId: string,
     id: string,
@@ -1895,6 +2087,8 @@ export const api = {
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/merges/${mergeId}/revert`, {
       method: "POST",
     }),
+  reviewSummary: (kbId: string) =>
+    request<ReviewSummary>(`/api/v1/kbs/${kbId}/review/summary`),
   reviewHistory: (kbId: string, page: number, per = 20) =>
     request<{ events: ReviewHistoryEvent[]; total: number }>(
       `/api/v1/kbs/${kbId}/review/history?page=${page}&per=${per}`,

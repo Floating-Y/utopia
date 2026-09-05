@@ -1,9 +1,14 @@
-/* Utopia UI 组件库 — 页面只用这里的组件与 styles.css 语义类，不写颜色字面量。 */
-import { useEffect, useRef, useState } from "react";
+/* Utopia UI 组件库 — 页面只用这里的组件与 styles.css 语义类，不写颜色字面量。
+   规矩在 web/DESIGN.md，守卫在 scripts/style-guard.mjs：字号五档、间距六档、
+   圆角两档、颜色只认令牌、状态（hover/focus/disabled/动效）只在这里定。
+   Dialog / DangerConfirm / Tooltip / Table / Field 各在自己的文件里，从这里再导出。 */
+import { forwardRef, useEffect, useRef, useState } from "react";
 import type {
   ButtonHTMLAttributes,
   InputHTMLAttributes,
   ReactNode,
+  SelectHTMLAttributes,
+  TextareaHTMLAttributes,
 } from "react";
 import {
   ArrowUpRight,
@@ -49,39 +54,166 @@ export function cn(...parts: (string | false | null | undefined)[]): string {
   return parts.filter(Boolean).join(" ");
 }
 
-/* ---------- Button ---------- */
+/* ---------- Button ----------
+   四种变体：primary（白底黑字，一屏最多一个）、secondary（描边，默认的次要动作）、
+   ghost（无边框，行内动作与工具条）、danger（深红实底，不可逆的那一下）。
+   两个尺寸与 Input 同高，同一行里顶齐不靠页面调 py。 */
+export type ButtonVariant = "primary" | "secondary" | "ghost" | "danger";
 type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
-  variant?: "primary" | "ghost";
+  variant?: ButtonVariant;
   size?: "sm" | "md";
+  /** 文字左侧的图标（lucide，13 / 14 号） */
+  icon?: ReactNode;
+  /** 正在提交：禁用并告诉读屏器 */
+  busy?: boolean;
 };
 
-export function Button({
-  variant = "primary",
-  size = "md",
-  className,
-  ...props
-}: ButtonProps) {
+const BUTTON_VARIANT: Record<ButtonVariant, string> = {
+  primary: "u-btn-primary",
+  secondary: "u-btn-secondary",
+  ghost: "u-btn-quiet",
+  danger: "u-btn-danger",
+};
+
+export const Button = forwardRef<HTMLButtonElement, ButtonProps>(function Button(
+  {
+    variant = "secondary",
+    size = "md",
+    icon,
+    busy,
+    className,
+    disabled,
+    children,
+    type = "button",
+    ...props
+  },
+  ref,
+) {
   return (
     <button
+      ref={ref}
+      type={type}
       className={cn(
         "u-btn",
-        variant === "primary" ? "u-btn-primary" : "u-btn-ghost",
-        size === "sm" ? "px-3 py-1.5 text-xs" : "px-4 py-2 text-sm",
+        BUTTON_VARIANT[variant],
+        size === "sm" ? "u-btn-sm" : "u-btn-md",
+        className,
+      )}
+      disabled={disabled || busy}
+      aria-busy={busy || undefined}
+      {...props}
+    >
+      {icon && <span className="shrink-0">{icon}</span>}
+      {children}
+    </button>
+  );
+});
+
+/* 只有图标的按钮：正方形；`label` 同时是 aria-label 与 title——
+   没有可见文字的按钮必须有一个名字，这是无障碍的底线 */
+export const IconButton = forwardRef<
+  HTMLButtonElement,
+  ButtonHTMLAttributes<HTMLButtonElement> & {
+    label: string;
+    variant?: ButtonVariant;
+    size?: "sm" | "md";
+  }
+>(function IconButton(
+  { label, variant = "ghost", size = "md", className, type = "button", ...props },
+  ref,
+) {
+  return (
+    <button
+      ref={ref}
+      type={type}
+      aria-label={label}
+      title={label}
+      className={cn(
+        "u-btn",
+        BUTTON_VARIANT[variant],
+        size === "sm" ? "u-btn-icon-sm" : "u-btn-icon-md",
         className,
       )}
       {...props}
     />
   );
-}
+});
 
-/* ---------- Input / Select ---------- */
-export function Input({
-  className,
-  ...props
-}: InputHTMLAttributes<HTMLInputElement>) {
-  return (
+/* ---------- Input / Textarea / NativeSelect ---------- */
+type InputSize = { size?: "sm" | "md" };
+
+export const Input = forwardRef<
+  HTMLInputElement,
+  Omit<InputHTMLAttributes<HTMLInputElement>, "size"> &
+    InputSize & {
+      /** 左侧的语义图标（筛选框的放大镜）。给了它，className 落在外层容器上 */
+      icon?: ReactNode;
+    }
+>(function Input({ className, size = "md", icon, ...props }, ref) {
+  const control = (
     <input
-      className={cn("input-dark px-3 py-2 text-sm", className)}
+      ref={ref}
+      className={cn(
+        "input-dark",
+        size === "sm" ? "u-input-sm" : "u-input-md",
+        // 图标槽：图标离左内缘 8px，文字从 30px 起。左栏里的输入框（盒 12）
+        // 于是图标在 20、文字在 42，与左栏的行（图标 20、文字 42）同一条线
+        icon ? (size === "sm" ? "pl-7" : "pl-[30px]") : null,
+        icon ? "w-full" : className,
+      )}
+      {...props}
+    />
+  );
+  if (!icon) return control;
+  return (
+    <div className={cn("relative", className)}>
+      <span
+        className={cn(
+          "pointer-events-none absolute top-1/2 -translate-y-1/2 text-ink-3",
+          "left-2",
+        )}
+      >
+        {icon}
+      </span>
+      {control}
+    </div>
+  );
+});
+
+export const Textarea = forwardRef<
+  HTMLTextAreaElement,
+  TextareaHTMLAttributes<HTMLTextAreaElement> &
+    InputSize & {
+      /** 没有自己的皮：装在别的面里（对话输入框那种） */
+      bare?: boolean;
+    }
+>(function Textarea({ className, size = "md", bare, ...props }, ref) {
+  return (
+    <textarea
+      ref={ref}
+      className={cn(
+        "u-scroll",
+        bare ? "u-input-bare" : cn("input-dark", size === "sm" ? "u-input-sm" : "u-input-md"),
+        className,
+      )}
+      {...props}
+    />
+  );
+});
+
+/* 原生 select：弹层无法主题化，所以只给"两三个选项、不值得一个 Dropdown"的地方用 */
+export function NativeSelect({
+  className,
+  size = "md",
+  ...props
+}: Omit<SelectHTMLAttributes<HTMLSelectElement>, "size"> & InputSize) {
+  return (
+    <select
+      className={cn(
+        "input-dark appearance-none",
+        size === "sm" ? "u-input-sm" : "u-input-md",
+        className,
+      )}
       {...props}
     />
   );
@@ -137,7 +269,7 @@ export function Dropdown({
   }, [open]);
 
   const current = options.find((o) => o.value === value);
-  const pad = size === "sm" ? "px-2.5 py-1 text-xs" : "px-3 py-1.5 text-sm";
+  const pad = size === "sm" ? "px-2.5 py-1 text-small" : "px-3 py-1.5 text-body";
 
   return (
     <div ref={rootRef} className={cn("relative", className)}>
@@ -145,29 +277,31 @@ export function Dropdown({
         type="button"
         onClick={() => setOpen(!open)}
         title={menuLabel}
-        className={cn(
-          "input-dark w-full flex items-center gap-2 text-left",
-          pad,
-        )}
+        className={cn("input-dark w-full flex items-center gap-2 text-left", pad)}
       >
-        {icon && <span className="shrink-0 text-neutral-500">{icon}</span>}
+        {icon && <span className="shrink-0 text-ink-3">{icon}</span>}
         <span className="flex-1 min-w-0 truncate">
           {current?.label ?? (
-            <span className="text-neutral-600">{placeholder ?? ""}</span>
+            <span className="text-ink-3">{placeholder ?? ""}</span>
           )}
         </span>
         <ChevronDown
           size={12}
           className={cn(
-            "shrink-0 text-neutral-500 transition-transform",
+            "shrink-0 text-ink-3 transition-transform",
             open && "rotate-180",
           )}
         />
       </button>
       {open && (
-        <div className="u-pop u-pop-in u-pop-in-tl absolute z-50 mt-1 w-full rounded-lg shadow-xl overflow-hidden">
+        <div
+          className={cn(
+            // 与告警面板、用户菜单同一张皮（u-menu-glass）：浮在页面上的面只有一种
+            "u-menu-glass u-pop-in u-pop-in-tl absolute z-50 mt-1 w-full rounded-xl shadow-2xl overflow-hidden",
+          )}
+        >
           {menuLabel && (
-            <div className="px-2.5 pt-2 pb-1 text-[9.5px] font-medium uppercase tracking-[0.1em] text-neutral-600 border-b border-white/5">
+            <div className="border-b border-line px-4 py-3 text-body font-medium text-ink">
               {menuLabel}
             </div>
           )}
@@ -185,20 +319,20 @@ export function Dropdown({
                   "w-full flex items-center gap-2 text-left",
                   pad,
                   o.value === value
-                    ? "bg-white/[0.12] text-white"
-                    : "text-neutral-300 hover:bg-white/[0.06] hover:text-white",
+                    ? "bg-surface-3 text-white"
+                    : "text-ink-2 hover:bg-surface-2 hover:text-ink",
                 )}
               >
                 <span className="flex-1 min-w-0 truncate">{o.label}</span>
                 {o.value === value && (
-                  <Check size={12} className="shrink-0 text-neutral-400" />
+                  <Check size={12} className="shrink-0 text-ink-2" />
                 )}
               </button>
             ))}
           </div>
           {footer && (
             <div
-              className="border-t border-white/10"
+              className="border-t border-line"
               onClick={() => setOpen(false)}
             >
               {footer}
@@ -263,14 +397,14 @@ export function SearchSelect({
   };
 
   const pad =
-    size === "sm" ? "pl-7 pr-2.5 py-1 text-xs" : "pl-8 pr-3 py-1.5 text-sm";
-  const rowPad = size === "sm" ? "px-2.5 py-1 text-xs" : "px-3 py-1.5 text-sm";
+    size === "sm" ? "pl-7 pr-2.5 py-1 text-small" : "pl-8 pr-3 py-1.5 text-body";
+  const rowPad = size === "sm" ? "px-2.5 py-1 text-small" : "px-3 py-1.5 text-body";
 
   return (
     <div className={cn("relative", className)}>
       <SearchIcon
         size={size === "sm" ? 11 : 13}
-        className="absolute left-2.5 top-1/2 -translate-y-1/2 text-neutral-600 pointer-events-none"
+        className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ink-3 pointer-events-none"
       />
       <input
         ref={inputRef}
@@ -306,7 +440,7 @@ export function SearchSelect({
         }}
       />
       {open && (
-        <div className="u-pop u-pop-in u-pop-in-tl absolute z-50 mt-1 w-full rounded-lg shadow-xl overflow-hidden">
+        <div className="u-menu-glass u-pop-in u-pop-in-tl absolute z-50 mt-1 w-full rounded-xl shadow-2xl overflow-hidden">
           {visible.map((o, i) => (
             <button
               key={o.value}
@@ -318,8 +452,8 @@ export function SearchSelect({
                 "w-full flex items-center gap-2 text-left",
                 rowPad,
                 i === active
-                  ? "bg-white/[0.08] text-white"
-                  : "text-neutral-300",
+                  ? "bg-surface-3 text-white"
+                  : "text-ink-2",
               )}
             >
               {!q && !!o.indent && (
@@ -328,22 +462,22 @@ export function SearchSelect({
               <span className="min-w-0 flex-1 truncate">
                 {o.label}
                 {o.hint && (
-                  <span className="ml-2 text-neutral-500">{o.hint}</span>
+                  <span className="ml-2 text-ink-3">{o.hint}</span>
                 )}
               </span>
               {o.value === value && (
-                <Check size={12} className="shrink-0 text-neutral-400" />
+                <Check size={12} className="shrink-0 text-ink-2" />
               )}
             </button>
           ))}
           {visible.length === 0 && (
-            <p className={cn(rowPad, "text-neutral-600")}>{S.ui.noMatches}</p>
+            <p className={cn(rowPad, "text-ink-3")}>{S.ui.noMatches}</p>
           )}
           {hidden > 0 && (
             <div
               className={cn(
                 rowPad,
-                "border-t border-white/5 text-[11px] text-neutral-600",
+                "border-t border-line text-fine text-ink-3",
               )}
             >
               {S.ui.keepTyping(hidden)}
@@ -419,11 +553,11 @@ export function MultiSearchSelect({
               key={o.value}
               type="button"
               onClick={() => onToggle(o.value)}
-              className="group flex items-center gap-1 rounded-full bg-white/[0.10] px-2 py-0.5 text-[11px] text-neutral-200 hover:bg-white/[0.16] transition-colors"
+              className="group flex items-center gap-1 rounded-full bg-surface-2 px-2 py-0.5 text-fine text-ink transition-colors duration-fast hover:bg-surface-3"
               title={o.hint ?? o.label}
             >
               {o.label}
-              <span className="text-neutral-500 group-hover:text-neutral-200">
+              <span className="text-ink-3 group-hover:text-ink">
                 ✕
               </span>
             </button>
@@ -431,18 +565,18 @@ export function MultiSearchSelect({
         </div>
       )}
       {picked.length === 0 && emptyHint && (
-        <p className="mb-1 text-[11px] text-neutral-600">{emptyHint}</p>
+        <p className="mb-1 text-fine text-ink-3">{emptyHint}</p>
       )}
       {/* 图标只对输入框定位。从前它相对整个组件居中，而组件里输入框上面
           还有一行已选项或空态提示，"一半高"就落到了输入框的上方（#288） */}
       <div className="relative">
         <SearchIcon
           size={11}
-          className="absolute left-2.5 top-1/2 -translate-y-1/2 text-neutral-600 pointer-events-none"
+          className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ink-3 pointer-events-none"
         />
       <input
           ref={inputRef}
-          className="input-dark w-full pl-7 pr-2.5 py-1 text-xs"
+          className="input-dark w-full pl-7 pr-2.5 py-1 text-small"
           value={query}
           placeholder={placeholder}
           onFocus={() => {
@@ -475,7 +609,7 @@ export function MultiSearchSelect({
         />
       </div>
       {open && (
-        <div className="u-pop u-pop-in u-pop-in-tl absolute z-50 mt-1 w-full rounded-lg shadow-xl overflow-hidden">
+        <div className="u-menu-glass u-pop-in u-pop-in-tl absolute z-50 mt-1 w-full rounded-xl shadow-2xl overflow-hidden">
           {visible.map((o, i) => (
             <button
               key={o.value}
@@ -484,10 +618,10 @@ export function MultiSearchSelect({
               onClick={() => toggle(o.value)}
               onMouseEnter={() => setActive(i)}
               className={cn(
-                "w-full flex items-center gap-2 text-left px-2.5 py-1 text-xs",
+                "w-full flex items-center gap-2 text-left px-2.5 py-1 text-small",
                 i === active
-                  ? "bg-white/[0.08] text-white"
-                  : "text-neutral-300",
+                  ? "bg-surface-3 text-white"
+                  : "text-ink-2",
               )}
             >
               {!q && !!o.indent && (
@@ -496,21 +630,21 @@ export function MultiSearchSelect({
               <span className="min-w-0 flex-1 truncate">
                 {o.label}
                 {o.hint && (
-                  <span className="ml-2 text-neutral-500">{o.hint}</span>
+                  <span className="ml-2 text-ink-3">{o.hint}</span>
                 )}
               </span>
               {values.includes(o.value) && (
-                <Check size={12} className="shrink-0 text-neutral-400" />
+                <Check size={12} className="shrink-0 text-ink-2" />
               )}
             </button>
           ))}
           {visible.length === 0 && (
-            <p className="px-2.5 py-1 text-xs text-neutral-600">
+            <p className="px-2.5 py-1 text-small text-ink-3">
               {S.ui.noMatches}
             </p>
           )}
           {hidden > 0 && (
-            <div className="px-2.5 py-1 text-[11px] text-neutral-600 border-t border-white/5">
+            <div className="px-2.5 py-1 text-fine text-ink-3 border-t border-line">
               {S.ui.keepTyping(hidden)}
             </div>
           )}
@@ -603,7 +737,7 @@ export function ColorPicker({
           type="button"
           title={value}
           onClick={() => setOpen(!open)}
-          className="h-8 w-14 rounded-lg border border-white/15 hover:border-white/35 transition-colors bg-white/[0.04] grid place-items-center"
+          className="h-8 w-14 rounded-lg border border-line-strong hover:border-line-strong transition-colors bg-surface grid place-items-center"
         >
           <span
             className={cn("h-3.5 w-3.5", shape === "circle" && "rounded-full")}
@@ -615,13 +749,13 @@ export function ColorPicker({
           type="button"
           title={value}
           onClick={() => setOpen(!open)}
-          className="h-8 w-14 rounded-lg border border-white/15 hover:border-white/35 transition-colors"
+          className="h-8 w-14 rounded-lg border border-line-strong hover:border-line-strong transition-colors"
           style={{ background: valid ? value : ENTITY_PALETTE[0] }}
         />
       )}
       {open && (
         // 显式宽度：绝对定位的收缩宽度会被 inline-block 触发器的 56px 容器块钳死
-        <div className="u-pop u-pop-in u-pop-in-tl absolute z-50 left-0 top-full mt-2 w-56 rounded-xl p-3 shadow-xl">
+        <div className="u-menu-glass u-pop-in u-pop-in-tl absolute z-50 left-0 top-full mt-2 w-56 rounded-xl p-3 shadow-2xl">
           <div className="grid grid-cols-8 gap-1.5 mb-2.5">
             {ENTITY_PALETTE.map((c) => (
               <button
@@ -635,7 +769,7 @@ export function ColorPicker({
                 className={cn(
                   "h-5 w-5 rounded-full transition-transform hover:scale-110",
                   value.toLowerCase() === c &&
-                    "outline outline-2 outline-white/80 outline-offset-1",
+                    "outline outline-2 outline-ring outline-offset-1",
                 )}
                 style={{ background: c }}
               />
@@ -646,8 +780,8 @@ export function ColorPicker({
             onChange={(e) => onChange(e.target.value)}
             placeholder={ENTITY_PALETTE[0]}
             className={cn(
-              "input-dark w-full px-2 py-1 text-xs font-mono",
-              !valid && "!border-[var(--u-danger)]",
+              "input-dark w-full px-2 py-1 text-small font-mono",
+              !valid && "!border-danger",
             )}
           />
         </div>
@@ -676,7 +810,7 @@ export function Pager({
   const safe = Math.min(page, pageCount - 1);
   if (total <= pageSize) return null;
   return (
-    <div className={cn("flex items-center justify-end gap-2 text-xs text-neutral-500", className)}>
+    <div className={cn("flex items-center justify-end gap-2 text-small text-ink-3", className)}>
       <span className="u-num">
         {S.library.pageOf(
           safe * pageSize + 1,
@@ -713,80 +847,6 @@ export function pageSlice<T>(
   return { rows: items.slice(safe * pageSize, (safe + 1) * pageSize), safe };
 }
 
-/* ---------- DangerConfirm（危险操作确认弹窗：可要求输入指定文本解锁） ---------- */
-export function DangerConfirm({
-  title,
-  hint,
-  requireText,
-  confirmLabel,
-  cancelLabel,
-  busy,
-  onConfirm,
-  onCancel,
-}: {
-  title: string;
-  hint: string;
-  /** 要求逐字输入的解锁文本（如资源名称）；缺省则直接可确认 */
-  requireText?: string;
-  confirmLabel: string;
-  cancelLabel: string;
-  busy?: boolean;
-  onConfirm: () => void;
-  onCancel: () => void;
-}) {
-  const [text, setText] = useState("");
-  const unlocked = !requireText || text === requireText;
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCancel();
-    };
-    document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
-  }, [onCancel]);
-
-  return (
-    <div
-      className="u-modal-scrim fixed inset-0 z-50 grid place-items-center bg-black/80 backdrop-blur-sm"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget) onCancel();
-      }}
-    >
-      <div className="u-modal-panel u-modal-in w-[24rem] max-w-[calc(100vw-2rem)] rounded-2xl shadow-2xl p-5">
-        <h2 className="text-[15px] font-semibold text-[var(--u-danger)] mb-2">
-          {title}
-        </h2>
-        <p className="text-xs text-neutral-400 leading-relaxed mb-4">{hint}</p>
-        {requireText && (
-          <input
-            autoFocus
-            className="input-dark w-full px-3 py-2 text-sm mb-4"
-            placeholder={requireText}
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-          />
-        )}
-        <div className="flex justify-end gap-2">
-          <button
-            className="u-btn u-btn-ghost px-3.5 py-1.5 text-xs"
-            onClick={onCancel}
-          >
-            {cancelLabel}
-          </button>
-          <button
-            className="u-btn px-3.5 py-1.5 text-xs font-semibold disabled:opacity-40"
-            style={{ background: "var(--u-danger-solid)", color: "#ffffff" }}
-            disabled={!unlocked || busy}
-            onClick={onConfirm}
-          >
-            {confirmLabel}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 /* ---------- Panel（玻璃面板） ---------- */
 export function Panel({
   strong = false,
@@ -814,17 +874,87 @@ export function Chip({
   tone = "neutral",
   className,
   title,
+  onClick,
   children,
 }: {
   tone?: ChipTone;
   className?: string;
   title?: string;
+  /** 给了就是一个按钮（点开看失败原文那种） */
+  onClick?: () => void;
   children: ReactNode;
 }) {
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        onClick={onClick}
+        title={title}
+        className={cn("u-chip u-chip-click", `u-chip-${tone}`, className)}
+      >
+        {children}
+      </button>
+    );
+  }
   return (
     <span className={cn("u-chip", `u-chip-${tone}`, className)} title={title}>
       {children}
     </span>
+  );
+}
+
+/* ---------- LinkButton（长得像一句话的动作：表格行末的"重抽""删除"） ---------- */
+export function LinkButton({
+  tone = "default",
+  underline,
+  className,
+  type = "button",
+  ...props
+}: ButtonHTMLAttributes<HTMLButtonElement> & {
+  tone?: "default" | "danger";
+  /** 带下划线（u-link 那种） */
+  underline?: boolean;
+}) {
+  return (
+    <button
+      type={type}
+      className={cn(
+        "u-linkbtn",
+        tone === "danger" && "is-danger",
+        underline && "u-link",
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+/* ---------- ChoiceCard（勾选框藏起来的可选卡片：本体包那种并排的几张） ---------- */
+export function ChoiceCard({
+  checked,
+  onChange,
+  label,
+  className,
+  children,
+}: {
+  checked: boolean;
+  onChange: () => void;
+  /** 读屏器念的名字 */
+  label: string;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <label className={cn("u-choice", checked && "is-on", className)}>
+      <input
+        type="checkbox"
+        className="sr-only"
+        aria-label={label}
+        checked={checked}
+        onChange={onChange}
+      />
+      {children}
+    </label>
   );
 }
 
@@ -836,7 +966,7 @@ export function PageTitle({
   className?: string;
   children: ReactNode;
 }) {
-  return <h2 className={cn("u-title text-lg", className)}>{children}</h2>;
+  return <h2 className={cn("u-title text-title", className)}>{children}</h2>;
 }
 
 /* ---------- EmptyState ---------- */
@@ -849,10 +979,10 @@ export function EmptyState({
 }) {
   return (
     <div className="text-center">
-      <div className="glass mx-auto mb-4 h-14 w-14 rounded-2xl grid place-items-center text-xl font-bold text-neutral-300">
+      <div className="glass mx-auto mb-4 h-14 w-14 rounded-xl grid place-items-center text-title font-bold text-ink-2">
         {icon}
       </div>
-      <div className="text-sm text-neutral-500 whitespace-pre-line">
+      <div className="text-body text-ink-3 whitespace-pre-line">
         {children}
       </div>
     </div>
@@ -861,11 +991,11 @@ export function EmptyState({
 
 /* ---------- Loading / ErrorText ---------- */
 export function Loading({ children }: { children: ReactNode }) {
-  return <div className="p-8 text-sm text-neutral-500">{children}</div>;
+  return <div className="p-8 text-body text-ink-3">{children}</div>;
 }
 
 export function ErrorText({ children }: { children: ReactNode }) {
-  return <p className="text-sm text-rose-400">{children}</p>;
+  return <p className="text-body text-danger">{children}</p>;
 }
 
 /* ---------- GithubMark（lucide 无品牌图标，官方 mark 内联） ---------- */
@@ -890,7 +1020,7 @@ export function SectionMark({ text, title }: { text: string; title: string }) {
     <RouterLink
       to="/"
       title={title}
-      className="relative inline-flex text-white text-[17px]"
+      className="relative inline-flex text-white text-title"
       style={{ fontFamily: "var(--font-brand)", letterSpacing: "0.06em" }}
     >
       {[...text].map((ch, i) => (
@@ -922,3 +1052,361 @@ export function localDateTime(iso: string): string {
   const mm = String(d.getMinutes()).padStart(2, "0");
   return `${localDate(iso)} ${hh}:${mm}`;
 }
+
+/* ---------- Row（可点的一行：左栏导航项、类树、关系/属性列表） ----------
+   一行整条可点，指针停上变面、选中反白。列表里的行与左栏导航项是同一个东西，
+   只差密度：nav 高一点、带图标；list 矮一点、可缩进。 */
+/** 一行的类：Row 自己用；页面里必须是 <Link> 的行（跳去图谱的实例行）也用它 */
+export type RowDensity = "nav" | "list" | "menu";
+export function rowClass(
+  active?: boolean,
+  density: RowDensity = "list",
+  danger?: boolean,
+): string {
+  return cn(
+    "group flex w-full items-center gap-2 text-left transition-colors duration-fast",
+    density === "menu" ? "rounded-none" : "rounded-lg",
+    density === "nav"
+      ? "px-2 py-2 text-body font-medium"
+      : density === "menu"
+        ? "px-3 py-2 text-small"
+        : "px-2 py-1 text-body",
+    active
+      ? "u-nav-active"
+      : danger
+        ? "text-danger hover:bg-surface-2"
+        : "text-ink-2 hover:bg-surface-2 hover:text-ink",
+  );
+}
+/** 行右端小字：静止时最淡，整行被指着时提亮一级 */
+export const ROW_TRAILING = "ml-auto shrink-0 text-fine text-ink-3 group-hover:text-ink-2";
+
+export function Row({
+  active,
+  danger,
+  density = "list",
+  indent = 0,
+  icon,
+  trailing,
+  className,
+  children,
+  type = "button",
+  ...props
+}: ButtonHTMLAttributes<HTMLButtonElement> & {
+  active?: boolean;
+  /** 危险的那一行（菜单里的删除） */
+  danger?: boolean;
+  /** nav = 左栏导航项；list = 列表行；menu = 弹出菜单里的一项（顶满、不圆角） */
+  density?: RowDensity;
+  /** 树形缩进的层级 */
+  indent?: number;
+  icon?: ReactNode;
+  /** 右端的东西：计数、类型小字 */
+  trailing?: ReactNode;
+}) {
+  return (
+    <button
+      type={type}
+      aria-current={active ? "true" : undefined}
+      style={indent ? { paddingLeft: `${8 + indent * 14}px` } : undefined}
+      className={cn(rowClass(active, density, danger), className)}
+      {...props}
+    >
+      {icon && <span className="shrink-0 text-ink-3">{icon}</span>}
+      <span className="min-w-0 flex-1 truncate">{children}</span>
+      {trailing && <span className={ROW_TRAILING}>{trailing}</span>}
+    </button>
+  );
+}
+
+/* 左栏的一条入口：Library 的来源、Review 的队列、Ontology 底部钉住的那几个
+   都是它。**与列表里的行同一副样子**（Row density="nav"，圆角、缩进）——
+   钉在底部的靠外面那条分隔线说明「这几个是常驻的」，不靠把行本身画成方的。
+   计数给了就显示，0 也显示（灰一档）：队列清空了是个有意义的事实。 */
+export function RailItem({
+  active,
+  icon,
+  count,
+  dot,
+  external,
+  className,
+  children,
+  ...props
+}: Omit<ButtonHTMLAttributes<HTMLButtonElement>, "type"> & {
+  active?: boolean;
+  icon?: ReactNode;
+  count?: number;
+  /** 右侧的状态点（同步中/失败那种），给背景色的类名 */
+  dot?: string;
+  /** 这一条不在本页办——加个去向记号，免得点下去以为页面没反应 */
+  external?: boolean;
+}) {
+  return (
+    <Row
+      density="nav"
+      active={active}
+      icon={icon}
+      className={className}
+      trailing={
+        count !== undefined ? (
+          <span className={cn("u-num", count > 0 ? "text-ink-2" : "text-ink-3")}>
+            {count}
+          </span>
+        ) : undefined
+      }
+      {...props}
+    >
+      <span className="flex min-w-0 items-center gap-2">
+        <span className="truncate">{children}</span>
+        {dot && <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", dot)} />}
+        {external && <ArrowUpRight size={11} className="shrink-0 opacity-50" />}
+      </span>
+    </Row>
+  );
+}
+
+/* ---------- Segmented（分段切换） ----------
+   两三个互斥的视图或取值。fill = 每格等宽撑满（左栏的类/属性切换）；
+   否则按内容宽（连接方向、形状那种小开关）。 */
+export function Segmented<T extends string>({
+  value,
+  options,
+  onChange,
+  size = "md",
+  fill,
+  disabled,
+  className,
+}: {
+  value: T;
+  options: { value: T; label: ReactNode; count?: number; title?: string }[];
+  onChange: (v: T) => void;
+  size?: "sm" | "md";
+  fill?: boolean;
+  disabled?: boolean;
+  className?: string;
+}) {
+  return (
+    <div
+      role="tablist"
+      className={cn(
+        "flex gap-1 rounded-lg bg-surface p-1",
+        fill && "w-full",
+        disabled && "opacity-40",
+        className,
+      )}
+    >
+      {options.map((o) => {
+        const active = o.value === value;
+        return (
+          <button
+            key={o.value}
+            type="button"
+            role="tab"
+            aria-selected={active}
+            title={o.title}
+            disabled={disabled}
+            onClick={() => onChange(o.value)}
+            className={cn(
+              "flex items-center justify-center gap-1 rounded-lg font-medium transition-colors duration-fast",
+              size === "sm" ? "px-2 py-1 text-fine" : "px-3 py-1 text-small",
+              fill && "flex-1",
+              active
+                ? "bg-surface-3 text-ink"
+                : "text-ink-3 hover:bg-surface-2 hover:text-ink-2",
+            )}
+          >
+            {o.label}
+            {o.count !== undefined && o.count > 0 && (
+              <span className="u-num text-ink-3">{o.count}</span>
+            )}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ---------- Checkbox ---------- */
+export function Checkbox({
+  label,
+  hint,
+  className,
+  ...props
+}: Omit<InputHTMLAttributes<HTMLInputElement>, "type"> & {
+  label: ReactNode;
+  hint?: ReactNode;
+}) {
+  return (
+    <label className={cn("flex cursor-pointer items-start gap-2", className)}>
+      <input type="checkbox" className="mt-1 accent-accent" {...props} />
+      <span className="min-w-0">
+        <span className="block text-body text-ink">{label}</span>
+        {hint && <span className="block text-fine text-ink-3">{hint}</span>}
+      </span>
+    </label>
+  );
+}
+
+/* ---------- Disclosure（折叠小节：一行可点的摘要 + 展开的内容） ---------- */
+export function Disclosure({
+  summary,
+  defaultOpen,
+  className,
+  children,
+}: {
+  summary: ReactNode;
+  defaultOpen?: boolean;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <details open={defaultOpen} className={className}>
+      <summary className="cursor-pointer select-none text-small text-ink-3 transition-colors duration-fast hover:text-ink-2">
+        {summary}
+      </summary>
+      <div className="mt-2">{children}</div>
+    </details>
+  );
+}
+
+/* ---------- ToolTower（画布上的竖排工具塔） ----------
+   图标常驻，名字在整组 hover / 键盘走到时一起展开（styles.css 的 u-tower）。
+   一组是一个语义单元：派生 / 布局 / 相机。 */
+export function ToolTower({
+  className,
+  children,
+}: {
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <div
+      className={cn(
+        "u-tower group glass-strong flex flex-col overflow-hidden rounded-xl shadow-xl",
+        className,
+      )}
+    >
+      {children}
+    </div>
+  );
+}
+
+export const ToolButton = forwardRef<
+  HTMLButtonElement,
+  ButtonHTMLAttributes<HTMLButtonElement> & {
+    active?: boolean;
+    /** 展开时显示的名字，也是 title 与无障碍名称 */
+    label: string;
+    icon: ReactNode;
+  }
+>(function ToolButton({ active, label, icon, className, type = "button", ...props }, ref) {
+  return (
+    <button
+      ref={ref}
+      type={type}
+      title={label}
+      aria-label={label}
+      className={cn("u-tool", active && "is-on", className)}
+      {...props}
+    >
+      {icon}
+      <span className="u-tower-label">{label}</span>
+    </button>
+  );
+});
+
+export function ToolDivider() {
+  return <div className="mx-2 h-px bg-line-strong" />;
+}
+
+/* ---------- Pill（玻璃药丸：图例、"+N 个类"这类浮在画布上的小开关） ---------- */
+export const Pill = forwardRef<
+  HTMLButtonElement,
+  ButtonHTMLAttributes<HTMLButtonElement> & {
+    active?: boolean;
+    /** 被关掉的那种：压到三成五 */
+    dim?: boolean;
+  }
+>(function Pill({ active, dim, className, type = "button", ...props }, ref) {
+  return (
+    <button
+      ref={ref}
+      type={type}
+      className={cn("u-pill", active && "is-on", dim && "is-dim", className)}
+      {...props}
+    />
+  );
+});
+
+/* ---------- Radio ---------- */
+export function Radio({
+  label,
+  className,
+  children,
+  ...props
+}: Omit<InputHTMLAttributes<HTMLInputElement>, "type"> & {
+  label: ReactNode;
+  /** 选中后跟在标签后面的东西（比如一个日期框） */
+  children?: ReactNode;
+}) {
+  return (
+    <label className={cn("flex items-center gap-2 text-small text-ink-2", className)}>
+      <input type="radio" className="accent-accent" {...props} />
+      {label}
+      {children}
+    </label>
+  );
+}
+
+/* ---------- ExpandCard（可展开的一条：事实、派生、被挡下的派生） ----------
+   头是一整条可点的按钮，展开的内容跟在下面。头里可以有 role="link" 的 span
+   （去看另一端），但不能有按钮——按钮里不能嵌按钮。 */
+export function ExpandCard({
+  open,
+  onToggle,
+  dim,
+  title,
+  headerClassName,
+  className,
+  header,
+  children,
+}: {
+  open: boolean;
+  onToggle: () => void;
+  /** 陈旧的那种：整条压淡 */
+  dim?: boolean;
+  title?: string;
+  headerClassName?: string;
+  className?: string;
+  header: ReactNode;
+  children?: ReactNode;
+}) {
+  return (
+    <div
+      className={cn("u-card-row group", open && "is-open", dim && "opacity-55", className)}
+      title={title}
+    >
+      <button
+        type="button"
+        onClick={onToggle}
+        className={cn("w-full px-2 py-1 text-left", headerClassName)}
+      >
+        {header}
+      </button>
+      {children}
+    </div>
+  );
+}
+
+/** 复合行的外壳：一行里有两个按钮时不能是 Row（按钮里不能嵌按钮），
+    外层 div 用它拿到 hover 与 group */
+export const HOVER_ROW =
+  "group flex items-center gap-2 rounded-lg px-2 py-1 transition-colors duration-fast hover:bg-surface-2";
+/** 指针停在所在行（.group）上才现身的东西；加 is-on 常显 */
+export const REVEAL = "u-reveal";
+
+/* 各在自己文件里的组件，从这里一并导出，页面只认 "../ui" 一个入口 */
+export { Dialog, DangerConfirm } from "./dialog";
+export { Tooltip } from "./tooltip";
+export { Table, THead, TBody, Tr, Th, Td } from "./table";
+export { Field } from "./field";

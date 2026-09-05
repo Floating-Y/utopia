@@ -278,6 +278,15 @@ pub struct SourceView {
     pub doc_count: i64,
     /// 已标记"不在来源中"的文档数（url 全集对账 / custom 墓碑产生）
     pub missing_count: i64,
+    /// full_new_items 的当前代状态；非 full-content 来源为 NULL
+    pub rss_full_content_state: Option<String>,
+    pub rss_full_content_generation: Option<i32>,
+    pub rss_full_content_baseline_count: Option<i32>,
+    pub rss_full_content_pending_count: i64,
+    pub rss_full_content_queued_count: i64,
+    pub rss_full_content_retrying_count: i64,
+    pub rss_full_content_complete_count: i64,
+    pub rss_full_content_terminal_count: i64,
 }
 
 /// 审计事件视图（带操作人显示名；删号后为 NULL）。纯审计展示用。
@@ -606,6 +615,11 @@ pub struct GraphEdge {
     pub premises: Vec<Uuid>,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
+    /// **读出来的**区间（0022）：没有起点的事实从最早的证据起，结束了不知哪天的
+    /// 到最早说出它的那份文档为止。滑杆按这两个过滤，不再自己解释 NULL——
+    /// 上面那两个是原文说了什么，只用来显示
+    pub holds_from: Option<DateTime<Utc>>,
+    pub holds_to: Option<DateTime<Utc>>,
     pub confidence: f32,
     /// 有争议（0017 §3）：有一条 open 的公理违规或时态冲突指着它。整条边画成
     /// 警戒色——环在节点上、边还是灰的，余光分不出来
@@ -642,6 +656,10 @@ pub struct EntityFact {
     /// 结束端的粒度，外加一个 `unknown`——**原文说它结束了，但没说哪天**。
     /// `valid_to` 与它都为 None 才是「仍在持续」（见 `facts.valid_to_precision`）
     pub valid_to_precision: Option<String>,
+    /// **读出来的**区间（0022），与 `GraphEdge` 同义：面板判「此刻成立」按它，
+    /// 不再自己把 NULL 解释成开放
+    pub holds_from: Option<DateTime<Utc>>,
+    pub holds_to: Option<DateTime<Utc>>,
     pub confidence: f32,
     pub evidence_count: i64,
     /// 证据全部停留在来源文档的旧版（未被现行内容确认；不代表事实失效）
@@ -1063,11 +1081,14 @@ pub struct DerivedFactView {
     pub id: Uuid,
     pub subject_id: Uuid,
     pub subject: String,
-    pub object_id: Uuid,
+    /// 字面值结论（业务规则的归类与属性）没有实体宾语（0021）
+    pub object_id: Option<Uuid>,
     pub object: String,
     pub predicate: String,
-    /// transitive | symmetric——靠哪条规则推的
+    /// transitive | symmetric | inverse | sub_property，或 `business`（业务规则）
     pub rule: String,
+    /// 业务规则的名字。公理推的为 None——公理没有名字，`rule` 那一列就是它的全部身份
+    pub rule_name: Option<String>,
     pub valid_from: Option<DateTime<Utc>>,
     pub valid_to: Option<DateTime<Utc>>,
     pub confidence: f32,
@@ -1189,6 +1210,88 @@ pub struct ReviewCounts {
     pub violations: i64,
     pub defects: i64,
     pub merges: i64,
+}
+
+/// 审核台的总览（#377）：等着办的、办过的、库的成色。
+///
+/// 左栏的七个数只说「开着多少条」；总览要回答的是一个审核者进来时的三个
+/// 问题——**有多少在等、等了多久、队列在消还是在涨**。三段各自一组查询，
+/// 拼在一起一次返回。
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewSummary {
+    pub waiting: ReviewWaiting,
+    pub decided: ReviewDecided,
+    pub health: ReviewHealth,
+}
+
+/// 一档队列里等着的：多少条、最老的一条从什么时候开始等
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct QueueWait {
+    pub count: i64,
+    pub oldest_at: Option<DateTime<Utc>>,
+}
+
+/// 七档队列，与 [`ReviewCounts`] 同一套口径（同一套 WHERE），多了「最老」
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ReviewWaiting {
+    pub pending: QueueWait,
+    pub duplicates: QueueWait,
+    pub conflicts: QueueWait,
+    pub unconfirmed: QueueWait,
+    pub lowconf: QueueWait,
+    pub violations: QueueWait,
+    pub defects: QueueWait,
+}
+
+/// 办过的：近 7 天与近 30 天两个窗口，加近 14 天每天一根柱
+#[derive(Debug, Clone, Serialize)]
+pub struct ReviewDecided {
+    pub last_7d: DecidedWindow,
+    pub last_30d: DecidedWindow,
+    /// 近 14 天，按天，一天一条，没有决定的那天也在（count 0）——画柱子要等距
+    pub daily: Vec<DecidedDay>,
+}
+
+/// 一个时间窗口里的决定：总数、其中 AI 自裁的（台账上没有 actor 的那些）、
+/// 按动作分、按人分
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct DecidedWindow {
+    pub total: i64,
+    pub automatic: i64,
+    pub by_action: Vec<ActionCount>,
+    pub by_actor: Vec<ActorCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActionCount {
+    /// 台账上的动作名（review.merge / fact.confirm / conflict.close_old …）
+    pub action: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ActorCount {
+    /// None = 后台自裁（攒批裁决那种没有客户端、没有人的动作）
+    pub actor_id: Option<Uuid>,
+    /// 台账里的身份快照；人被删了也认得出
+    pub label: Option<String>,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DecidedDay {
+    pub day: chrono::NaiveDate,
+    pub count: i64,
+}
+
+/// 库的成色：还在世的事实里有多少是暂定的——低置信、证据全被换掉了、
+/// 正跟别的事实打架
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ReviewHealth {
+    pub facts: i64,
+    pub low_confidence: i64,
+    pub unconfirmed: i64,
+    pub contested: i64,
 }
 
 /// 一个关系声明了哪些 OWL 公理。

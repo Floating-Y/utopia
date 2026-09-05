@@ -500,7 +500,7 @@ export const en = {
     sources: "Sources",
     allDocs: "All documents",
     uploads: "Uploads",
-    addSource: "Add source",
+    sourceType: "Type",
     sourceKinds: {
       folder: "Folder",
       url: "URLs",
@@ -589,6 +589,18 @@ export const en = {
     sourceName: "Name",
     urlsField: "Page URLs (one per line)",
     feedUrl: "Feed URL",
+    rssContentMode: "RSS content mode",
+    rssModeFeed: "Feed content only",
+    rssModeFull: "Full article content (new items)",
+    rssModeFeedShort: "Feed only",
+    rssModeFullShort: "Full articles",
+    rssContentModeHint: "Full mode fetches linked articles only for items first seen after activation.",
+    rssFullModeHint:
+      "The first successful sync records the current feed as a baseline and imports nothing. Later new items use feed content first, then a guarded article fetch; summaries without usable content remain diagnosable terminal outcomes.",
+    rssFeedModeHint:
+      "Legacy mode stores feed content or the summary and does not fetch linked articles.",
+    rssHydrationCounts: (pending: number, queued: number, retrying: number, complete: number, terminal: number) =>
+      `pending ${pending} · queued ${queued} · retrying ${retrying} · complete ${complete} · terminal ${terminal}`,
     repoField: "Repository (owner/name)",
     jiraUrlField: "Jira site URL",
     jiraProjectField: "Project key",
@@ -781,7 +793,7 @@ export const en = {
     viewDerived: "Derived",
     derivedEdges: (n: number) => `${n} derived`,
     derivedHint:
-      "Edges no one asserted — the engine worked them out from axioms your ontology declares. Each one shows the premises it came from.",
+      "Nothing here was asserted — the engine worked it out, from an axiom your ontology declares or from a rule someone wrote. Each one shows the premises it came from.",
     derivedNoProof: "The premises are gone.",
     /* 争议（0017 §3） */
     contestedChip: "disputed",
@@ -1042,7 +1054,74 @@ export const en = {
     newProperty: "New property",
     filter: "Filter…",
     missesShort: "Unmatched",
+    uniquenessShort: "Overlaps",
     refineShort: "Refine types",
+    /* ---- 业务规则（0021 / #277）---- */
+    rulesShort: "Business rules",
+    rulesTitle: "Business rules",
+    /* 说清三件事：谁写的、结论是什么身份、什么时候重算。第三件最容易被误解成
+       「保存就生效」，而它其实等下一轮物化 */
+    rulesHint:
+      "A rule reads one entity's own attributes and concludes a class or a value. " +
+      "You write the criteria — the model never proposes one. " +
+      "What a rule concludes is derived: it never replaces an asserted fact, it carries the readings that made it true, and it retires by itself when they change.",
+    rulesEmpty: "No rules yet.",
+    ruleNew: "New rule",
+    ruleName: "Name",
+    ruleNamePlaceholder: "Gas-bearing well",
+    ruleDescription: "What it means (optional)",
+    ruleSubject: "Applies to",
+    ruleSubjectHint: "and its subclasses",
+    ruleConcludes: "Concludes",
+    ruleConcludesTyping: "the class",
+    ruleConcludesAttribute: "the attribute",
+    ruleConditions: "When all of",
+    ruleAddCondition: "Add a condition",
+    ruleOpGt: "is above",
+    ruleOpGte: "is at least",
+    ruleOpLt: "is below",
+    ruleOpLte: "is at most",
+    ruleOpBetween: "is between",
+    ruleOpIn: "is one of",
+    ruleOpPresent: "is recorded",
+    ruleOperandNumber: "12.0",
+    ruleOperandSet: "gas anomaly, post-effect gas anomaly",
+    ruleOperandSetHint: "comma separated",
+    ruleSave: "Save rule",
+    ruleSaved: "Rule saved",
+    ruleDeleted: "Rule deleted",
+    ruleDelete: "Delete",
+    ruleDeleteConfirm: (n: string) => `Delete “${n}”? What it concluded goes with it.`,
+    ruleEnabled: "On",
+    ruleDisabled: "Off",
+    /* 数字是「此刻凭它成立的结论条数」，不是历史总数 */
+    ruleDerivedCount: (n: number) =>
+      n === 1 ? "1 entity" : `${n} entities`,
+    ruleRun: "Run now",
+    ruleRunning: "Running…",
+    /* 跑完要说清三件事，因为图会自己变：命中多少、新落多少、退了多少 */
+    ruleRunDone: (hits: number, inserted: number, invalidated: number) =>
+      `${hits} matched · ${inserted} new · ${invalidated} retired`,
+    ruleRunCapped: (n: number) =>
+      `${n} entity/rule pairs had too many readings to expand; their conclusions are incomplete`,
+    ruleNeedsCondition: "A rule needs at least one condition.",
+    /* ---- 打磨：可点的计数、常驻的 capped 提示、改结论 ---- */
+    ruleEdit: "Edit",
+    ruleEditing: "Editing",
+    ruleMatchesTitle: "What it marks",
+    ruleMatchesEmpty: "Nothing right now.",
+    /* 前提要读成「凭什么」，所以用 because 起头而不是干列 */
+    ruleMatchBecause: (premises: string) => `because ${premises}`,
+    /* 同一个实体会因为不同时段的读数出现好几次——不写出这一段就像重复了 */
+    ruleMatchSpan: (from: string, to: string | null) =>
+      to ? `${from} – ${to}` : `since ${from}`,
+    ruleMatchesMore: (shown: number, total: number) =>
+      `showing ${shown} of ${total}`,
+    /* 常驻在卡片上，而不只在跑完那一刻的 toast 里——少推几条与「不满足」
+       在结果里长得一样，读的人得随时看得见 */
+    ruleCappedChip: "incomplete",
+    ruleCappedHint:
+      "Some entities carry too many readings of the same attribute to expand every combination, so this rule's conclusions for them are incomplete.",
     refineTitle: "Refine types",
     refineHint:
       "Entities whose class is roughly right but not the most specific one available. Look first, then apply — retyping does not appear on any timeline, so this is the only place you get to see it before it happens.",
@@ -1204,6 +1283,33 @@ export const en = {
     misses: "Unmatched from extraction",
     missesHint:
       "The extractor produced these outside your ontology (they fell back to concept / related to). They are signals for extending the ontology.",
+    /* ---- 一端挂着两个以上开放值的谓词（#341） ----
+       文案克制：状态一句话，后果一句话，动作在按钮上。这一档的读者要判断的是
+       「这条关系一次只能有一个值吗」，不是读一篇关于双时态的说明 */
+    uniqueness: "Overlapping values",
+    uniquenessHint:
+      "One holder, two values, neither closed. Until the relation says it holds one value at a time, a successor does not close a predecessor — and a question about any past date answers with both.",
+    uniquenessEmpty: "No overlaps. Every holder has at most one open value.",
+    /* 主语侧 / 宾语侧：说人话，不写 functional / inverse functional */
+    uniquenessSubject: (n: number) =>
+      `${n} subject${n === 1 ? "" : "s"} with two or more open values`,
+    uniquenessObject: (n: number) =>
+      `${n} value${n === 1 ? "" : "s"} held open by two or more subjects`,
+    /* 按钮按下去会动账本，所以先说清动多少 */
+    uniquenessEffect: (close: number, review: number) =>
+      review > 0
+        ? `Closes ${close}, sends ${review} to review`
+        : `Closes ${close}`,
+    uniquenessDeclare: "Declare and close",
+    /* 声明过了、只是还没对过账（导入的，或声明之前就在的行） */
+    uniquenessReconcile: "Close them",
+    uniquenessDeclared: "Declared",
+    uniquenessBusy: "Closing…",
+    uniquenessDone: (close: number, review: number) =>
+      review > 0
+        ? `Closed ${close} · ${review} in Review`
+        : `Closed ${close}`,
+    uniquenessSince: (d: string) => `since ${d}`,
     dismiss: "Dismiss",
     dismissed: (n: number) => `Dismissed (${n})`,
     /* 数字是**忽略之后**还在涨的那个——这一行的全部意义就在于此：
@@ -1259,7 +1365,6 @@ export const en = {
     keyHint: "lowercase_snake_case",
     /* ---- Schema diagram ---- */
     schemaDiagram: "Schema diagram",
-    schemaSearchPlaceholder: "Search schema…",
     /* 从前这句把「先加个类或导入 OWL 文件」说成了开始的前提，而本体本来就
        从语料里长（0003，默认开）——那句话正是 #313 说的劝退点。现在只说状态，
        动作留给左栏本来就有的 New class 与 Import */
@@ -1273,6 +1378,12 @@ export const en = {
     schemaUnscoped: (n: number) => `Unscoped properties (${n})`,
     schemaUnscopedHint:
       "Not limited to specific classes, so no line on the canvas would be honest. Select one to inspect or edit it.",
+    // 取景说明：大本体只画库用到的类，这里说没画的有多少、为什么、去哪找
+    schemaMoreClasses: (n: number) => (n === 1 ? "+1 class" : `+${n} classes`),
+    schemaScopeInUseHint:
+      "Drawn: the classes with instances, and their ancestors. Pick any other class in the rail to add it.",
+    schemaScopeTopHint:
+      "No class has instances yet, so the top two levels are drawn. Pick any other class in the rail to add it.",
     schemaClosePanel: "Close",
     // 面板里的三段：定义（表单）/ 属性（关系 + 字面值字段）/ 实例。
     // 用页面自己的词——左栏就叫 Classes / Properties
@@ -1286,6 +1397,8 @@ export const en = {
         : `${n} new ontology issues from this change`,
     schemaCheckReview: "Review",
     schemaRelationships: "Relationships",
+    /** 画布上并成一条的关系边写的字 */
+    schemaBundle: (n: number) => `${n} relations`,
     schemaOutgoing: "From this class",
     schemaIncoming: "To this class",
     schemaNoRelationships: "No relationships yet.",
@@ -1363,11 +1476,11 @@ export const en = {
   review: {
     title: "Review",
     hint: "Duplicates & low-confidence facts",
-    tabQueue: "Queue",
     tabHistory: "History",
     empty: "Nothing to review — the graph is clean.",
     historyEmpty: "No merges yet.",
     // 左栏分类导航
+    railOverview: "Overview",
     railPending: "Awaiting your nod",
     railDuplicates: "Duplicates",
     railConflicts: "Conflicts",
@@ -1379,6 +1492,28 @@ export const en = {
     railDecisions: "Decisions",
     railMerges: "Merges",
     categoryEmpty: "This queue is clear.",
+    // 总览（#377）
+    overviewTitle: "Overview",
+    overviewHint:
+      "What the base needs from you: how much is waiting and for how long, what has been decided, and how much of the base is still provisional.",
+    overviewWaiting: "Waiting",
+    overviewAllClear: "Nothing is waiting — the base is clean.",
+    overviewOldest: (days: number) =>
+      days === 0 ? "oldest since today" : days === 1 ? "oldest since yesterday" : `oldest waiting ${days} days`,
+    overviewOpen: "Review these",
+    overviewDecided: "Decided",
+    overviewLast7: "Last 7 days",
+    overviewLast30: "Last 30 days",
+    overviewAutomatic: (n: number) =>
+      n === 1 ? "1 by the adjudicator" : `${n} by the adjudicator`,
+    overviewDaily: "Decisions per day, last 14 days",
+    overviewByAction: "By kind",
+    overviewByActor: "Who decided",
+    overviewNoDecisions: "No decisions in the last 30 days.",
+    overviewHealth: "Base health",
+    overviewFacts: (n: number) =>
+      n === 1 ? "1 fact currently held. Of it:" : `${n} facts currently held. Of them:`,
+    overviewContested: "Contested",
     // 决策台账
     decisionsTitle: "Decisions",
     decisionsHint:
@@ -1398,6 +1533,7 @@ export const en = {
       "conflict.reject_new": "Rejected new",
       "merge.revert": "Reverted merge",
       "merge.manual": "Merged manually",
+      "fact.time_corrected": "Time corrected",
     } as Record<string, string>,
     /** 升格给人裁决的原因。服务端存 code（可选 |detail），措辞在这里 */
     escalated: {
@@ -1562,6 +1698,7 @@ export const en = {
   },
   /** 通用组件文案（SearchSelect 等） */
   ui: {
+    close: "Close",
     noMatches: "No matches",
     keepTyping: (n: number) => `${n} more — keep typing to narrow down`,
   },
