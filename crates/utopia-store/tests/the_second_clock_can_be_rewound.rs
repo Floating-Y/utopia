@@ -304,7 +304,7 @@ async fn the_recording_axis_rewinds_on_every_graph_read() -> anyhow::Result<()> 
         (changed, Some(f.correction)),
     ] {
         let (_, rows) =
-            utopia_store::graph::entity_detail(&pool, f.kb, f.zhang, Some(moment)).await?;
+            utopia_store::graph::entity_detail(&pool, f.kb, f.zhang, None, Some(moment)).await?;
         let ids: Vec<_> = rows.iter().map(|row| row.id).collect();
         assert_eq!(
             ids,
