@@ -206,9 +206,31 @@ async fn permit(ctx: &Ctx<'_>) -> Option<tokio::sync::OwnedSemaphorePermit> {
 }
 
 fn pair_of(item: &ReviewItem, p: &Precedents) -> utopia_extract::AdjudicationPair {
+    // 同名且大类不冲突的对：两侧写同一个类型标签。抽取器给同一家公司的两条记录
+    // Store 与 Organization，模型就拿这个当「不同」的理由——把拐杖拿掉，让它看事实
+    // 只在两侧都归得到同一个大类（人、组织、地点、事件）时才共用：Periodical 对 Service、
+    // VideoGame 对没类型，那些标签是有信息的，留着
+    let same_kind = gov::name_shape(&item.left.name, &item.right.name) == gov::NameShape::Identical
+        && matches!(
+            (
+                item.left.type_label.as_deref().and_then(gov::type_family),
+                item.right.type_label.as_deref().and_then(gov::type_family),
+            ),
+            (Some(a), Some(b)) if a == b
+        );
+    let shared = item
+        .left
+        .type_label
+        .clone()
+        .or_else(|| item.right.type_label.clone())
+        .unwrap_or_else(|| "untyped".into());
     let side = |s: &utopia_core::models::ReviewSide| utopia_extract::AdjudicationSide {
         name: s.name.clone(),
-        type_label: s.type_label.clone().unwrap_or_else(|| "untyped".into()),
+        type_label: if same_kind {
+            shared.clone()
+        } else {
+            s.type_label.clone().unwrap_or_else(|| "untyped".into())
+        },
         facts: s.top_facts.clone(),
     };
     utopia_extract::AdjudicationPair {
@@ -229,14 +251,22 @@ async fn settle(
 ) -> anyhow::Result<()> {
     let pool = &ctx.state.pool;
     let kb_id = ctx.kb_id;
-    let types_conflict = matches!(
-        (&item.left.type_label, &item.right.type_label),
-        (Some(a), Some(b)) if a != b
+    let types_conflict = gov::types_conflict(
+        item.left.type_label.as_deref(),
+        item.right.type_label.as_deref(),
     );
+    let shape = gov::name_shape(&item.left.name, &item.right.name);
 
     // 第二层：只接判不定的，硬规则拦下的不进。预算用完了照第一刀写建议
-    if gov::gate(look.same, look.conf, types_conflict, p) == Gate::Propose
+    // 同名、大类不冲突、模型却说不同：这是它最爱错的一种，先别采纳，让第二层带着
+    // 全部事实与原文再看一遍
+    let doubted_split = shape == gov::NameShape::Identical
+        && !types_conflict
+        && look.same == Some(false)
+        && look.calls == 0;
+    if (gov::gate(look.same, look.conf, types_conflict, shape, p) == Gate::Propose
         && look.uncertain()
+        || doubted_split)
         && p.reverts.is_empty()
     {
         let spent = gov::loop_calls_today(pool, kb_id).await?;
@@ -270,7 +300,7 @@ async fn settle(
         calls: look.calls,
     };
 
-    match gov::gate(look.same, look.conf, types_conflict, p) {
+    match gov::gate(look.same, look.conf, types_conflict, shape, p) {
         Gate::Apply if look.same == Some(true) => {
             let reason = format!("governed|{conf:.2}");
             // 同簇连锁：前一对合完，这一对的一侧可能已经并进了别人——合活着的那个
