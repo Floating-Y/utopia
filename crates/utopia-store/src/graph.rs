@@ -14,6 +14,7 @@ type FactSpanRow = (
     Uuid,
     Option<chrono::DateTime<chrono::Utc>>,
     Option<chrono::DateTime<chrono::Utc>>,
+    Option<String>,
 );
 
 /// 采纳时旧事实的去向（`fact_adoptions.mode`）：新写一行取代它。
@@ -124,7 +125,7 @@ pub async fn insert_fact(
 /// |---|---|---|
 /// | 仍在持续 | `None` | `None` |
 /// | **结束了，不知哪天** | `None` | `Some("unknown")` |
-/// | 某时结束 | `Some(t)` | `Some("year"/"month"/"day")` |
+/// | 某时结束 | `Some(t)` | `Some(WORLD_PRECISIONS 之一)` |
 ///
 /// 第二行是后加的。在它之前 `to = None` 同时承载「还在持续」和「不知何时
 /// 结束」，于是 "former CEO of Weta Digital" 这种**结束明确、日期缺失**的句子
@@ -135,10 +136,57 @@ pub struct Validity<'a> {
     pub from_precision: Option<&'a str>,
     pub to: Option<chrono::DateTime<chrono::Utc>>,
     pub to_precision: Option<&'a str>,
+    /// 这次观察的证据是哪一天的——文档的日期（0022）。`None` 即此刻：人此刻写下
+    /// 的事实，人就是证据。落库成 `attested_from`，说结束了不知哪天的观察还落成
+    /// `attested_to`（#393，两端各有各的锚点）；同一断言再被观察到时只往早挪。
+    /// 没有起点的事实从它起成立，结束了不知哪天的到它为止——**它不是起点**，所以
+    /// 不写进 `from`（0003 拒绝过把文档日期填进日期列）
+    pub attested_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// `valid_to_precision` 表示「结束了，但不知道是哪天」。
 pub const ENDED_UNKNOWN: &str = "unknown";
+
+/// 世界轴的精度梯子（0024）：从年到秒，不再往下——没有哪个源头陈述到亚秒；记录轴留
+/// 微秒是因为那是我们自己的钟。结束端另有 `ENDED_UNKNOWN`。数据库的 CHECK 也是这一张表，
+/// 抽取端 `parse_time`、给模型看的 `time_text`、导出的 `rdf::world_time` 都照它拼
+pub const WORLD_PRECISIONS: [&str; 6] = ["year", "month", "day", "hour", "minute", "second"];
+
+/// 把值截到它的精度：年精度是 1 月 1 日 0 点，秒精度是整秒。**存的值与精度说同一句话**
+/// （0024 第 2 条，数据库有同样的 CHECK）；没有精度（锚点、派生的界）原样返回。
+pub fn truncate_to(
+    t: chrono::DateTime<chrono::Utc>,
+    precision: Option<&str>,
+) -> chrono::DateTime<chrono::Utc> {
+    use chrono::{Datelike, NaiveDate, NaiveTime, TimeZone, Timelike};
+    let n = t.naive_utc();
+    let (d, time) = (n.date(), n.time());
+    let (date, time) = match precision {
+        Some("year") => (
+            NaiveDate::from_ymd_opt(d.year(), 1, 1).unwrap_or(d),
+            NaiveTime::MIN,
+        ),
+        Some("month") => (
+            NaiveDate::from_ymd_opt(d.year(), d.month(), 1).unwrap_or(d),
+            NaiveTime::MIN,
+        ),
+        Some("day") => (d, NaiveTime::MIN),
+        Some("hour") => (
+            d,
+            NaiveTime::from_hms_opt(time.hour(), 0, 0).unwrap_or(time),
+        ),
+        Some("minute") => (
+            d,
+            NaiveTime::from_hms_opt(time.hour(), time.minute(), 0).unwrap_or(time),
+        ),
+        Some("second") => (
+            d,
+            NaiveTime::from_hms_opt(time.hour(), time.minute(), time.second()).unwrap_or(time),
+        ),
+        _ => return t,
+    };
+    chrono::Utc.from_utc_datetime(&date.and_time(time))
+}
 
 impl<'a> Validity<'a> {
     /// 起始端已知、结束端未知或不适用。
@@ -151,7 +199,21 @@ impl<'a> Validity<'a> {
             from_precision,
             to: None,
             to_precision: None,
+            attested_at: None,
         }
+    }
+
+    /// 这次观察出自哪一天的文档。
+    pub fn attested(mut self, at: Option<chrono::DateTime<chrono::Utc>>) -> Self {
+        self.attested_at = at;
+        self
+    }
+
+    /// 两端截到各自的精度（0024）。写入路径进库前都走一遍，与数据库的 CHECK 同一句话
+    pub fn truncated(mut self) -> Self {
+        self.from = self.from.map(|t| truncate_to(t, self.from_precision));
+        self.to = self.to.map(|t| truncate_to(t, self.to_precision));
+        self
     }
 
     /// 原文说它结束了，但没说哪天。
@@ -182,14 +244,15 @@ async fn insert_fact_inner(
     validity: Validity<'_>,
     confidence: f32,
 ) -> AppResult<(Uuid, bool)> {
+    let validity = validity.truncated();
     let same_sql = match object {
         FactObject::Entity(_) => {
-            "SELECT id, valid_from, valid_to FROM facts
+            "SELECT id, valid_from, valid_to, valid_to_precision FROM facts
              WHERE kb_id = $1 AND subject_id = $2 AND predicate_id = $3 AND object_id = $4
                AND invalidated_at IS NULL"
         }
         FactObject::Value(_) => {
-            "SELECT id, valid_from, valid_to FROM facts
+            "SELECT id, valid_from, valid_to, valid_to_precision FROM facts
              WHERE kb_id = $1 AND subject_id = $2 AND predicate_id = $3 AND object_value = $4
                AND object_id IS NULL AND invalidated_at IS NULL"
         }
@@ -203,25 +266,59 @@ async fn insert_fact_inner(
         FactObject::Value(v) => q.bind(v),
     };
     let same: Vec<FactSpanRow> = q.fetch_all(pool).await?;
+    // 「结束了，不知哪天」的观察撞上同断言的**开放行**（0022 / #393）：关上它。
+    // 不并进去——并进去等于把「它结束了」这唯一带来的信息丢掉（同 valid_from 那条
+    // 精确重复的路会这么干）；也不另立一行——另立一行让两条各说各话，开放的那条
+    // 照旧被读成「至今仍是」（#345 的那道题正是这样挂的）。
+    // 修正走 supersede：旧行作废，新行终点仍空、精度 'unknown'，`attested_to` 锚在说出
+    // 结束的那份文档上；起点照旧——有日期的用日期，没日期的裸行留着它自己的
+    // `attested_from`（第一份证据）。两个锚点，裸行也关得上
+    if validity.to.is_none() && validity.to_precision == Some(ENDED_UNKNOWN) {
+        let open = same
+            .iter()
+            .filter(|(_, vf, vt, vtp)| {
+                vt.is_none() && vtp.is_none() && validity.from.is_none_or(|f| Some(f) == *vf)
+            })
+            .max_by_key(|(_, vf, _, _)| *vf);
+        if let Some((open, _, _, _)) = open {
+            if let Some(closed) =
+                crate::temporal::close_with_unknown_end(pool, *open, validity.attested_at).await?
+            {
+                return Ok((closed, true));
+            }
+        }
+        // 已经关上的（结束了不知哪天）再听到一次「结束了」：同一件事，复用那一行。
+        // 锚点只往早挪——更早的文档说它结束了，它就结束得更早
+        if let Some((ended, _, _, _)) = same.iter().find(|(_, vf, vt, vtp)| {
+            vt.is_none()
+                && vtp.as_deref() == Some(ENDED_UNKNOWN)
+                && validity.from.is_none_or(|f| Some(f) == *vf)
+        }) {
+            attest_earlier(pool, *ended, validity.attested_at).await?;
+            return Ok((*ended, false));
+        }
+    }
     // 精确重复：同 valid_from → 复用
-    if let Some((existing, _, _)) = same.iter().find(|(_, vf, _)| *vf == validity.from) {
+    if let Some((existing, _, _, _)) = same.iter().find(|(_, vf, _, _)| *vf == validity.from) {
+        attest_earlier(pool, *existing, validity.attested_at).await?;
         return Ok((*existing, false));
     }
     // 弱化陈述：新观察无时间，同断言已有开放行 → 并入（取起点最新的开放行）
     if validity.from.is_none() && !validity.has_ended() {
-        if let Some((existing, _, _)) = same
+        if let Some((existing, _, _, _)) = same
             .iter()
-            .filter(|(_, _, vt)| vt.is_none())
-            .max_by_key(|(_, vf, _)| *vf)
+            .filter(|(_, _, vt, _)| vt.is_none())
+            .max_by_key(|(_, vf, _, _)| *vf)
         {
+            attest_earlier(pool, *existing, validity.attested_at).await?;
             return Ok((*existing, false));
         }
     }
     // 时间精化候选：已有无时无终的裸行，本次观察带了起点 → 落库后作废裸行并链上
     let refine_target = if validity.from.is_some() {
         same.iter()
-            .find(|(_, vf, vt)| vf.is_none() && vt.is_none())
-            .map(|(id, _, _)| *id)
+            .find(|(_, vf, vt, _)| vf.is_none() && vt.is_none())
+            .map(|(id, _, _, _)| *id)
     } else {
         None
     };
@@ -229,16 +326,21 @@ async fn insert_fact_inner(
     let id = Uuid::now_v7();
     let insert_sql = match object {
         FactObject::Entity(_) => {
+            // 说结束了不知哪天的观察，说出结束的就是它自己那份文档：attested_to 也落它
             "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_id,
                                 valid_from, valid_from_precision,
-                                valid_to, valid_to_precision, confidence)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+                                valid_to, valid_to_precision, confidence,
+                                attested_from, attested_to)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, now()),
+                     CASE WHEN $9::text = 'unknown' THEN COALESCE($11, now()) END)"
         }
         FactObject::Value(_) => {
             "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_value,
                                 valid_from, valid_from_precision,
-                                valid_to, valid_to_precision, confidence)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)"
+                                valid_to, valid_to_precision, confidence,
+                                attested_from, attested_to)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, now()),
+                     CASE WHEN $9::text = 'unknown' THEN COALESCE($11, now()) END)"
         }
     };
     let mut ins = sqlx::query(insert_sql)
@@ -255,6 +357,7 @@ async fn insert_fact_inner(
         .bind(validity.to)
         .bind(validity.to_precision)
         .bind(confidence)
+        .bind(validity.attested_at)
         .execute(pool)
         .await?;
 
@@ -282,6 +385,33 @@ async fn insert_fact_inner(
         .await?;
     }
     Ok((id, true))
+}
+
+/// 同一断言又被观察到一次：锚点只往早挪（0022）。更早的文档是更早的证据；
+/// 更晚的什么也不改——一条事实从有证据的那一刻起成立，之后再被提到不会把它
+/// 往后推。`None`（此刻）也不动它：此刻不会早于任何已有的证据。
+async fn attest_earlier(
+    pool: &PgPool,
+    fact_id: Uuid,
+    at: Option<chrono::DateTime<chrono::Utc>>,
+) -> AppResult<()> {
+    if let Some(at) = at {
+        // 两个锚点都只往早挪：更早的文档既是它成立的更早证据，若它说的是结束，也是
+        // 结束得更早的证据。attested_to 只在结束未知的行上有，NULL 的留 NULL
+        sqlx::query(
+            // LEAST 会跳过 NULL——开放行的 attested_to 是 NULL，直接 least 会给它凭空长出一个
+            // 终点锚，撞上 CHECK。NULL 的留 NULL
+            "UPDATE facts SET attested_from = least(attested_from, $2),
+                              attested_to = CASE WHEN attested_to IS NULL THEN NULL
+                                                 ELSE least(attested_to, $2) END
+              WHERE id = $1",
+        )
+        .bind(fact_id)
+        .bind(at)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
 }
 
 /// 字面值宾语的事实（object_value 通道，问数映射首个消费者）。
@@ -350,11 +480,16 @@ pub async fn add_evidence(
 /// `as_of`：绑记录轴参数的位置（`None` = 只答现在，写路径和"当下"视图用这个）。
 /// 度数跟着画布走——回放时数的是**当时**连在这个节点上的边，否则右上角的数
 /// 和眼前的图对不上。
-fn node_sql(as_of: Option<usize>) -> String {
+/// `owner`：**只在真的传了时刻时**才绑（#336）。`fact_owner_at` 包住列之后
+/// `facts` 上按主宾的索引就用不上了，而「现在」是每次画图都要走的那条路
+fn node_sql(as_of: Option<usize>, owner: Option<usize>) -> String {
     let held = match as_of {
         Some(param) => crate::record_axis::facts_held_at("f", param),
         None => "f.invalidated_at IS NULL".to_string(),
     };
+    // 主宾也跟着倒：三月被合并掉的实体，在二月身上还挂着它自己的那些事实（#336）
+    let subject = crate::record_axis::owner_at("f", "subject_id", owner, false);
+    let object = crate::record_axis::owner_at("f", "object_id", owner, true);
     format!(
         "SELECT e.id, e.canonical_name AS name, t.key AS type_key,
         t.label AS type_label,
@@ -362,7 +497,7 @@ fn node_sql(as_of: Option<usize>) -> String {
         coalesce(t.shape, 'circle') AS shape,
         e.disambiguator,
         (SELECT count(*) FROM facts f
-         WHERE (f.subject_id = e.id OR f.object_id = e.id) AND {held}) AS degree
+         WHERE ({subject} = e.id OR {object} = e.id) AND {held}) AS degree
      FROM entities e LEFT JOIN entity_types t ON t.id = e.type_id"
     )
 }
@@ -387,8 +522,9 @@ pub async fn overview(
     as_of: Option<chrono::DateTime<chrono::Utc>>,
 ) -> AppResult<(Vec<GraphNode>, Vec<GraphEdge>, i64, i64)> {
     let nodes: Vec<GraphNode> = sqlx::query_as(&format!(
-        "{} WHERE e.kb_id = $1 AND e.merged_into IS NULL ORDER BY degree DESC, e.created_at LIMIT $2",
-        node_sql(Some(3))
+        "{} WHERE e.kb_id = $1 AND {visible} ORDER BY degree DESC, e.created_at LIMIT $2",
+        node_sql(Some(3), as_of.map(|_| 3)),
+        visible = crate::record_axis::entity_visible_at("e", 3),
     ))
     .bind(kb_id)
     .bind(limit)
@@ -404,19 +540,24 @@ pub async fn overview(
     // 「150 / 325」里那个 325 会跟用户在别处看到的数对不上——**回放时也一样**，
     // 边数跟着记录轴走，否则倒回三月的图上写着今天的边数。
     //
-    // 节点数没跟着倒：实体身上没有记录轴（`merged_into` 只说合并发生过，
-    // 时刻在 `entity_merges` 里），要倒得顺着那张表拆合并，是另一刀（0019 遗留问题）
-    let total_nodes: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM entities WHERE kb_id = $1 AND merged_into IS NULL",
-    )
+    // 节点数也跟着倒（#336）：实体的时刻在 `entity_merges` 上，不在实体行上——
+    // 三月并掉的那个，在二月既该出现在画布上，也该数进这个总数里
+    let total_nodes: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM entities e WHERE e.kb_id = $1 AND {visible}",
+        visible = crate::record_axis::entity_visible_at("e", 2),
+    ))
     .bind(kb_id)
+    .bind(as_of)
     .fetch_one(pool)
     .await?;
     let total_edges: i64 = sqlx::query_scalar(&format!(
+        // 两边都要 `object_id IS NOT NULL`：数的是**画得出来的边**。派生表拓宽
+        // 之后（0021）字面值结论也住在这张表里，把它们数进来，状态栏报的边数
+        // 就比画布上多——而多出来的那些永远找不到
         "SELECT (SELECT count(*) FROM facts f
                   WHERE f.kb_id = $1 AND {facts_held} AND f.object_id IS NOT NULL)
               + (SELECT count(*) FROM derived_facts d
-                  WHERE d.kb_id = $1 AND {derived_held})",
+                  WHERE d.kb_id = $1 AND {derived_held} AND d.object_id IS NOT NULL)",
         facts_held = crate::record_axis::facts_held_at("f", 2),
         derived_held = crate::record_axis::derived_held_at("d", 2),
     ))
@@ -451,12 +592,13 @@ async fn edges_among(
     // 断言那一段多算一位 `contested`：有 open 的违规或时态冲突指着它。派生撞断言
     // 时被撞的是 left；right 只是最后一条前提，它本身没有争议
     let edges: Vec<GraphEdge> = sqlx::query_as(&format!(
-        "SELECT f.id, f.subject_id AS source, f.object_id AS target,
+        "SELECT f.id, {subject} AS source, {object} AS target,
                 COALESCE(r.key, fact_surface_predicate(f.id)) AS predicate,
                 COALESCE(r.label, fact_surface_predicate(f.id)) AS label,
                 r.id IS NULL AS inferred, FALSE AS derived, NULL::text AS rule,
                 ARRAY[]::uuid[] AS premises,
-                f.valid_from, f.valid_to, f.confidence,
+                f.valid_from, f.valid_to,
+                {holds_from} AS holds_from, {holds_to} AS holds_to, f.confidence,
                 (EXISTS (SELECT 1 FROM axiom_violations v
                           WHERE {violation_open}
                             AND (v.left_fact = f.id
@@ -468,25 +610,22 @@ async fn edges_among(
                 FALSE AS blocked
          FROM facts f LEFT JOIN relation_types r ON r.id = f.predicate_id
          WHERE f.kb_id = $1 AND {facts_held} AND f.object_id IS NOT NULL
-           AND f.subject_id = ANY($2) AND f.object_id = ANY($2)
-           AND ($3::timestamptz IS NULL
-                OR ((f.valid_from IS NULL OR f.valid_from <= $3)
-                    AND (f.valid_to IS NULL OR f.valid_to > $3)))
+           AND {subject} = ANY($2) AND {object} = ANY($2)
+           AND {facts_hold}
          UNION ALL
          SELECT d.id, d.subject_id AS source, d.object_id AS target,
                 r.key AS predicate, r.label AS label,
                 FALSE AS inferred, TRUE AS derived, ru.kind AS rule,
                 ARRAY(SELECT fd.premise_fact_id FROM fact_derivations fd
                        WHERE fd.derived_fact_id = d.id ORDER BY fd.seq) AS premises,
-                d.valid_from, d.valid_to, d.confidence,
+                d.valid_from, d.valid_to,
+                d.valid_from AS holds_from, d.valid_to AS holds_to, d.confidence,
                 FALSE AS contested, FALSE AS blocked
          FROM derived_facts d JOIN relation_types r ON r.id = d.predicate_id
                               JOIN rules ru ON ru.id = d.rule_id
          WHERE d.kb_id = $1 AND {derived_held}
            AND d.subject_id = ANY($2) AND d.object_id = ANY($2)
-           AND ($3::timestamptz IS NULL
-                OR ((d.valid_from IS NULL OR d.valid_from <= $3)
-                    AND (d.valid_to IS NULL OR d.valid_to > $3)))
+           AND {derived_hold}
          UNION ALL
          SELECT v.id,
                 (v.detail->>'subject_id')::uuid AS source,
@@ -496,21 +635,32 @@ async fn edges_among(
                 v.path AS premises,
                 (v.detail->>'valid_from')::timestamptz AS valid_from,
                 (v.detail->>'valid_to')::timestamptz AS valid_to,
+                (v.detail->>'valid_from')::timestamptz AS holds_from,
+                (v.detail->>'valid_to')::timestamptz AS holds_to,
                 0::real AS confidence,
                 TRUE AS contested, TRUE AS blocked
          FROM axiom_violations v
          WHERE v.kb_id = $1 AND v.kind = 'derived_contradiction' AND {violation_open}
            AND (v.detail->>'subject_id')::uuid = ANY($2)
            AND (v.detail->>'object_id')::uuid = ANY($2)
-           AND ($3::timestamptz IS NULL
-                OR (((v.detail->>'valid_from')::timestamptz IS NULL
-                     OR (v.detail->>'valid_from')::timestamptz <= $3)
-                    AND ((v.detail->>'valid_to')::timestamptz IS NULL
-                         OR (v.detail->>'valid_to')::timestamptz > $3)))",
+           AND {ghost_hold}",
+        // 世界轴（0022）：三段都从 world_axis 拼，读点上不再手写 NULL 的含义
+        facts_hold = crate::world_axis::facts_hold_at("f", 3),
+        derived_hold = crate::world_axis::derived_hold_at("d", 3),
+        ghost_hold = crate::world_axis::interval_holds_at(
+            "(v.detail->>'valid_from')::timestamptz",
+            "(v.detail->>'valid_to')::timestamptz",
+            3,
+        ),
+        holds_from = crate::world_axis::facts_holds_from("f"),
+        holds_to = crate::world_axis::facts_holds_to("f"),
         facts_held = crate::record_axis::facts_held_at("f", 4),
         derived_held = crate::record_axis::derived_held_at("d", 4),
         violation_open = crate::record_axis::violation_open_at("v", 4),
         conflict_open = crate::record_axis::conflict_open_at("c", 4),
+        // 派生边不跟着倒：它们由引擎按当时的断言推出，主宾从来没被合并改写过
+        subject = crate::record_axis::owner_at("f", "subject_id", as_of.map(|_| 4), false),
+        object = crate::record_axis::owner_at("f", "object_id", as_of.map(|_| 4), true),
     ))
     .bind(kb_id)
     .bind(ids)
@@ -541,10 +691,12 @@ pub async fn neighborhood(
         // 铺开也走记录轴：邻居按**当时**的边找，否则回放的图上会长出
         // 只有今天才连得上的节点
         let touching: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(&format!(
-            "SELECT f.subject_id, f.object_id FROM facts f
+            "SELECT {subject}, {object} FROM facts f
              WHERE f.kb_id = $1 AND {facts_held} AND f.object_id IS NOT NULL
-               AND (f.subject_id = ANY($2) OR f.object_id = ANY($2))",
+               AND ({subject} = ANY($2) OR {object} = ANY($2))",
             facts_held = crate::record_axis::facts_held_at("f", 3),
+            subject = crate::record_axis::owner_at("f", "subject_id", as_of.map(|_| 3), false),
+            object = crate::record_axis::owner_at("f", "object_id", as_of.map(|_| 3), true),
         ))
         .bind(kb_id)
         .bind(&frontier)
@@ -568,8 +720,9 @@ pub async fn neighborhood(
 
     let ids: Vec<Uuid> = seen.into_iter().collect();
     let nodes: Vec<GraphNode> = sqlx::query_as(&format!(
-        "{} WHERE e.kb_id = $1 AND e.id = ANY($2)",
-        node_sql(Some(3))
+        "{} WHERE e.kb_id = $1 AND e.id = ANY($2) AND {visible}",
+        node_sql(Some(3), as_of.map(|_| 3)),
+        visible = crate::record_axis::entity_visible_at("e", 3),
     ))
     .bind(kb_id)
     .bind(&ids)
@@ -594,7 +747,7 @@ pub async fn search_entities(
         "{} WHERE e.kb_id = $1 AND e.merged_into IS NULL
          AND e.canonical_name ILIKE $2
          ORDER BY degree DESC, e.canonical_name LIMIT $3 OFFSET $4",
-        node_sql(None)
+        node_sql(None, None)
     ))
     .bind(kb_id)
     .bind(&pattern)
@@ -618,11 +771,12 @@ pub async fn entity_detail(
     pool: &PgPool,
     kb_id: Uuid,
     entity_id: Uuid,
+    at: Option<chrono::DateTime<chrono::Utc>>,
     as_of: Option<chrono::DateTime<chrono::Utc>>,
 ) -> AppResult<(GraphNode, Vec<EntityFact>)> {
     let node: GraphNode = sqlx::query_as(&format!(
         "{} WHERE e.kb_id = $1 AND e.id = $2",
-        node_sql(Some(3))
+        node_sql(Some(3), as_of.map(|_| 3))
     ))
     .bind(kb_id)
     .bind(entity_id)
@@ -633,13 +787,14 @@ pub async fn entity_detail(
 
     let facts: Vec<EntityFact> = sqlx::query_as(&format!(
         "SELECT f.id,
-                CASE WHEN f.subject_id = $2 THEN 'out' ELSE 'in' END AS direction,
+                CASE WHEN {subject} = $2 THEN 'out' ELSE 'in' END AS direction,
                 COALESCE(r.key, fact_surface_predicate(f.id)) AS predicate_key,
                 COALESCE(r.label, fact_surface_predicate(f.id)) AS predicate_label,
                 r.id IS NULL AS inferred, r.temporal,
-                CASE WHEN f.subject_id = $2 THEN f.object_id ELSE f.subject_id END AS other_id,
+                CASE WHEN {subject} = $2 THEN {object} ELSE {subject} END AS other_id,
                 o.canonical_name AS other_name, f.object_value,
-                f.valid_from, f.valid_from_precision, f.valid_to, f.valid_to_precision, f.confidence,
+                f.valid_from, f.valid_from_precision, f.valid_to, f.valid_to_precision,
+                {holds_from} AS holds_from, {holds_to} AS holds_to, f.confidence,
                 (SELECT count(*) FROM fact_evidence fe WHERE fe.fact_id = f.id) AS evidence_count,
                 (EXISTS (SELECT 1 FROM fact_evidence fe WHERE fe.fact_id = f.id)
                  AND NOT EXISTS (SELECT 1 FROM fact_evidence fe
@@ -671,11 +826,16 @@ pub async fn entity_detail(
          FROM facts f
          LEFT JOIN relation_types r ON r.id = f.predicate_id
          LEFT JOIN entities o
-           ON o.id = CASE WHEN f.subject_id = $2 THEN f.object_id ELSE f.subject_id END
-         WHERE f.kb_id = $1 AND {facts_held}
-           AND (f.subject_id = $2 OR f.object_id = $2)
+           ON o.id = CASE WHEN {subject} = $2 THEN {object} ELSE {subject} END
+         WHERE f.kb_id = $1 AND {facts_held} AND {facts_hold}
+           AND ({subject} = $2 OR {object} = $2)
          ORDER BY f.valid_from NULLS LAST, f.recorded_at",
         facts_held = crate::record_axis::facts_held_at("f", 3),
+        facts_hold = crate::world_axis::facts_hold_at("f", 4),
+        holds_from = crate::world_axis::facts_holds_from("f"),
+        holds_to = crate::world_axis::facts_holds_to("f"),
+        subject = crate::record_axis::owner_at("f", "subject_id", as_of.map(|_| 3), false),
+        object = crate::record_axis::owner_at("f", "object_id", as_of.map(|_| 3), true),
         chunk_live = crate::record_axis::chunk_live_at("c", 3),
         violation_open = crate::record_axis::violation_open_at("v", 3),
         conflict_open = crate::record_axis::conflict_open_at("c", 3),
@@ -683,6 +843,7 @@ pub async fn entity_detail(
     .bind(kb_id)
     .bind(entity_id)
     .bind(as_of)
+    .bind(at)
     .fetch_all(pool)
     .await?;
 
@@ -704,7 +865,7 @@ pub async fn update_entity(
 ) -> AppResult<(GraphNode, GraphNode)> {
     let before: GraphNode = sqlx::query_as(&format!(
         "{} WHERE e.kb_id = $1 AND e.id = $2 AND e.merged_into IS NULL",
-        node_sql(None)
+        node_sql(None, None)
     ))
     .bind(kb_id)
     .bind(entity_id)
@@ -781,7 +942,7 @@ pub async fn update_entity(
 
     let after: GraphNode = sqlx::query_as(&format!(
         "{} WHERE e.kb_id = $1 AND e.id = $2",
-        node_sql(None)
+        node_sql(None, None)
     ))
     .bind(kb_id)
     .bind(entity_id)
@@ -801,7 +962,7 @@ pub async fn same_name_peers(
         "{} WHERE e.kb_id = $1 AND e.merged_into IS NULL AND e.id <> $2
            AND lower(e.canonical_name) = (SELECT lower(canonical_name) FROM entities WHERE id = $2)
          ORDER BY degree DESC LIMIT 10",
-        node_sql(None)
+        node_sql(None, None)
     ))
     .bind(kb_id)
     .bind(entity_id)
@@ -1509,10 +1670,12 @@ async fn adopt(
                 let inserted: Option<(Uuid,)> = sqlx::query_as(
                     "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_id, object_value,
                                         valid_from, valid_from_precision,
-                                        valid_to, valid_to_precision, confidence, supersedes)
+                                        valid_to, valid_to_precision, confidence, supersedes,
+                                        attested_from, attested_to)
                      SELECT $1, kb_id, $6, $3, $4, $5,
                             valid_from, valid_from_precision,
-                            valid_to, valid_to_precision, confidence, id
+                            valid_to, valid_to_precision, confidence, id,
+                            attested_from, attested_to
                      FROM facts WHERE id = $2 AND invalidated_at IS NULL
                      RETURNING id",
                 )

@@ -33,7 +33,7 @@ import {
 } from "lucide-react";
 import { api, type SourceView } from "../api";
 import { S } from "../i18n";
-import { RAIL_CLS } from "../ui";
+import { RAIL_CLS, RailItem } from "../ui";
 
 /** 左栏选择：全部 / 手动上传 / 某个来源 id */
 /** "deleted" = 墓碑视图（#268）：删了、还能恢复或清除的文档 */
@@ -95,47 +95,17 @@ export const SYNCING_KINDS = new Set([
 ]);
 
 export const SYNC_DOT: Record<SourceView["last_sync_status"], string> = {
-  never: "bg-neutral-600",
-  queued: "bg-[var(--u-warn)]",
-  running: "bg-[var(--u-warn)] animate-pulse",
-  ok: "bg-[var(--u-ok)]",
-  failed: "bg-[var(--u-danger)]",
+  never: "bg-ink-3",
+  queued: "bg-warn",
+  running: "bg-warn animate-pulse",
+  ok: "bg-ok",
+  failed: "bg-danger",
 };
 
 export function sourceIcon(s: SourceView): LucideIcon {
   // 内置类型图标固定，只有 custom 尊重用户自选图标
   if (s.kind === "custom" && s.icon && SOURCE_ICONS[s.icon]) return SOURCE_ICONS[s.icon];
   return KIND_ICON[s.kind] || Globe;
-}
-
-function RailItem({
-  active,
-  onClick,
-  icon,
-  label,
-  count,
-  dot,
-}: {
-  active: boolean;
-  onClick: () => void;
-  icon: React.ReactNode;
-  label: string;
-  count: number;
-  dot?: string;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={`w-full flex items-center gap-2 rounded-lg px-2.5 py-1.5 text-[13px] transition-colors ${
-        active ? "u-nav-active" : "text-neutral-400 hover:bg-white/[0.05] hover:text-neutral-200"
-      }`}
-    >
-      <span className="shrink-0 text-neutral-500">{icon}</span>
-      <span className="truncate">{label}</span>
-      {dot && <span className={`h-1.5 w-1.5 rounded-full shrink-0 ${dot}`} />}
-      <span className="ml-auto shrink-0 u-num text-[10.5px] text-neutral-600">{count}</span>
-    </button>
-  );
 }
 
 export function SourcesRail({
@@ -170,39 +140,37 @@ export function SourcesRail({
 
   return (
     <aside className={`${RAIL_CLS} flex flex-col`}>
-      {/* 全部文档置顶为一级入口；SOURCES 小节（含 +）居其下 */}
-      <div className="px-2 pt-3">
+      {/* 全部文档置顶为一级入口。**不带计数**：它是总数，下面各行已经说了
+          文档都在哪，这个数只是装饰 */}
+      <div className="px-3 pt-3">
         <RailItem
           active={active === "all"}
           onClick={() => onSelect("all")}
           icon={<LibraryIcon size={14} />}
-          label={S.library.allDocs}
-          count={docs.data?.total ?? 0}
-        />
+        >
+          {S.library.allDocs}
+        </RailItem>
       </div>
-      <div className="flex items-center justify-between px-4 pt-3 pb-1.5">
-        <span className="text-[10px] font-medium uppercase tracking-[0.08em] text-neutral-500">
-          {S.library.sources}
-        </span>
-        {onAdd && (
-          <button
-            onClick={onAdd}
-            title={S.library.addSource}
-            className="text-neutral-500 hover:text-neutral-200"
-          >
-            <Plus size={14} />
-          </button>
-        )}
-      </div>
-      <div className="u-scroll flex-1 overflow-y-auto px-2 pb-3 space-y-0.5">
+      {/* 新建来源是一行，与 Chat 的「New chat」、本体页的「New class」同一个
+          语汇：加号在图标槽里，行本身与周围的行同一副样子——这一栏从头到尾只有
+          一种东西。没有 onAdd 的页面（文档查看页）不渲染这一行 */}
+      {onAdd && (
+        <div className="px-3 pt-1">
+          <RailItem icon={<Plus size={14} />} onClick={onAdd}>
+            {S.library.newSourceTitle}
+          </RailItem>
+        </div>
+      )}
+      <div className="u-scroll flex-1 overflow-y-auto px-3 pt-1 pb-3 space-y-1">
         {/* Uploads：常驻默认来源（上传的默认去处，不可删除） */}
         <RailItem
           active={active === "uploads"}
           onClick={() => onSelect("uploads")}
           icon={<Upload size={14} />}
-          label={S.library.uploads}
           count={uploadsCount}
-        />
+        >
+          {S.library.uploads}
+        </RailItem>
         {sourceList.map((s) => {
           const Icon = sourceIcon(s);
           return (
@@ -211,27 +179,29 @@ export function SourcesRail({
               active={active === s.id}
               onClick={() => onSelect(s.id)}
               icon={<Icon size={14} />}
-              label={s.name}
               count={s.doc_count}
               dot={
                 SYNCING_KINDS.has(s.kind) || s.kind === "api"
                   ? SYNC_DOT[s.last_sync_status]
                   : undefined
               }
-            />
+            >
+              {s.name}
+            </RailItem>
           );
         })}
       </div>
       {/* 已删除（#268）：墓碑在这里等着被恢复或清除。一个都没有就不占一行 */}
       {((docs.data?.deleted ?? 0) > 0 || active === "deleted") && (
-        <div className="px-2 pb-3">
+        <div className="px-3 pb-3">
           <RailItem
             active={active === "deleted"}
             onClick={() => onSelect("deleted")}
             icon={<Trash2 size={14} />}
-            label={S.library.deleted}
             count={docs.data?.deleted ?? 0}
-          />
+          >
+            {S.library.deleted}
+          </RailItem>
         </div>
       )}
     </aside>

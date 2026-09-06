@@ -24,7 +24,7 @@ pub(super) async fn require_kb(
 /// 两根轴共用这一个解析：`at` 走世界轴（那时世界是什么样），`as_of` 走记录轴
 /// （那时我们以为世界是什么样）。**两个参数一路分开**（0019）：合成一个控件，
 /// 答出来的是另一个问题，而屏幕上看不出来
-fn parse_instant(
+pub(super) fn parse_instant(
     field: &str,
     raw: Option<&str>,
 ) -> Result<Option<chrono::DateTime<chrono::Utc>>, AppError> {
@@ -166,13 +166,15 @@ pub async fn entity_detail(
 ) -> ApiResult<Json<serde_json::Value>> {
     require_kb(&state, &user, kb_id, Role::Viewer).await?;
     let as_of = parse_instant("as_of", q.as_of.as_deref())?;
+    // 世界轴不过滤（at = None）：面板要的是整条时间线，「此刻成立」那一档由前端
+    // 按 holds_from / holds_to 分出来（0022）
     let (entity, facts) =
-        utopia_store::graph::entity_detail(&state.pool, kb_id, entity_id, as_of).await?;
+        utopia_store::graph::entity_detail(&state.pool, kb_id, entity_id, None, as_of).await?;
     // 推出来的那些**单独回一个键**，不掺进 `facts`。前端据此给它们自己的一档：
     // 一条派生边跟一条断言边混在同一个列表里，用户看不出「这条是文档里写的」
     // 和「这条是引擎推的」的区别，而那正是推理会污染知识的样子
     let derived =
-        utopia_store::reasoning::derived_for_entity(&state.pool, kb_id, entity_id).await?;
+        utopia_store::reasoning::derived_for_entity(&state.pool, kb_id, entity_id, None).await?;
     // 同名的那些**打开面板时就给**，不是等改名之后才回。
     //
     // 从前它只随 `update_entity` 的响应回来，于是「把同名的合并进来」这个动作
@@ -275,7 +277,8 @@ pub struct FactTimePatch {
     pub note: Option<String>,
 }
 
-const DATE_PRECISIONS: [&str; 3] = ["year", "month", "day"];
+// 梯子只有一张（0024）：与数据库的 CHECK、抽取端、显示端同一列
+const DATE_PRECISIONS: [&str; 6] = utopia_store::graph::WORLD_PRECISIONS;
 
 /// 修改前的区间，用于「一字未改」的判定与台账里的前后对照。
 #[derive(sqlx::FromRow)]
@@ -298,7 +301,7 @@ fn check_interval(p: &FactTimePatch) -> Result<(), AppError> {
         (None, None) => {}
         _ => return Err(AppError::invalid(
             "bad_valid_from",
-            "A start date needs a precision of year, month or day, and a precision needs a date.",
+            "A start date needs a precision of year, month, day, hour, minute or second, and a precision needs a date.",
         )),
     }
     // 结束端：有日期必有精度；没日期只能是仍在持续（都为空）或结束了不知哪天
@@ -309,7 +312,7 @@ fn check_interval(p: &FactTimePatch) -> Result<(), AppError> {
         _ => {
             return Err(AppError::invalid(
                 "bad_valid_to",
-                "An end date needs a precision of year, month or day. Leave the date empty for still going, or mark it ended with an unknown date.",
+                "An end date needs a precision of year, month, day, hour, minute or second. Leave the date empty for still going, or mark it ended with an unknown date.",
             ))
         }
     }
@@ -371,6 +374,9 @@ pub async fn update_fact_time(
         from_precision: req.valid_from_precision.as_deref(),
         to: req.valid_to,
         to_precision: req.valid_to_precision.as_deref(),
+        // 修正行从被替代的行继承锚点（correct_interval 的 SQL 里）：改区间是重述
+        // 同一份证据，不是更新的证据
+        attested_at: None,
     };
     let Some(corrected) =
         utopia_store::temporal::correct_interval(&state.pool, fact_id, validity).await?

@@ -3,12 +3,21 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useNavigate } from "@tanstack/react-router";
 import { usePageTitle } from "../useTitle";
-import { BookMarked, KeyRound, ShieldCheck, UserRound } from "lucide-react";
+import {
+  KeyRound,
+  Layers,
+  ShieldCheck,
+  UserRound,
+} from "lucide-react";
 import { api, ApiError } from "../api";
 import { S } from "../i18n";
-import { GithubMark, RAIL_CLS, SectionMark } from "../ui";
+import {
+  RAIL_CLS,
+  rowClass,
+  SectionMark,
+} from "../ui";
 import { ServerDown } from "./ServerDown";
-import { UserMenu } from "./UserMenu";
+import { HeaderActions } from "./HeaderActions";
 
 export function AccountShell() {
   const navigate = useNavigate();
@@ -19,7 +28,7 @@ export function AccountShell() {
 
   if (me.isPending) {
     return (
-      <div className="min-h-screen flex items-center justify-center text-neutral-500 text-sm">
+      <div className="min-h-screen flex items-center justify-center text-ink-3 text-body">
         {S.nav.loading}
       </div>
     );
@@ -32,41 +41,25 @@ export function AccountShell() {
     return <ServerDown />;
   }
 
-  const rail =
-    "flex items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] text-neutral-400 hover:bg-white/[0.05] hover:text-neutral-200";
-  const railActive = "flex items-center gap-2.5 rounded-lg px-3 py-2 text-[13px] u-nav-active";
+  const rail = rowClass(false, "nav");
+  const railActive = rowClass(true, "nav");
 
   return (
     <div className="h-screen flex flex-col overflow-hidden u-arrive">
       {/* 顶栏与 Docs 页同构：分区字标（点击回城）+ 返回 + GitHub·版本 + 用户 */}
-      <header className="glass-strong relative z-40 border-x-0 border-t-0 h-14 shrink-0 flex items-center px-5">
+      {/* px-8 与 App 顶栏同一个内距：右上那一组换页时不该动 */}
+      <header className="glass-strong relative z-40 border-x-0 border-t-0 h-14 shrink-0 flex items-center px-8">
         <SectionMark text={S.account.brand} title={S.docs.backTitle} />
-        <div className="ml-auto flex items-center gap-1.5">
-          <Link
-            to="/"
-            className="px-2 py-1 rounded-lg text-[12.5px] text-neutral-500 hover:text-neutral-200 hover:bg-white/[0.05] transition-colors"
-          >
-            {S.account.backToApp}
-          </Link>
-          <a
-            href={S.login.githubUrl}
-            target="_blank"
-            rel="noreferrer"
-            title="GitHub"
-            className="flex items-center gap-1.5 rounded-full border border-white/10 px-2.5 py-1 text-neutral-500 hover:text-neutral-200 hover:border-white/25 transition-colors"
-          >
-            <GithubMark size={13} />
-            {health.data && <span className="u-num text-[11px]">v{health.data.version}</span>}
-          </a>
-          <div className="ml-1.5">
-            <UserMenu user={me.data} />
-          </div>
-        </div>
+        <HeaderActions
+          link={{ to: "/", label: S.account.backToApp }}
+          version={health.data?.version}
+          user={me.data}
+        />
       </header>
 
       <div className="flex-1 min-h-0 flex">
         {/* 账户导航栏（仅两项，管理员多一项） */}
-        <aside className={`${RAIL_CLS} p-3 space-y-0.5`}>
+        <aside className={`${RAIL_CLS} p-3 space-y-1`}>
           {/* exact：/account 是 /account/kbs 的前缀，默认前缀匹配会双亮 */}
           <Link
             to="/account"
@@ -78,7 +71,7 @@ export function AccountShell() {
             {S.account.profile}
           </Link>
           <Link to="/account/kbs" className={rail} activeProps={{ className: railActive }}>
-            <BookMarked size={14} />
+            <Layers size={14} />
             {S.account.kbsNav}
           </Link>
           <Link to="/account/tokens" className={rail} activeProps={{ className: railActive }}>

@@ -14,6 +14,7 @@ mod mcp;
 mod members_routes;
 pub(crate) mod ontology_routes;
 mod review_routes;
+pub(crate) mod rule_routes;
 mod search_routes;
 mod settings_routes;
 mod sources_routes;
@@ -184,6 +185,20 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             get(documents_routes::extraction_drops),
         )
         .route("/kbs/{id}/ontology", get(ontology_routes::get))
+        // 业务规则（0021）：读规则要 Viewer，写要 Editor
+        .route(
+            "/kbs/{id}/rules",
+            get(rule_routes::list).post(rule_routes::create),
+        )
+        .route("/kbs/{id}/rules/run", post(rule_routes::run_now))
+        .route(
+            "/kbs/{id}/rules/{rule_id}",
+            patch(rule_routes::update).delete(rule_routes::delete),
+        )
+        .route(
+            "/kbs/{id}/rules/{rule_id}/matches",
+            get(rule_routes::matches),
+        )
         .route(
             "/kbs/{id}/ontology/type-resolution/preview",
             post(ontology_routes::type_resolution_preview),
@@ -220,6 +235,15 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             "/kbs/{id}/ontology/relation-types/{type_id}",
             patch(ontology_routes::update_relation_type)
                 .delete(ontology_routes::delete_relation_type),
+        )
+        // 声明来晚了（#341）：谁的哪一端挂着两个以上开放值；补上声明后把账对一遍
+        .route(
+            "/kbs/{id}/ontology/uniqueness",
+            get(ontology_routes::uniqueness_candidates),
+        )
+        .route(
+            "/kbs/{id}/ontology/relation-types/{type_id}/reconcile",
+            post(ontology_routes::reconcile_relation_type),
         )
         .route(
             "/kbs/{id}/ontology/misses/dismiss",
@@ -363,6 +387,12 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
         )
         .route("/kbs/{id}/review", get(review_routes::list))
         .route("/kbs/{id}/review/history", get(review_routes::history))
+        .route("/kbs/{id}/review/summary", get(review_routes::summary))
+        .route("/kbs/{id}/review/batch", post(review_routes::batch))
+        .route(
+            "/kbs/{id}/review/agent/{decision_id}",
+            post(review_routes::agent_answer),
+        )
         // 记忆抽出、等人点头的事实（0015）：按句取、逐条裁
         .route(
             "/kbs/{id}/review/pending",

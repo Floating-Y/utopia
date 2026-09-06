@@ -7,7 +7,6 @@ import {
   useRouterState,
 } from "@tanstack/react-router";
 import {
-  BookMarked,
   Database,
   Library as LibraryIcon,
   ListChecks,
@@ -20,9 +19,9 @@ import {
 import { api, ApiError } from "../api";
 import { S } from "../i18n";
 import { useKb, useKbId } from "../kb";
-import { Dropdown, GithubMark, Wordmark } from "../ui";
-import { AlertBell } from "./AlertBell";
-import { UserMenu } from "./UserMenu";
+import { Wordmark } from "../ui";
+import { KbSwitcher } from "./KbSwitcher";
+import { HeaderActions } from "./HeaderActions";
 import { ServerDown } from "./ServerDown";
 import { useAlertEvents } from "../useAlertEvents";
 import { useKbEvents } from "../useKbEvents";
@@ -73,7 +72,7 @@ export function Shell() {
 
   if (me.isPending) {
     return (
-      <div className="min-h-screen flex items-center justify-center text-neutral-500 text-sm">
+      <div className="min-h-screen flex items-center justify-center text-ink-3 text-body">
         {S.nav.loading}
       </div>
     );
@@ -95,72 +94,39 @@ export function Shell() {
       {/* 顶栏：品牌 + 工作区 + 用户（Vercel 式） */}
       {/* z-40：backdrop-filter 使顶栏与 tab 条各自成 stacking context，
           不提权则后者按 DOM 序盖住顶栏内的弹出面板 */}
-      <header className="glass-strong relative z-40 border-x-0 border-t-0 h-14 shrink-0 flex items-center gap-4 px-5">
+      {/* 左内距 32px：字标的左缘落在下面第一个标签的图标上（nav px-4 + 标签左 16）。
+          字标与切换器之间 gap-6（切换器自己只有 px-2）：切换器的图标正好落在第二个
+          标签的图标上（132；英文界面下的巧合，字标或标签一换尺寸就得重量）——
+          两行同一套节奏 */}
+      <header className="glass-strong relative z-40 border-x-0 border-t-0 h-14 shrink-0 flex items-center gap-6 px-8">
         {/* 字标：逐字母淡入，hover 浮出 ↗，点击去官网 */}
-        <Wordmark className="text-[17px]" />
-        {/* 面包屑唯一一级：知识库。Workspace 已从概念层折叠为部署级隐形管道
-            （settings/members 仍经它走 API，如 organizations 之于单租户）。 */}
-        <span className="text-neutral-700">/</span>
-        {/* 纯切换器：建库是管理动作，入口在 System settings › Knowledge bases */}
-        <Dropdown
-          className="w-40"
-          size="sm"
-          icon={<BookMarked size={12} />}
-          menuLabel={S.nav.kbLabel}
-          value={kb?.id ?? ""}
-          onChange={setKb}
-          options={kbs.map((k) => ({ value: k.id, label: k.name }))}
+        <Wordmark className="text-display" />
+        {/* 知识库切换器紧跟字标，中间不画斜杠——它不是面包屑的第二级，就是
+            「现在在哪个库」。Workspace 已从概念层折叠为部署级隐形管道
+            （settings/members 仍经它走 API，如 organizations 之于单租户）。
+            左边的图标与账户页左栏「Knowledge bases」那一项同一个，说明这一串字
+            是库名；中号字与下面的标签同一个字号；箭头贴着名字，不顶到一个固定
+            宽度的右边去。
+            纯切换器：建库是管理动作，入口在 System settings › Knowledge bases */}
+        <KbSwitcher kb={kb} kbs={kbs} onChange={setKb} />
+        {/* 右上那一组三个顶栏共用一份（HeaderActions）：换页时它不该动 */}
+        <HeaderActions
+          link={{ to: "/docs", label: S.nav.docs }}
+          version={health.data?.version}
+          user={me.data}
         />
-        {/* 三组：项目入口 / 告警 / 身份。**组间 gap-3，组内 gap-1.5**——
-            间距由结构表达，而不是给某一个元素补一次性的 ml。
-            此前用户菜单挂着一个 ml-1.5（当初它紧挨 GitHub 胶囊时调的），
-            铃铛插进两者之间以后就成了左 6px 右 12px */}
-        <div className="ml-auto flex items-center gap-3">
-          {/* 项目入口：Docs + [GitHub·版本] 胶囊（版本取自后端 health，与部署一致）。
-              版本并入 GitHub 胶囊：两个等高元素，视觉平衡。
-              这两个是一对，所以彼此贴得比组间近 */}
-          <div className="flex items-center gap-1.5">
-            <Link
-              to="/docs"
-              className="px-2 py-1 rounded-lg text-[12.5px] text-neutral-500 hover:text-neutral-200 hover:bg-white/[0.05] transition-colors"
-            >
-              {S.nav.docs}
-            </Link>
-            <a
-              href={S.login.githubUrl}
-              target="_blank"
-              rel="noreferrer"
-              title="GitHub"
-              className="flex items-center gap-1.5 rounded-full border border-white/10 px-2.5 py-1 text-neutral-500 hover:text-neutral-200 hover:border-white/25 transition-colors"
-            >
-              <GithubMark size={13} />
-              {health.data && (
-                <span className="u-num text-[11px]">
-                  v{health.data.version}
-                </span>
-              )}
-            </a>
-          </div>
-          {/* 告警角标：跨库的未读数。失败此前只留在日志与 jobs.last_error 里，
-              界面上一份文档也不会变颜色（0005） */}
-          <AlertBell />
-          {/* 用户菜单：个人信息 / 系统管理（仅管理员）/ 登出 */}
-          <UserMenu user={me.data} />
-        </div>
       </header>
 
       {/* Tab 导航条：图标 + 文字，激活态下划线（Vercel 式） */}
+      {/* px-4 + 标签自己的左 16：第一个标签的图标与字标同在 32 */}
       <nav className="glass-strong border-x-0 border-t-0 shrink-0 flex items-stretch gap-1 px-4">
         {TABS.map(({ to, label, Icon }) => (
           <Link
             key={to}
             to={to}
             params={{ kbId }}
-            className="flex items-center gap-2 px-3.5 py-2.5 text-[13.5px] font-medium text-neutral-400 border-b-2 border-transparent hover:text-neutral-200"
-            activeProps={{
-              className:
-                "flex items-center gap-2 px-3.5 py-2.5 text-[13.5px] font-medium text-white border-b-2 border-white",
-            }}
+            className="u-tab"
+            activeProps={{ className: "u-tab is-active" }}
           >
             <Icon size={15} strokeWidth={1.8} />
             {label}

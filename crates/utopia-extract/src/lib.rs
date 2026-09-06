@@ -5,6 +5,8 @@ use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use serde::Deserialize;
 use utopia_llm::ChatMessage;
 
+pub mod governor;
+
 #[derive(Debug, Deserialize)]
 pub struct Extraction {
     #[serde(default)]
@@ -205,7 +207,7 @@ pub fn build_messages(
         String::new()
     } else {
         "\n10. Attribute facts carry \"value\" (no \"object\"): number = plain number without \
-         thousands separators or unit symbols; date = \"YYYY[-MM[-DD]]\"; bool = true/false; \
+         thousands separators or unit symbols; date = \"YYYY[-MM[-DD]]\" (a zoned clock time only when the text gives one); bool = true/false; \
          text = a short string. Only attach an attribute to a subject of its listed class. \
          valid_from = when this value took effect, if the text says so."
             .to_string()
@@ -242,7 +244,10 @@ pub fn build_messages(
             object_ref. Each ref must be either a local_id defined exactly once in \
             entities or a known handle supplied with this text. An entity referenced by a known \
             handle must not be copied into entities.\n\
-         3. Dates must be \"YYYY\", \"YYYY-MM\", \"YYYY-MM-DD\", or null — never invent dates.\n\
+         3. Dates must be \"YYYY\", \"YYYY-MM\", \"YYYY-MM-DD\", or null — never invent dates. \
+            A clock time is allowed only together with its zone, as \"YYYY-MM-DDTHH:MM[:SS]Z\" \
+            or with a \"+HH:MM\" offset, and only when the text or the document states that \
+            zone; a time of day without a zone stays a plain date — never guess a zone.\n\
          3a. valid_to takes a third value: \"unknown\". Use it when the text says the relation \
             has ended but does not say when — \"former CEO of X\", \"stepped down\", \"left the \
             company\", \"no longer available\", \"until recently\". Use null only for something \
@@ -502,6 +507,8 @@ pub struct AdjudicationSide {
 pub struct AdjudicationPair {
     pub left: AdjudicationSide,
     pub right: AdjudicationSide,
+    /// 这个库里的人对这一对、这个名字、这种类型对做过什么（0025）。空就不提
+    pub precedents: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -510,6 +517,9 @@ pub struct AdjudicationVerdict {
     pub verdict: String,
     #[serde(default)]
     pub confidence: Option<f32>,
+    /// 一句理由；带先例的裁决要说依据了哪条
+    #[serde(default)]
+    pub why: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -542,13 +552,21 @@ pub fn build_adjudication_messages(pairs: &[AdjudicationPair]) -> Vec<ChatMessag
         Platform, \"Qiming X7 programme\" is not the Qiming X7, and \"沧海平台项目\" is not \
         \"沧海平台\" — a project, a programme, a team or a component is its own record.\n\
         \n\
+        Some pairs carry precedents: decisions people made in this same knowledge base on \
+        these names, or on pairs of the same two types. Treat them as how the owners of this \
+        base want such cases judged. Follow a precedent on the same pair unless the facts of \
+        this pair clearly differ from it; when precedents disagree with each other, answer \
+        \"unsure\". A precedent never overrides a contradiction in the facts.\n\
+        \n\
         Output exactly one JSON object and nothing else:\n\
-        {\"verdicts\":[{\"i\":0,\"verdict\":\"same|different|unsure\",\"confidence\":0.9}]}\n\
+        {\"verdicts\":[{\"i\":0,\"verdict\":\"same|different|unsure\",\"confidence\":0.9,\
+        \"why\":\"one sentence\"}]}\n\
         \n\
         Rules:\n\
         1. One verdict per pair, using the pair's number as \"i\".\n\
         2. confidence in 0~1.\n\
-        3. Be conservative: if the evidence is insufficient to decide, answer \"unsure\" — \
+        3. \"why\" is one short sentence; when a precedent decided it, say which.\n\
+        4. Be conservative: if the evidence is insufficient to decide, answer \"unsure\" — \
            a wrong merge is far more damaging than leaving two records separate."
         .to_string();
 
@@ -566,8 +584,19 @@ pub fn build_adjudication_messages(pairs: &[AdjudicationPair]) -> Vec<ChatMessag
             };
             format!("\"{}\" ({})\n{}", s.name, s.type_label, facts)
         };
+        let precedents = if p.precedents.is_empty() {
+            String::new()
+        } else {
+            let lines = p
+                .precedents
+                .iter()
+                .map(|l| format!("  - {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("Precedents (decided by people in this base):\n{lines}\n")
+        };
         user.push_str(&format!(
-            "Pair {i}:\nRecord A: {}\nRecord B: {}\n\n",
+            "Pair {i}:\nRecord A: {}\nRecord B: {}\n{precedents}\n",
             fmt(&p.left),
             fmt(&p.right)
         ));
@@ -636,11 +665,33 @@ pub fn normalize_attr_value(datatype: &str, raw: &serde_json::Value) -> Option<s
     }
 }
 
-/// 解析时间字符串 → (UTC 时间, 精度)。支持 YYYY / YYYY-MM / YYYY-MM-DD。
+/// 解析时间字符串 → (UTC 时间, 精度)。
+///
+/// 日期：YYYY / YYYY-MM / YYYY-MM-DD，精度随写了几位。带时区的时刻（0024）：
+/// `YYYY-MM-DDTHH[:MM[:SS]]` 后跟 `Z` 或 `±HH:MM`，精度到 hour / minute / second，
+/// 值截到那一位。**没有时区的钟点不是时刻**——「14:32」是哪里的 14:32 没人知道——
+/// 所以只取日期那一半，按天；钟点留在引文里。亚秒一律丢：账本到秒为止。
 pub fn parse_time(s: &str) -> Option<(DateTime<Utc>, &'static str)> {
     let s = s.trim();
     if s.is_empty() || s.eq_ignore_ascii_case("null") {
         return None;
+    }
+    if let Some((date, clock)) = s.split_once(['T', ' ']) {
+        let d = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+        let Some((clock, offset)) = split_zone(clock) else {
+            return Some((Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0)?), "day"));
+        };
+        let parts: Vec<&str> = clock.split(':').collect();
+        let (h, m, sec, precision) = match parts.as_slice() {
+            [h] => (*h, "0", "0", "hour"),
+            [h, m] => (*h, *m, "0", "minute"),
+            [h, m, sec] => (*h, *m, sec.split('.').next().unwrap_or(sec), "second"),
+            _ => return None,
+        };
+        let time =
+            chrono::NaiveTime::from_hms_opt(h.parse().ok()?, m.parse().ok()?, sec.parse().ok()?)?;
+        let utc = d.and_time(time) - offset;
+        return Some((Utc.from_utc_datetime(&utc), precision));
     }
     if let Ok(d) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
         return Some((Utc.from_utc_datetime(&d.and_hms_opt(0, 0, 0)?), "day"));
@@ -655,6 +706,25 @@ pub fn parse_time(s: &str) -> Option<(DateTime<Utc>, &'static str)> {
         }
     }
     None
+}
+
+/// 钟点后面的时区：`Z` 或 `±HH[:]MM` / `±HH`。返回 (钟点, 相对 UTC 的偏移)；
+/// 没有时区返回 None——调用方据此只记那一天
+fn split_zone(clock: &str) -> Option<(&str, chrono::Duration)> {
+    if let Some(c) = clock.strip_suffix(['Z', 'z']) {
+        return Some((c, chrono::Duration::zero()));
+    }
+    let i = clock.rfind(['+', '-'])?;
+    let (c, zone) = clock.split_at(i);
+    let sign: i64 = if zone.starts_with('-') { -1 } else { 1 };
+    let digits: String = zone[1..].chars().filter(|ch| ch.is_ascii_digit()).collect();
+    let (hh, mm) = match digits.len() {
+        2 => (&digits[..2], "0"),
+        4 => (&digits[..2], &digits[2..]),
+        _ => return None,
+    };
+    let (h, m): (i64, i64) = (hh.parse().ok()?, mm.parse().ok()?);
+    Some((c, chrono::Duration::minutes(sign * (h * 60 + m))))
 }
 
 #[cfg(test)]
@@ -804,6 +874,24 @@ mod tests {
         assert_eq!(parse_time("2024").unwrap().1, "year");
         assert_eq!(parse_time("2024-07").unwrap().1, "month");
         assert_eq!(parse_time("2024-07-15").unwrap().1, "day");
+        // 带时区的钟点：到分、到时、到秒，值截到那一位，偏移换回 UTC
+        let (t, p) = parse_time("2026-06-01T14:32Z").unwrap();
+        assert_eq!(
+            (t.to_rfc3339(), p),
+            ("2026-06-01T14:32:00+00:00".to_string(), "minute")
+        );
+        assert_eq!(parse_time("2026-06-01T14Z").unwrap().1, "hour");
+        let (t, p) = parse_time("2026-06-01T14:32:07.382+08:00").unwrap();
+        assert_eq!(
+            (t.to_rfc3339(), p),
+            ("2026-06-01T06:32:07+00:00".to_string(), "second")
+        );
+        // 没时区的钟点不是时刻：只记那一天
+        let (t, p) = parse_time("2026-06-01T14:32").unwrap();
+        assert_eq!(
+            (t.to_rfc3339(), p),
+            ("2026-06-01T00:00:00+00:00".to_string(), "day")
+        );
         assert!(parse_time("null").is_none());
         assert!(parse_time("").is_none());
         assert!(parse_time("下个月").is_none());

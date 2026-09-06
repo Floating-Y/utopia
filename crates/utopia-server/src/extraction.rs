@@ -313,6 +313,7 @@ pub async fn extract_document(
 
 /// mention → 实体 id。同一文档内同名同类型直接复用（单文档语境里罕有同名不同人，
 /// 也把消解调用摊薄到每个名字一次）；跨文档歧义由 resolve_mention 的画像比对处理。
+#[allow(clippy::too_many_arguments)]
 async fn resolve(
     pool: &PgPool,
     kb_id: Uuid,
@@ -320,6 +321,8 @@ async fn resolve(
     type_id: Option<Uuid>,
     name: &str,
     ctx: Option<&[f32]>,
+    // 本次提及所在分块的原文：画像分不开同名候选时的事实旁证（#331）
+    text: Option<&str>,
     doc_cache: &mut HashMap<(Option<Uuid>, String), Uuid>,
     needs_adjudication: &mut bool,
 ) -> anyhow::Result<Uuid> {
@@ -330,24 +333,37 @@ async fn resolve(
     if let Some(id) = doc_cache.get(&key) {
         return Ok(*id);
     }
-    let id = resolve_uncached(pool, kb_id, type_id, name, ctx, &[], needs_adjudication).await?;
+    let id = resolve_uncached(
+        pool,
+        kb_id,
+        type_id,
+        name,
+        ctx,
+        text,
+        &[],
+        needs_adjudication,
+    )
+    .await?;
     doc_cache.insert(key, id);
     Ok(id)
 }
 
 /// Resolve without the document's name cache. Handles use this path so two identities claimed
 /// separately in one response cannot collapse before their fact refs are bound.
+#[allow(clippy::too_many_arguments)]
 async fn resolve_uncached(
     pool: &PgPool,
     kb_id: Uuid,
     type_id: Option<Uuid>,
     name: &str,
     ctx: Option<&[f32]>,
+    text: Option<&str>,
     exclude: &[Uuid],
     needs_adjudication: &mut bool,
 ) -> anyhow::Result<Uuid> {
     let r =
-        utopia_store::resolution::resolve_mention(pool, kb_id, type_id, name, ctx, exclude).await?;
+        utopia_store::resolution::resolve_mention(pool, kb_id, type_id, name, ctx, text, exclude)
+            .await?;
     // 疑似重复对（画像灰区 / 类型漂移 / 同名并列）入审核队列。多数走批量裁决器，
     // 同名并列（`ReviewStage::Human`）分不出谁是谁，只能等人裁——它自己带着 stage。
     for review in &r.reviews {
@@ -439,6 +455,7 @@ async fn resolve_handle(
     type_id: Option<Uuid>,
     name: &str,
     ctx: Option<&[f32]>,
+    text: Option<&str>,
     response_claims: &mut HashMap<String, Vec<Uuid>>,
     handled_by_name: &mut HashMap<String, Vec<Uuid>>,
     ambiguous_bare_cache: &mut HashMap<String, Uuid>,
@@ -477,6 +494,7 @@ async fn resolve_handle(
                 type_id,
                 name,
                 ctx,
+                text,
                 &excluded,
                 needs_adjudication,
             )
@@ -508,6 +526,7 @@ async fn resolve_bare(
     type_id: Option<Uuid>,
     name: &str,
     ctx: Option<&[f32]>,
+    text: Option<&str>,
     doc_cache: &mut HashMap<(Option<Uuid>, String), Uuid>,
     handled_by_name: &HashMap<String, Vec<Uuid>>,
     ambiguous_bare_cache: &mut HashMap<String, Uuid>,
@@ -526,6 +545,7 @@ async fn resolve_bare(
             type_id,
             name,
             ctx,
+            text,
             doc_cache,
             needs_adjudication,
         )
@@ -538,7 +558,17 @@ async fn resolve_bare(
     // The text supplies no evidence for choosing among the handled namesakes. Preserve the
     // fact on one document-scoped provisional entity and expose every possible identity link
     // to a person. Subsequent bare mentions in this document reuse this provisional entity.
-    let id = resolve_uncached(pool, kb_id, type_id, name, ctx, &claims, needs_adjudication).await?;
+    let id = resolve_uncached(
+        pool,
+        kb_id,
+        type_id,
+        name,
+        ctx,
+        text,
+        &claims,
+        needs_adjudication,
+    )
+    .await?;
     if create_namesake_reviews(pool, kb_id, id, &claims).await? {
         *human_reviews_found = true;
     }
@@ -890,6 +920,7 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     type_id,
                     name,
                     ctx,
+                    Some(&chunk.text),
                     &mut response_claims,
                     &mut handled_by_name,
                     &mut ambiguous_bare_cache,
@@ -906,6 +937,7 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                     type_id,
                     name,
                     ctx,
+                    Some(&chunk.text),
                     &mut doc_cache,
                     &handled_by_name,
                     &mut ambiguous_bare_cache,
@@ -984,6 +1016,9 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                 to_precision: to
                     .map(|(_, p)| p)
                     .or(ended_unknown.then_some(utopia_store::graph::ENDED_UNKNOWN)),
+                // 这次观察出自哪一天的文档（0022）：没起点的事实从它起成立，结束了
+                // 不知哪天的到它为止。没有文档日期就是记下的此刻——账本能给的最好的
+                attested_at: doc.doc_time,
             };
 
             // 属性事实：谓词命中属性 → 字面值通道。datatype 校验失败宁缺勿脏；
@@ -1020,6 +1055,7 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                                     type_id,
                                     subject_name,
                                     ctx,
+                                    Some(&chunk.text),
                                     &mut doc_cache,
                                     &handled_by_name,
                                     &mut ambiguous_bare_cache,
@@ -1379,6 +1415,7 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                                 None,
                                 f.subject.trim(),
                                 ctx,
+                                Some(&chunk.text),
                                 &mut doc_cache,
                                 &handled_by_name,
                                 &mut ambiguous_bare_cache,
@@ -1418,6 +1455,7 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
                             None,
                             object_name,
                             ctx,
+                            Some(&chunk.text),
                             &mut doc_cache,
                             &handled_by_name,
                             &mut ambiguous_bare_cache,
@@ -1713,8 +1751,19 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
     utopia_store::documents::set_graph_status(&state.pool, document_id, "done").await?;
     state.emit_document(doc.kb_id, document_id);
 
-    // 灰区对进了审核队列 → 触发攒批裁决任务（独立后台跑，抽取本身到此已完成）
-    if needs_adjudication {
+    // 灰区对进了审核队列 → 触发攒批裁决任务（独立后台跑，抽取本身到此已完成）。
+    // 治理开着（0025）排的是治理任务：灰区对与直接转人工的对都从那条先进先出的
+    // 队列走，先读台账再裁；同库已排着的不重复
+    if kb.governance {
+        if needs_adjudication || human_reviews_found {
+            utopia_store::jobs::enqueue_unless_queued(
+                &state.pool,
+                "govern",
+                serde_json::json!({ "kb_id": doc.kb_id }),
+            )
+            .await?;
+        }
+    } else if needs_adjudication {
         utopia_store::jobs::enqueue(
             &state.pool,
             "adjudicate_entities",
@@ -2219,6 +2268,7 @@ mod tests {
                 Some(person),
                 "Alice",
                 None,
+                None,
                 &mut legacy_cache,
                 &mut legacy_needs_adjudication,
             )
@@ -2228,6 +2278,7 @@ mod tests {
                 kb,
                 Some(person),
                 "Alice",
+                None,
                 None,
                 &mut legacy_cache,
                 &mut legacy_needs_adjudication,
@@ -2245,6 +2296,7 @@ mod tests {
                 Some(person),
                 "Zhang Wei",
                 None,
+                None,
                 &mut response_claims,
                 &mut document_claims,
                 &mut bare_cache,
@@ -2257,6 +2309,7 @@ mod tests {
                 kb,
                 Some(person),
                 "Zhang Wei",
+                None,
                 None,
                 &mut response_claims,
                 &mut document_claims,
@@ -2356,6 +2409,7 @@ mod tests {
                 Some(person),
                 "Zhang Wei",
                 None,
+                None,
                 &mut doc_cache,
                 &document_claims,
                 &mut bare_cache,
@@ -2378,6 +2432,7 @@ mod tests {
                 kb,
                 None,
                 "Zhang Wei",
+                None,
                 None,
                 &mut doc_cache,
                 &document_claims,
@@ -2419,6 +2474,7 @@ mod tests {
                 Some(person),
                 "Zhang Wei",
                 None,
+                None,
                 &mut later_response_claims,
                 &mut document_claims,
                 &mut bare_cache,
@@ -2431,7 +2487,14 @@ mod tests {
                 "a later response cannot evade A/B ambiguity by inventing a new e-handle"
             );
 
-            let reviews = utopia_store::resolution::list_reviews(&pool, kb, 10, 0).await?;
+            let reviews = utopia_store::resolution::list_reviews(
+                &pool,
+                kb,
+                utopia_store::resolution::TypeFilter::Any,
+                10,
+                0,
+            )
+            .await?;
             assert_eq!(reviews.len(), 3, "A/B, C/A and C/B");
             assert!(reviews.iter().all(|review| review.stage == "human"));
             assert!(
@@ -2516,6 +2579,7 @@ mod tests {
                 Some(person),
                 "Zhang Wei",
                 Some(&ctx),
+                None,
                 &mut doc_cache,
                 &mut needs_adjudication,
             )
@@ -2528,7 +2592,14 @@ mod tests {
                 "同名并列只能等人裁，绝不该唤醒 LLM 裁决器"
             );
 
-            let reviews = utopia_store::resolution::list_reviews(&pool, kb, 10, 0).await?;
+            let reviews = utopia_store::resolution::list_reviews(
+                &pool,
+                kb,
+                utopia_store::resolution::TypeFilter::Any,
+                10,
+                0,
+            )
+            .await?;
             assert_eq!(reviews.len(), 2, "对 A、对 B 各一条审核对");
             assert!(
                 reviews.iter().all(|review| review.stage == "human"),

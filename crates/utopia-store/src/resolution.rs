@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use pgvector::Vector;
 use sqlx::PgPool;
 use std::collections::HashSet;
-use utopia_core::models::{MergeLogView, ReviewItem, ReviewSide};
+use utopia_core::models::{MergeLogView, ReviewBatchOutcome, ReviewItem, ReviewSide};
 use utopia_core::{AppError, AppResult};
 use uuid::Uuid;
 
@@ -26,6 +26,15 @@ pub const SIM_NEW: f32 = 0.35;
 /// 与其掷硬币，不如两个都不并、都入人工审核。取值偏紧：真正拉得开的同名人（不同
 /// chunk、不同事实积累）分差远大于此，只有质心几乎重合（如同一 chunk 播种）才触发。
 pub const SIM_TIE_MARGIN: f32 = 0.02;
+
+/// 旁证宾语的最短长度。低于它的（"IT"、"A 组"）在任何一篇文档里都可能出现，
+/// 命中不含信息量。**宁可漏掉一条旁证**：漏了就是今天的行为，错了会并错人。
+const MIN_CORROBORATION_CHARS: usize = 2;
+
+/// 每个候选取几个消歧宾语参与旁证。取多个是因为文档提到的未必是排序最靠前的
+/// 那一个（他的部门写在这句、职位写在下一句），但也不能全取——候选的事实越多，
+/// 撞上一个泛泛的宾语的机会越大。
+const CORROBORATION_OBJECTS: i64 = 3;
 
 /// 名称规范化：全角 ASCII → 半角、全角空格 → 半角、空白折叠。
 /// 返回展示形态（保留大小写）；匹配一律再套 SQL lower()。
@@ -233,6 +242,9 @@ pub async fn resolve_mention(
     type_id: Option<Uuid>,
     raw_name: &str,
     context: Option<&[f32]>,
+    // 这次提及所在的**块原文**。画像分不出谁是谁时拿它做事实旁证（#331）——
+    // 传整篇文档会让每个部门都命中，所以这里要的是句子或块，不是文档。
+    text: Option<&str>,
     // Candidates already claimed by a different response-local handle. They remain stored
     // and recallable on later calls, but this mention cannot attach to them.
     exclude: &[Uuid],
@@ -321,6 +333,20 @@ pub async fn resolve_mention(
                 })
                 .reduce(|acc, cur| if cur.1 > acc.1 { cur } else { acc })
             {
+                // 画像掷硬币之前，先问事实（#331）：这句话里提到了其中一个人的
+                // 部门或职位吗？提到了就不是硬币，是线索
+                if let Some(t) = text {
+                    if let Some(c) =
+                        corroborating_candidate(pool, kb_id, &[best, runner], t).await?
+                    {
+                        update_profile(pool, c.id, c.profile_n, ctx).await?;
+                        return Ok(Resolution {
+                            entity_id: c.id,
+                            created: false,
+                            reviews: Vec::new(),
+                        });
+                    }
+                }
                 let id = create_entity(pool, kb_id, type_id, &name, context).await?;
                 refresh_disambiguators(pool, kb_id, &name).await?;
                 let reviews = [(best, sim), (runner, r_sim)]
@@ -356,7 +382,27 @@ pub async fn resolve_mention(
         });
     }
 
-    // 走到这里：所有候选都有画像且最高分 < ATTACH → 新建实体（同名不同人）
+    // 走到这里：所有候选都有画像且最高分 < ATTACH → 新建实体（同名不同人）。
+    //
+    // 但先问一次事实（#331）。灰区的意思是"向量说不好"，不是"一定是新人"——
+    // 这句话里若正好写着某一个候选的部门或职位，那比余弦值可靠。
+    // **只认灰区**（≥ SIM_NEW）：分数低于它的候选连审核对都不配入队，
+    // 拿一条旁证把它拉成同一人，等于绕过阈值而不是补充它。
+    if let Some(t) = text {
+        let in_grey: Vec<&Candidate> = scored
+            .iter()
+            .filter(|(_, s)| *s >= SIM_NEW)
+            .map(|(c, _)| *c)
+            .collect();
+        if let Some(c) = corroborating_candidate(pool, kb_id, &in_grey, t).await? {
+            update_profile(pool, c.id, c.profile_n, ctx).await?;
+            return Ok(Resolution {
+                entity_id: c.id,
+                created: false,
+                reviews: Vec::new(),
+            });
+        }
+    }
     let id = create_entity(pool, kb_id, type_id, &name, context).await?;
     refresh_disambiguators(pool, kb_id, &name).await?;
     let mut reviews = best_scored
@@ -378,6 +424,85 @@ pub async fn resolve_mention(
         created: true,
         reviews,
     })
+}
+
+/// **事实旁证**：这次提及的原文里，出现了某个候选的消歧宾语吗（#331）。
+///
+/// 画像向量分不出谁是谁时，能分开的线索往往就在事实里——一个张伟 `works_for`
+/// 平台工程部，另一个 `works_for` 财务部，而这句话里写着"财务"。人在审核卡上
+/// 看的正是这些事实（`top_facts`），这一步是把人做的事交回给代码。
+///
+/// **证据只往一个方向走。** 一致是"同一人"的弱证据；不一致**什么都不是**——
+/// 在 Acme 上班又在 Zenith 兼职的人有两个 `works_for` 值，他仍是一个人。所以
+/// 这个函数只回答"哪个候选被原文提到了"，永远不回答"哪个候选被排除了"。
+///
+/// **恰好一个候选命中才算数。** 两个都命中说明这条线索在他们之间也分不开，
+/// 与其挑一个不如维持原样。
+///
+/// 宾语的挑法与 `refresh_disambiguators` 同源（#299 之后从本体的 range 声明选，
+/// 不是词表），并且**排除同名同伴也指着的那些**：两个张伟都在同一家公司时，
+/// 公司名对分辨他们毫无帮助，却最容易在文档里撞上。
+async fn corroborating_candidate<'a>(
+    pool: &PgPool,
+    kb_id: Uuid,
+    candidates: &[&'a Candidate],
+    text: &str,
+) -> AppResult<Option<&'a Candidate>> {
+    // 单个候选也算数：「其他候选都没命中」在只有一个候选时天然成立
+    if candidates.is_empty() || text.trim().is_empty() {
+        return Ok(None);
+    }
+    let ids: Vec<Uuid> = candidates.iter().map(|c| c.id).collect();
+    // 一次查完所有候选：每个候选取若干个「同伴不指向」的宾语名字
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT s.subject_id, s.name FROM (
+           SELECT f.subject_id, o.canonical_name AS name,
+                  row_number() OVER (
+                    PARTITION BY f.subject_id
+                    ORDER BY EXISTS (SELECT 1 FROM relation_type_ranges rr
+                                      WHERE rr.relation_type_id = r.id) DESC,
+                             (r.temporal = 'state') DESC,
+                             r.functional DESC,
+                             f.confidence DESC, f.recorded_at DESC
+                  ) AS rn
+           FROM facts f
+           JOIN relation_types r ON r.id = f.predicate_id
+           JOIN entities o ON o.id = f.object_id
+           WHERE f.kb_id = $1 AND f.subject_id = ANY($2)
+             AND f.invalidated_at IS NULL AND f.object_id IS NOT NULL
+             -- 同名同伴也指着的宾语没有分辨力，排除
+             AND NOT EXISTS (SELECT 1 FROM facts g
+                              WHERE g.kb_id = $1 AND g.subject_id = ANY($2)
+                                AND g.subject_id <> f.subject_id
+                                AND g.object_id = f.object_id
+                                AND g.invalidated_at IS NULL)
+         ) s WHERE s.rn <= $3",
+    )
+    .bind(kb_id)
+    .bind(&ids)
+    .bind(CORROBORATION_OBJECTS)
+    .fetch_all(pool)
+    .await?;
+
+    let haystack = text.to_lowercase();
+    let mut hit: Option<&'a Candidate> = None;
+    for (subject_id, object_name) in &rows {
+        let needle = object_name.trim().to_lowercase();
+        if needle.chars().count() < MIN_CORROBORATION_CHARS || !haystack.contains(&needle) {
+            continue;
+        }
+        let Some(c) = candidates.iter().find(|c| c.id == *subject_id) else {
+            continue;
+        };
+        match hit {
+            // 同一个候选的第二条宾语也命中：仍是同一个候选，不算分歧
+            Some(prev) if prev.id == c.id => {}
+            // 命中了第二个候选：这条线索分不开他们
+            Some(_) => return Ok(None),
+            None => hit = Some(c),
+        }
+    }
+    Ok(hit)
 }
 
 /// 包含关系候选的最短边：两个名字里**较短的那个**至少这么长才算数。
@@ -977,7 +1102,7 @@ pub async fn create_review(
 }
 
 #[derive(Debug, sqlx::FromRow)]
-struct ReviewRow {
+pub(crate) struct ReviewRow {
     id: Uuid,
     left_id: Uuid,
     right_id: Uuid,
@@ -1081,13 +1206,40 @@ pub async fn entity_fact_lines(
         .collect())
 }
 
-async fn assemble_reviews(
+pub(crate) async fn assemble_reviews(
     pool: &PgPool,
     kb_id: Uuid,
     rows: Vec<ReviewRow>,
 ) -> AppResult<Vec<ReviewItem>> {
+    // 这一页上开着的建议（0025）：一趟查完，按审核行挂上去
+    let ids: Vec<Uuid> = rows.iter().map(|r| r.id).collect();
+    let proposals: Vec<(Uuid, utopia_core::models::ReviewProposal)> =
+        sqlx::query_as::<_, (Uuid, Uuid, String, f32, Option<String>)>(
+            "SELECT target_id, id, action, confidence, reason FROM agent_decisions
+         WHERE target_kind = 'review' AND target_id = ANY($1) AND status = 'proposed'",
+        )
+        .bind(&ids)
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|(target, id, action, confidence, reason)| {
+            (
+                target,
+                utopia_core::models::ReviewProposal {
+                    id,
+                    action,
+                    confidence,
+                    reason,
+                },
+            )
+        })
+        .collect();
     let mut items = Vec::with_capacity(rows.len());
     for r in rows {
+        let proposal = proposals
+            .iter()
+            .find(|(t, _)| *t == r.id)
+            .map(|(_, p)| p.clone());
         items.push(ReviewItem {
             id: r.id,
             score: r.score,
@@ -1096,30 +1248,97 @@ async fn assemble_reviews(
             created_at: r.created_at,
             left: review_side(pool, kb_id, r.left_id).await?,
             right: review_side(pool, kb_id, r.right_id).await?,
+            proposal,
         });
     }
     Ok(items)
+}
+
+/// 重复项按两边类型的关系分三档（#428）。**没类型的一侧哪档都不进**：不知道的
+/// 既不能当成一样，也不能当成不一样。`clause()` 是 SQL 片段，别名固定 a / b
+/// （左右两个实体），列表与 `review::counts` 共用，两处口径不会分叉。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeFilter {
+    Any,
+    /// 两边都有类型且相等——同名同类，人最先想批量合的那一档
+    Same,
+    /// 两边都有类型且不等——同名异义，合了就错
+    Conflict,
+}
+
+impl TypeFilter {
+    /// 查询串里的写法：缺省 any；认不出的当契约错误报出来
+    pub fn parse(s: Option<&str>) -> AppResult<Self> {
+        match s.unwrap_or("any") {
+            "any" => Ok(Self::Any),
+            "same" => Ok(Self::Same),
+            "conflict" => Ok(Self::Conflict),
+            other => Err(AppError::invalid(
+                "unknown_type_filter",
+                format!("types must be any, same or conflict, not {other}"),
+            )),
+        }
+    }
+
+    pub fn clause(self) -> &'static str {
+        match self {
+            Self::Any => "TRUE",
+            Self::Same => "a.type_id IS NOT NULL AND a.type_id = b.type_id",
+            Self::Conflict => {
+                "a.type_id IS NOT NULL AND b.type_id IS NOT NULL AND a.type_id <> b.type_id"
+            }
+        }
+    }
 }
 
 /// 全部待处理审核项（LLM 裁决中 + 等人工的都展示，人工可随时抢先定夺）。
 pub async fn list_reviews(
     pool: &PgPool,
     kb_id: Uuid,
+    types: TypeFilter,
     limit: i64,
     offset: i64,
 ) -> AppResult<Vec<ReviewItem>> {
-    let rows: Vec<ReviewRow> = sqlx::query_as(
-        "SELECT id, left_id, right_id, score, reason, stage, created_at
-         FROM resolution_reviews
-         WHERE kb_id = $1 AND status = 'pending'
-         ORDER BY created_at DESC LIMIT $2 OFFSET $3",
-    )
-    .bind(kb_id)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(pool)
-    .await?;
+    let sql = format!(
+        "SELECT rr.id, rr.left_id, rr.right_id, rr.score, rr.reason, rr.stage, rr.created_at
+         FROM resolution_reviews rr
+         JOIN entities a ON a.id = rr.left_id
+         JOIN entities b ON b.id = rr.right_id
+         WHERE rr.kb_id = $1 AND rr.status = 'pending' AND {}
+         ORDER BY rr.created_at DESC LIMIT $2 OFFSET $3",
+        types.clause()
+    );
+    let rows: Vec<ReviewRow> = sqlx::query_as(&sql)
+        .bind(kb_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
     assemble_reviews(pool, kb_id, rows).await
+}
+
+/// 批量裁决 = 逐条的人工裁决（#428）：每一条走 `decide_review`，合并方向、状态、
+/// decided_by 与单条一模一样。一条失败（不存在、已经裁过、并到一半出错）不拖累
+/// 其余的，结果逐条带回；动作不认识整批拒绝——那不是某一条的问题。
+pub async fn decide_reviews(
+    pool: &PgPool,
+    kb_id: Uuid,
+    ids: &[Uuid],
+    action: &str,
+    user_id: Uuid,
+) -> AppResult<Vec<ReviewBatchOutcome>> {
+    if action != "merge" && action != "keep" {
+        return Err(AppError::Validation("action must be merge or keep".into()));
+    }
+    let mut out = Vec::with_capacity(ids.len());
+    for &id in ids {
+        let error = decide_review(pool, kb_id, id, action, user_id)
+            .await
+            .err()
+            .map(|e| e.to_string());
+        out.push(ReviewBatchOutcome { id, error });
+    }
+    Ok(out)
 }
 
 /// 等待 LLM 裁决的审核项（后台裁决任务消费）。
@@ -1197,16 +1416,24 @@ pub async fn decide_review(
 
     match action {
         "merge" => {
-            let (target, source) = merge_direction(pool, row.left_id, row.right_id).await?;
-            merge_entities(
-                pool,
-                kb_id,
-                source,
-                target,
-                Some(user_id),
-                "review decision",
-            )
-            .await?;
+            // 同名连锁（A-B 合了，B-C 还等着）：B 已并进 A，这一对实际上是 A-C。
+            // 跟着 merged_into 走到活着的那个再合；两边走到同一个，就只剩把审核行关上
+            let (l, r) = (
+                survivor(pool, kb_id, row.left_id).await?,
+                survivor(pool, kb_id, row.right_id).await?,
+            );
+            if l != r {
+                let (target, source) = merge_direction(pool, l, r).await?;
+                merge_entities(
+                    pool,
+                    kb_id,
+                    source,
+                    target,
+                    Some(user_id),
+                    "review decision",
+                )
+                .await?;
+            }
             sqlx::query(
                 "UPDATE resolution_reviews SET status = 'merged', decided_at = now(), decided_by = $2
                  WHERE id = $1",
@@ -1229,6 +1456,25 @@ pub async fn decide_review(
         _ => return Err(AppError::Validation("action must be merge or keep".into())),
     }
     Ok(())
+}
+
+/// 跟着 `merged_into` 走到还活着的那个实体。同簇连锁合并之后，一对里的一侧可能已经
+/// 并进了别人；合并要合的是活着的那个，不是那条已经空了的行
+pub async fn survivor(pool: &PgPool, kb_id: Uuid, mut id: Uuid) -> AppResult<Uuid> {
+    for _ in 0..16 {
+        let next: Option<Option<Uuid>> =
+            sqlx::query_scalar("SELECT merged_into FROM entities WHERE id = $1 AND kb_id = $2")
+                .bind(id)
+                .bind(kb_id)
+                .fetch_optional(pool)
+                .await?;
+        match next {
+            Some(Some(n)) => id = n,
+            Some(None) => return Ok(id),
+            None => return Err(AppError::NotFound),
+        }
+    }
+    Err(AppError::Conflict("merge chain too long".into()))
 }
 
 /// 合并方向：返回 (target 存活, source 被并)。

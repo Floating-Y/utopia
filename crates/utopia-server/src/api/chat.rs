@@ -110,7 +110,7 @@ pub(super) fn tools_schema(can_write: bool, data_source_names: &[String]) -> ser
                             "occurred_at": {
                                 "type": "string",
                                 "description": "Optional date the stated fact took effect \
-                                    (YYYY-MM-DD). Omit to use today."
+                                    (YYYY, YYYY-MM, YYYY-MM-DD or RFC3339). Omit to use today."
                             }
                         },
                         "required": ["text"]
@@ -231,7 +231,11 @@ pub(super) fn base_tools() -> serde_json::Value {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Search query, phrased in the corpus language." }
+                        "query": { "type": "string", "description": "Search query, phrased in the corpus language." },
+                        "as_of": {
+                            "type": "string",
+                            "description": "Optional RECORD-time moment (YYYY-MM-DD or RFC3339): search only what the knowledge base held at that moment — earlier versions of documents, documents deleted since. Full-text recall stays current, so hits are correct but may be incomplete. Omit for the current base."
+                        }
                     },
                     "required": ["query"]
                 }
@@ -299,15 +303,27 @@ pub(super) fn base_tools() -> serde_json::Value {
                     relations with validity ranges (from → to; 'now' = still ongoing). \
                     The best tool for who/when/history questions. Use after find_entities. \
                     Pass `at` to see the world as of that date (server-side filter) — \
-                    always do this for \"who was X in <year/month>\" questions.",
+                    always do this for \"who was X in <year/month>\" questions. \
+                    Conclusions a business rule reached about this entity come back too, \
+                    marked `[rule: <name>]` with the readings that made them true — take \
+                    those as given rather than re-deriving them from the readings yourself.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "entity_id": { "type": "string", "description": "Entity id (uuid) from find_entities." },
                         "at": {
                             "type": "string",
-                            "description": "Optional as-of date (YYYY-MM-DD). Only facts valid on \
-                                this date are returned. Omit for the full history."
+                            "description": "Optional as-of moment on the WORLD axis (YYYY, YYYY-MM, \
+                                YYYY-MM-DD, or a zoned time). Only facts valid at that moment are \
+                                returned. Omit for the full history."
+                        },
+                        "as_of": {
+                            "type": "string",
+                            "description": "Optional RECORD-time moment (YYYY-MM-DD or RFC3339): the facts as the knowledge base held them at that moment, before later corrections, retractions and merges. Use for 'what did we think / know / have on record as of <date>'. Independent of `at`: `at` is when something was true, `as_of` is when we believed it. Omit for today's understanding."
+                        },
+                        "before": {
+                            "type": "string",
+                            "description": "Optional RECORD-time instant copied exactly from a changes event: the facts as the knowledge base held them strictly before that change landed. Use it for 'before <correction / memo> arrived' — paste the event's timestamp, do not compute an earlier as_of yourself. Overrides as_of."
                         }
                     },
                     "required": ["entity_id"]
@@ -317,18 +333,41 @@ pub(super) fn base_tools() -> serde_json::Value {
         {
             "type": "function",
             "function": {
+                "name": "list_rules",
+                "description": "The business rules this base runs: what each one concludes and                     the exact conditions it tests, thresholds included. A rule is written by a                     person, and its conclusions are already in the graph — read the rule to                     explain WHY something was concluded, or to answer \"what counts as X here\".                     Do not re-implement a rule's comparison yourself; ask entity_facts or                     rule_matches for what it actually concluded.",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "rule_matches",
+                "description": "Which entities a business rule currently marks, with the                     readings that made each one true. Use it for \"which wells are gas-bearing\"                     style questions — one call instead of checking every entity.                     Get the rule id from list_rules.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "rule_id": { "type": "string", "description": "Rule id (uuid) from list_rules." },
+                        "limit": { "type": "integer", "description": "How many to return (default 50, max 200)." }
+                    },
+                    "required": ["rule_id"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "changes",
-                "description": "What the graph LEARNED or REVISED in a window of record time —                     the belief axis. Answers \"what changed since X\", \"what did we get wrong\",                     \"what is new this quarter\", and needs no entity, so use it when the                     question names a period rather than a subject.                     Events: asserted (new claim), corrected (a claim replaced by a revised one),                     rejected (a claim withdrawn), merged (folded into another claim) — each with                     the document it came from.                     NOT the same axis as entity_facts(at): that asks \"what was true on date D\";                     this asks \"what did we change our mind about between D1 and D2\". A fact                     about 2019 can be recorded in 2026 — this windows on when we recorded it.",
+                "description": "What the graph LEARNED or REVISED in a window of record time —                     the belief axis. Answers \"what changed since X\", \"what did we get wrong\",                     \"what is new this quarter\", and needs no entity, so use it when the                     question names a period rather than a subject.                     Events: asserted (new claim), corrected (a claim replaced by a revised one),                     rejected (a claim withdrawn), merged (folded into another claim) — each with                     the document it came from.                     NOT the same axis as entity_facts(at): that asks \"what was true on date D\";                     this asks \"what did we change our mind about between D1 and D2\". A fact                     about 2019 can be recorded in 2026 — this windows on when we recorded it.                     Each event starts with its exact UTC RFC3339 record timestamp, including fractional seconds.                     For 'before a correction arrived', find that event here and pass its timestamp, exactly as printed, to entity_facts as `before`. Keep at for the world date asked about.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "since": {
                             "type": "string",
-                            "description": "Start of the window (YYYY-MM-DD), inclusive."
+                            "description": "Start of the window (YYYY, YYYY-MM or YYYY-MM-DD), inclusive — a year or month means its first day."
                         },
                         "until": {
                             "type": "string",
-                            "description": "End of the window (YYYY-MM-DD), inclusive of that                                 whole day. Omit for 'up to now'."
+                            "description": "End of the window (YYYY, YYYY-MM or YYYY-MM-DD), inclusive of that                                 whole day, month or year. Omit for 'up to now'."
                         },
                         "entity_id": {
                             "type": "string",
@@ -357,9 +396,9 @@ const SYSTEM_PROMPT: &str = "You are the assistant of Utopia, a temporal knowled
     search_chunks returns short excerpts of the best-matching sections only. When a hit is \
     clearly the right document but the excerpt does not carry the answer, read the whole \
     document with get_document before saying the knowledge base does not have it.\n\
-    The graph has TWO independent time axes, and each graph tool reads exactly one:\n\
-    - World time — when something was true. Read with entity_facts (`at` = as of that date).\n\
-    - Record time — when we came to believe it, and when we revised it. Read with changes.\n\
+    The graph has TWO independent time axes:\n\
+    - World time — when something was true. entity_facts(`at` = as of that date).\n\
+    - Record time — when we came to believe it, and when we revised it. entity_facts and search_chunks take `as_of` = the base as it stood at that moment, before later corrections, retractions and merges; changes lists what moved in a window.\n\
     \"Who was CTO in 2019\" is world time; \"what did we learn last month\" and \"what did \
     we get wrong\" are record time. The same fact has a position on both.\n\
     Boundary: search_docs answers questions about Utopia itself (features, ingestion, \
@@ -382,7 +421,14 @@ const SYSTEM_PROMPT: &str = "You are the assistant of Utopia, a temporal knowled
        when useful.\n\
     2. Facts carry validity ranges (from → to). For \"as of <date>\" questions pass `at` to \
        entity_facts and the server filters to that moment; for history questions omit `at` \
-       to see the full timeline. State dates in the answer.\n\
+       to see the full timeline. For 'what did we know / have on record / believe as of <date>' or 'before <memo> arrived' pass `as_of` — that is the record axis and the ONLY way to answer such a question; do not narrate a plan, call the tool. The two combine: `at` for the date asked about, `as_of` for when. State dates in the answer. Dates in tool output carry their own precision: \
+       `2023` means the year and `2023-06` the month — never turn them into a specific day; \
+       `attested <time>` marks a fact with no stated start, known only from that evidence on; \
+       `ended by <time>` marks one the text says is over, date not given.\n\
+    2a. For 'before a correction or memo arrived', call changes to find its exact record timestamp, \
+       then call entity_facts with `before` set to that timestamp, copied exactly as printed — the \
+       server reads the base as it stood strictly before that change. Never compute an earlier \
+       `as_of` yourself. Keep `at` for the world date asked about.\n\
     2b. For \"what changed / what is new / what did we get wrong since <date>\", call changes — \
        it needs no entity. Name the document a correction came from in plain prose. Graph tools \
        return no [n] numbers and no URLs, so never write a bracketed citation or a placeholder \
@@ -622,7 +668,7 @@ pub async fn chat(
                         // 模型可能不支持 tool-calling：降级为一次性 RAG 注入
                         tracing::warn!(error = %e, "tool-calling 不可用，降级为一次性 RAG");
                         let chunks =
-                            retrieval::hybrid(&state, kb_id, workspace_id, &query, 8)
+                            retrieval::hybrid(&state, kb_id, workspace_id, &query, 8, None)
                                 .await
                                 .unwrap_or_default();
                         let legacy_sources: Vec<serde_json::Value> = chunks

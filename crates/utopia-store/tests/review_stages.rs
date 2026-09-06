@@ -59,16 +59,19 @@ async fn human_review_is_visible_but_never_pending_adjudication() -> anyhow::Res
     }
 
     let run = async {
-        let ordinary = resolution::resolve_mention(&pool, kb, Some(ty), "Acme", None, &[]).await?;
+        let ordinary =
+            resolution::resolve_mention(&pool, kb, Some(ty), "Acme", None, None, &[]).await?;
         assert_eq!(ordinary.entity_id, existing);
         assert!(!ordinary.created, "exclude=[] must retain ordinary recall");
 
         let split =
-            resolution::resolve_mention(&pool, kb, Some(ty), "Acme", None, &[existing]).await?;
+            resolution::resolve_mention(&pool, kb, Some(ty), "Acme", None, None, &[existing])
+                .await?;
         assert_ne!(split.entity_id, existing);
         assert!(split.created, "the excluded candidate cannot be attached");
         let recalled_split =
-            resolution::resolve_mention(&pool, kb, Some(ty), "Acme", None, &[existing]).await?;
+            resolution::resolve_mention(&pool, kb, Some(ty), "Acme", None, None, &[existing])
+                .await?;
         assert_eq!(recalled_split.entity_id, split.entity_id);
         assert!(
             !recalled_split.created,
@@ -88,7 +91,8 @@ async fn human_review_is_visible_but_never_pending_adjudication() -> anyhow::Res
         )
         .await?;
 
-        let visible = resolution::list_reviews(&pool, kb, 10, 0).await?;
+        let visible =
+            resolution::list_reviews(&pool, kb, resolution::TypeFilter::Any, 10, 0).await?;
         assert_eq!(visible.len(), 2);
         assert!(visible.iter().any(|r| r.stage == "human"));
         let pending = resolution::pending_adjudications(&pool, kb, 10).await?;
@@ -112,7 +116,8 @@ async fn human_review_is_visible_but_never_pending_adjudication() -> anyhow::Res
         assert!(resolution::pending_adjudications(&pool, kb, 10)
             .await?
             .is_empty());
-        let visible = resolution::list_reviews(&pool, kb, 10, 0).await?;
+        let visible =
+            resolution::list_reviews(&pool, kb, resolution::TypeFilter::Any, 10, 0).await?;
         let upgraded = visible.iter().find(|r| {
             (r.left.id == left && r.right.id == third) || (r.left.id == third && r.right.id == left)
         });

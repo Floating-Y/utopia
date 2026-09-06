@@ -76,6 +76,11 @@ pub async fn dispatch(
         "find_entities" => find_entities(ctx, sink, args).await,
         "entity_facts" => entity_facts(ctx, args).await,
         "changes" => changes(ctx, args).await,
+        // 业务规则只读（0021）：判据要看得见，但**写规则不开给模型**——
+        // 「推理的判据由人写」是 0002 与 0021 共同的那条线，而一个工具调用
+        // 分不出「人口述、agent 代打」与「模型自己编了一条」
+        "list_rules" => list_rules(ctx).await,
+        "rule_matches" => rule_matches(ctx, args).await,
         "query_data" if !ctx.mounted_sources.is_empty() => query_data(ctx, args).await,
         "remember" if ctx.can_write => remember(ctx, args).await,
         other => (
@@ -106,9 +111,19 @@ pub async fn search_chunks(
     // 必填参数由 `chat::check_call` 在派发之前挡下，所以这里不再回落到
     // 用户那句原话——回落产出的是一个看起来没问题的错误答案
     let q = args["query"].as_str().unwrap_or_default().to_string();
-    let chunks = retrieval::hybrid(ctx.state, ctx.kb_id, ctx.workspace_id, &q, SEARCH_TOP_K)
-        .await
-        .unwrap_or_default();
+    // 记录轴（0019 / #347）：只搜那一刻库里有的东西。全文那一路仍是"现在"，
+    // 命中不会错但会缺——retrieval.rs 的头上写了
+    let as_of = args["as_of"].as_str().and_then(parse_when);
+    let chunks = retrieval::hybrid(
+        ctx.state,
+        ctx.kb_id,
+        ctx.workspace_id,
+        &q,
+        SEARCH_TOP_K,
+        as_of,
+    )
+    .await
+    .unwrap_or_default();
     let mut lines = Vec::new();
     for c in &chunks {
         let n = cite(sink, c.id.to_string(), |n| source_json(n, c));
@@ -194,7 +209,7 @@ pub async fn get_document(
 
     let when = doc
         .doc_time
-        .map(|t| t.format("%Y-%m-%d").to_string())
+        .map(crate::time_text::instant)
         .unwrap_or_else(|| "no date".to_string());
     let header = format!(
         "\"{}\" ({when}) — {} section(s):",
@@ -293,40 +308,63 @@ pub async fn entity_facts(ctx: &ToolCtx<'_>, args: &serde_json::Value) -> ToolRe
     let id = args["entity_id"]
         .as_str()
         .and_then(|s| s.parse::<Uuid>().ok());
-    // as-of 过滤：T 时刻有效 = 起点不晚于 T（或未知）且终点晚于 T（或开放）
-    let at = args["at"]
-        .as_str()
-        .and_then(|s| chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok())
-        .map(|d| d.and_hms_opt(0, 0, 0).unwrap().and_utc());
+    // 世界轴过滤在 SQL 里（world_axis，0022）：没起点的事实从最早的证据起，结束了
+    // 不知哪天的到说出它的那份文档为止。这里只把 T 传下去，不自己解释 NULL
+    let at = args["at"].as_str().and_then(parse_when);
+    // 记录轴（0019 / #347）：那一刻**我们持有**的事实。两根轴两个参数，绝不合成
+    // 一个——合起来就会拿「三月的世界，以今天的认知」去答「三月的世界，以三月的认知」
+    // 「更正到来之前」（#416）：`before` 是 changes 里印出来的那个时刻，原样抄过来。
+    // 账本的钟是微秒，「严格早于 T」就是「不晚于 T 减一微秒」——这一步在这里做，
+    // 不让模型对着 ISO 字符串算小数秒的借位：算错一位，答的就是更正**之后**的状态，
+    // 而且看不出来（#351 那种错）。给了 before 就以它为准
+    let before = args["before"].as_str().and_then(parse_when);
+    let as_of = match before {
+        Some(t) => Some(just_before(t)),
+        None => args["as_of"].as_str().and_then(parse_when),
+    };
     let Some(id) = id else {
         return (
             "Invalid entity_id (expected the uuid returned by find_entities).".to_string(),
             json!({ "kind": "facts", "label": "?", "detail": "invalid id" }),
         );
     };
-    match utopia_store::graph::entity_detail(&ctx.state.pool, ctx.kb_id, id, None).await {
-        Ok((node, mut facts)) => {
-            if let Some(t) = at {
-                facts.retain(|f| {
-                    f.valid_from.is_none_or(|from| from <= t) && f.valid_to.is_none_or(|to| to > t)
-                });
-            }
-            let text = if facts.is_empty() {
+    match utopia_store::graph::entity_detail(&ctx.state.pool, ctx.kb_id, id, at, as_of).await {
+        Ok((node, facts)) => {
+            // 规则的结论也是这个实体的一部分（0021）。**不给的话模型会拿那些
+            // 读数自己再判一遍**——而阈值写在规则里，它看不见，于是两处判断
+            // 迟早不一致，agent 那次还没有前提链、没有区间、也不进账本
+            let derived =
+                utopia_store::reasoning::derived_for_entity(&ctx.state.pool, ctx.kb_id, id, at)
+                    .await
+                    .unwrap_or_default();
+            let mut derived: Vec<String> = derived
+                .iter()
+                .map(|d| {
+                    format!(
+                        "{} · {} · {} [rule: {}]",
+                        d.subject,
+                        d.predicate,
+                        d.object,
+                        d.rule_name.as_deref().unwrap_or(&d.rule),
+                    )
+                })
+                .collect();
+
+            let text = if facts.is_empty() && derived.is_empty() {
                 match at {
                     Some(t) => format!(
                         "{}: no facts valid as of {}.",
                         node.name,
-                        t.format("%Y-%m-%d")
+                        crate::time_text::instant(t)
                     ),
                     None => format!("{}: no recorded facts.", node.name),
                 }
             } else {
-                facts.iter().map(fact_line).collect::<Vec<_>>().join("\n")
+                let mut lines: Vec<String> = facts.iter().map(fact_line).collect();
+                lines.append(&mut derived);
+                lines.join("\n")
             };
-            let detail = match at {
-                Some(t) => format!("{} facts as of {}", facts.len(), t.format("%Y-%m-%d")),
-                None => format!("{} facts", facts.len()),
-            };
+            let detail = entity_facts_detail(facts.len(), at, as_of, before);
             (
                 text,
                 json!({ "kind": "facts", "label": node.name, "detail": detail }),
@@ -339,15 +377,147 @@ pub async fn entity_facts(ctx: &ToolCtx<'_>, args: &serde_json::Value) -> ToolRe
     }
 }
 
-pub async fn changes(ctx: &ToolCtx<'_>, args: &serde_json::Value) -> ToolResult {
-    let day = |k: &str| {
-        args[k]
-            .as_str()
-            .and_then(|s| chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok())
+/// 这个库的判据。**把阈值原样给出来**——模型要能解释「凭什么算含气井」，
+/// 而不是猜一个听起来合理的门槛。
+pub async fn list_rules(ctx: &ToolCtx<'_>) -> ToolResult {
+    let Ok(rules) = utopia_store::business_rules::list(&ctx.state.pool, ctx.kb_id).await else {
+        return (
+            "Could not read the rules.".to_string(),
+            json!({ "kind": "tool", "label": "list_rules", "detail": "failed" }),
+        );
     };
-    let Some((since, until, window)) =
-        changes_window(day("since"), day("until"), chrono::Utc::now())
+    if rules.is_empty() {
+        return (
+            "This base has no business rules.".to_string(),
+            json!({ "kind": "tool", "label": "list_rules", "detail": "none" }),
+        );
+    }
+    let text = rules
+        .iter()
+        .map(|r| {
+            let conditions = r["conditions"]
+                .as_array()
+                .map(|cs| {
+                    cs.iter()
+                        .map(|c| {
+                            format!(
+                                "{} {} {}",
+                                c["predicate_label"].as_str().unwrap_or("?"),
+                                c["op"].as_str().unwrap_or("?"),
+                                c["operand"]
+                                    .as_str()
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| c["operand"].to_string()),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" AND ")
+                })
+                .unwrap_or_default();
+            let concludes = if r["conclusion"] == "typing" {
+                r["conclude_type_label"].as_str().unwrap_or("?").to_string()
+            } else {
+                format!(
+                    "{} = {}",
+                    r["conclude_predicate_label"].as_str().unwrap_or("?"),
+                    r["conclude_value"]
+                )
+            };
+            format!(
+                "{} [{}] — applies to {} where {} ⇒ {} · marks {} now · id {}",
+                r["name"].as_str().unwrap_or("?"),
+                if r["enabled"] == true { "on" } else { "off" },
+                r["subject_label"].as_str().unwrap_or("?"),
+                conditions,
+                concludes,
+                r["derived_count"],
+                r["id"].as_str().unwrap_or("?"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let n = rules.len();
+    (
+        text,
+        json!({ "kind": "tool", "label": "list_rules", "detail": format!("{n} rules") }),
+    )
+}
+
+/// 一条规则此刻标了谁。**前提一起给**：结论没有前提就跟一条凭空的断言没区别。
+pub async fn rule_matches(ctx: &ToolCtx<'_>, args: &serde_json::Value) -> ToolResult {
+    let Some(rule_id) = args["rule_id"]
+        .as_str()
+        .and_then(|s| s.parse::<Uuid>().ok())
     else {
+        return (
+            "Invalid rule_id (expected the uuid returned by list_rules).".to_string(),
+            json!({ "kind": "tool", "label": "rule_matches", "detail": "invalid id" }),
+        );
+    };
+    let limit = args["limit"].as_i64().unwrap_or(50).clamp(1, 200);
+    let Ok((rows, total)) =
+        utopia_store::business_rules::matches(&ctx.state.pool, ctx.kb_id, rule_id, limit, 0).await
+    else {
+        return (
+            "Could not read what that rule marks.".to_string(),
+            json!({ "kind": "tool", "label": "rule_matches", "detail": "failed" }),
+        );
+    };
+    if rows.is_empty() {
+        return (
+            "That rule marks nothing right now.".to_string(),
+            json!({ "kind": "tool", "label": "rule_matches", "detail": "0" }),
+        );
+    }
+    let text = rows
+        .iter()
+        .map(|m| {
+            let premises = m["premises"]
+                .as_array()
+                .map(|p| {
+                    p.iter()
+                        .filter_map(|x| x.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            format!(
+                "{} ⇒ {} (because {}) [{}]",
+                m["entity"].as_str().unwrap_or("?"),
+                m["concluded"]
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| m["concluded"].to_string()),
+                premises,
+                m["entity_id"].as_str().unwrap_or("?"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // 截断要说出来：模型看到 50 条会当成全部，而库里可能有两百
+    let text = if total > rows.len() as i64 {
+        format!("{text}\n(showing {} of {total})", rows.len())
+    } else {
+        text
+    };
+    (
+        text,
+        json!({ "kind": "tool", "label": "rule_matches", "detail": format!("{total} entities") }),
+    )
+}
+
+pub async fn changes(ctx: &ToolCtx<'_>, args: &serde_json::Value) -> ToolResult {
+    // 两端与 `at` 同一种写法：YYYY / YYYY-MM / YYYY-MM-DD。`since` 取那一段的第一天，
+    // `until` 取最后一天——「2023 年有什么变化」不该逼模型编一个 12 月 31 日
+    let since = args["since"]
+        .as_str()
+        .and_then(utopia_extract::parse_time)
+        .map(|(t, _)| t.date_naive());
+    let until = args["until"]
+        .as_str()
+        .and_then(utopia_extract::parse_time)
+        .map(|(t, p)| period_last_day(t.date_naive(), p));
+    let Some((since, until, window)) = changes_window(since, until, chrono::Utc::now()) else {
         return (
             "Invalid or missing `since` (expected YYYY-MM-DD).".to_string(),
             json!({ "kind": "changes", "label": "?", "detail": "invalid since" }),
@@ -426,11 +596,27 @@ pub async fn query_data(ctx: &ToolCtx<'_>, args: &serde_json::Value) -> ToolResu
 
 pub async fn remember(ctx: &ToolCtx<'_>, args: &serde_json::Value) -> ToolResult {
     let text = args["text"].as_str().map(str::trim).unwrap_or("");
-    let occurred_at = args["occurred_at"]
-        .as_str()
-        .and_then(|s| chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d").ok())
-        .map(|d| d.and_hms_opt(12, 0, 0).unwrap().and_utc())
-        .unwrap_or_else(chrono::Utc::now);
+    // 与 `at` 同一种写法：YYYY / YYYY-MM / YYYY-MM-DD 或 RFC3339。日期落在那段第一天的
+    // 正午——离两边的日界都最远；时刻照给的。回显按给的精度写，不把「2023 年」说成 1 月 1 日
+    let (occurred_at, occurred_text) = match args["occurred_at"].as_str().map(str::trim) {
+        Some(s) if !s.is_empty() => match utopia_extract::parse_time(s) {
+            Some((d, precision)) => (
+                d + chrono::Duration::hours(12),
+                crate::time_text::world(d, Some(precision)),
+            ),
+            None => match parse_when(s) {
+                Some(at) => (at, crate::time_text::instant(at)),
+                None => {
+                    let now = chrono::Utc::now();
+                    (now, crate::time_text::instant(now))
+                }
+            },
+        },
+        _ => {
+            let now = chrono::Utc::now();
+            (now, crate::time_text::instant(now))
+        }
+    };
     if text.is_empty() {
         return (
             "remember requires non-empty text.".to_string(),
@@ -461,7 +647,7 @@ pub async fn remember(ctx: &ToolCtx<'_>, args: &serde_json::Value) -> ToolResult
                      before entering the graph. Tell the user exactly that: the sentence is \
                      recorded, and the extracted facts await their confirmation. Do not claim \
                      any fact has been added to the knowledge graph.",
-                    occurred_at.format("%Y-%m-%d")
+                    occurred_text
                 ),
                 json!({
                     "kind": "tool", "label": "remember",
@@ -532,7 +718,19 @@ async fn run_query(state: &AppState, ds_id: Uuid, sql: &str) -> anyhow::Result<S
 
 /// 事实行："works at → 星云科技 (2023-08 → now) [90%]"，in 方向用 ←。
 fn fact_line(f: &EntityFact) -> String {
-    let other = f.other_name.as_deref().unwrap_or("?");
+    // 属性事实没有对端实体，值在 `object_value` 里（0004）。从前这里只看 `other_name`，
+    // 于是薪资、职位到了模型眼前是 `salary → ?`——区间和置信度都在，唯独值没到，
+    // 模型只能说"没有薪资信息"（#348）。渲染规则与客户端 `fmtObjectValue` 一致
+    let literal = f
+        .object_value
+        .as_ref()
+        .and_then(literal_text)
+        .filter(|_| f.other_name.is_none());
+    let other = f
+        .other_name
+        .as_deref()
+        .or(literal.as_deref())
+        .unwrap_or("?");
     // 本体没认下、原文说法也没留下时用 "?"——与 other 同一个约定。
     // 不编一个"相关"出来：那正是删掉 related_to 要消灭的东西
     let pred = f.predicate_label.as_deref().unwrap_or("?");
@@ -541,15 +739,103 @@ fn fact_line(f: &EntityFact) -> String {
     } else {
         format!("{pred} ← {other}")
     };
-    let range = match (&f.valid_from, &f.valid_to) {
-        (Some(from), Some(to)) => {
-            format!(" ({} → {})", from.format("%Y-%m-%d"), to.format("%Y-%m-%d"))
-        }
-        (Some(from), None) => format!(" ({} → now)", from.format("%Y-%m-%d")),
-        (None, Some(to)) => format!(" (→ {})", to.format("%Y-%m-%d")),
-        (None, None) => String::new(),
+    // 两端各按自己的精度写；没起点的从证据起，结束了不知哪天的到说出它的那份文档为止
+    //（time_text，0022）。从前一律 %Y-%m-%d，年精度印成 1 月 1 日、结束未知印成 now
+    let range = crate::time_text::span(crate::time_text::Span {
+        valid_from: f.valid_from,
+        from_precision: f.valid_from_precision.as_deref(),
+        valid_to: f.valid_to,
+        to_precision: f.valid_to_precision.as_deref(),
+        holds_from: f.holds_from,
+        holds_to: f.holds_to,
+    });
+    let range = if range.is_empty() {
+        range
+    } else {
+        format!(" ({range})")
     };
     format!("{core}{range} [{}%]", (f.confidence * 100.0).round() as i32)
+}
+
+// 记录轴上的两次更正可以发生在同一秒；输出必须能原样交回 as_of，不能截到天或秒。
+fn record_stamp(time: chrono::DateTime<chrono::Utc>) -> String {
+    crate::time_text::instant(time)
+}
+
+/// 严格早于 T，按账本的分辨率（timestamptz 是微秒）：不晚于 T − 1µs。
+/// `recorded_at <= T−1µs` 恰好是 `recorded_at < T`，`invalidated_at > T−1µs` 恰好是
+/// `invalidated_at >= T`——0019 的 held_at 一个字不用改
+fn just_before(t: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    t - chrono::Duration::microseconds(1)
+}
+
+fn entity_facts_detail(
+    count: usize,
+    at: Option<chrono::DateTime<chrono::Utc>>,
+    as_of: Option<chrono::DateTime<chrono::Utc>>,
+    before: Option<chrono::DateTime<chrono::Utc>>,
+) -> String {
+    // 记录轴那半句：给了 before 就说「before T」，是人问的那个时刻，不是减过一微秒的
+    let record = match (before, as_of) {
+        (Some(b), _) => Some(format!("as recorded before {}", record_stamp(b))),
+        (None, Some(r)) => Some(format!("as recorded by {}", record_stamp(r))),
+        (None, None) => None,
+    };
+    match (at, record) {
+        (Some(t), Some(r)) => format!("{count} facts at {}, {r}", record_stamp(t)),
+        (Some(t), None) => format!("{count} facts as of {}", record_stamp(t)),
+        (None, Some(r)) => format!("{count} facts {r}"),
+        (None, None) => format!("{count} facts"),
+    }
+}
+
+/// 时刻参数：`YYYY-MM-DD` 或 RFC3339。`at` 与 `as_of` 共用一个解析——记录轴上的
+/// 时刻常常是一个带时间的戳（"第一波灌完那一刻"），日期粒度装不下它
+fn parse_when(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = raw.trim();
+    // 完整的 RFC3339 时刻原样收下，小数秒也留着——记录轴上同一秒内可以先录入再更正
+    // （#351），这里截掉一位就把两次认知叠回一起。日期形式（YYYY / YYYY-MM / YYYY-MM-DD，
+    // 或带时区的缩略钟点）才交给抽取端同一个解析，取那一段的开头
+    if let Ok(t) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(t.with_timezone(&chrono::Utc));
+    }
+    utopia_extract::parse_time(s).map(|(d, _)| d)
+}
+
+/// 字面值宾语给模型看的样子：`{value, unit}` → "28000 CNY"，布尔 → ✓/✗，
+/// 映射那类 `{summary}` → 摘要本身。与 `web/src/pages/Graph.tsx::fmtObjectValue` 同一条规则，
+/// 两边分叉的话，人看到的和模型看到的就不是同一个值
+fn literal_text(v: &serde_json::Value) -> Option<String> {
+    // 裸标量（`changes` 那头的旧数据长这样）：字符串读成它自己，不带引号
+    match v {
+        serde_json::Value::Null => return None,
+        serde_json::Value::String(s) => return Some(s.clone()),
+        serde_json::Value::Bool(_) | serde_json::Value::Number(_) => return Some(v.to_string()),
+        _ => {}
+    }
+    if let Some(val) = v.get("value") {
+        let text = match val {
+            serde_json::Value::Bool(true) => "✓".to_string(),
+            serde_json::Value::Bool(false) => "✗".to_string(),
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Null => return None,
+            other => other.to_string(),
+        };
+        return Some(
+            match v
+                .get("unit")
+                .and_then(|u| u.as_str())
+                .filter(|u| !u.is_empty())
+            {
+                Some(unit) => format!("{text} {unit}"),
+                None => text,
+            },
+        );
+    }
+    if let Some(summary) = v.get("summary").and_then(|s| s.as_str()) {
+        return Some(summary.to_string());
+    }
+    Some(v.to_string())
 }
 
 /// changes 的时间窗：把两个可选日期变成 (SQL 用的半开区间, 展示用的窗口串)。
@@ -560,6 +846,25 @@ fn fact_line(f: &EntityFact) -> String {
 /// 一起被测住；分在两处写，迟早再次分叉。
 ///
 /// `now` 从外面传进来而不是在里面取，纯粹是为了这个函数测得动。
+/// 一段（年 / 月 / 日）的最后一天：`until=2023` 是到 12 月 31 日为止，含那一整天。
+fn period_last_day(first: chrono::NaiveDate, precision: &str) -> chrono::NaiveDate {
+    use chrono::Datelike;
+    match precision {
+        "year" => chrono::NaiveDate::from_ymd_opt(first.year(), 12, 31).unwrap_or(first),
+        "month" => {
+            let (y, m) = if first.month() == 12 {
+                (first.year() + 1, 1)
+            } else {
+                (first.year(), first.month() + 1)
+            };
+            chrono::NaiveDate::from_ymd_opt(y, m, 1)
+                .and_then(|d| d.pred_opt())
+                .unwrap_or(first)
+        }
+        _ => first,
+    }
+}
+
 fn changes_window(
     since: Option<chrono::NaiveDate>,
     until: Option<chrono::NaiveDate>,
@@ -593,25 +898,26 @@ fn changes_window(
 /// 若把它们排成一串日期，模型会把"2026 年记下的"读成"2026 年发生的"——那正是
 /// 这个工具要防的误读。
 fn change_line(c: &GraphChange) -> String {
+    // 字面值宾语与 `fact_line` 同一条规则（`literal_text`）：两个工具看到的
+    // 不能是两种写法，否则 `{value, unit}` 在这里会印成一段 JSON
     let object = match (&c.object_name, &c.object_value) {
         (Some(name), _) => name.clone(),
-        (None, Some(v)) => match v {
-            serde_json::Value::String(s) => s.clone(),
-            other => other.to_string(),
-        },
+        (None, Some(v)) => literal_text(v).unwrap_or_else(|| "?".to_string()),
         (None, None) => "?".to_string(),
     };
-    let range = match (&c.valid_from, &c.valid_to) {
-        (Some(from), Some(to)) => {
-            format!(
-                " [valid {} → {}]",
-                from.format("%Y-%m-%d"),
-                to.format("%Y-%m-%d")
-            )
-        }
-        (Some(from), None) => format!(" [valid {} → now]", from.format("%Y-%m-%d")),
-        (None, Some(to)) => format!(" [valid → {}]", to.format("%Y-%m-%d")),
-        (None, None) => String::new(),
+    // 世界轴两端按自己的精度写（time_text）；事件行上没有锚点，结束未知只能写成话
+    let range = crate::time_text::span(crate::time_text::Span {
+        valid_from: c.valid_from,
+        from_precision: c.valid_from_precision.as_deref(),
+        valid_to: c.valid_to,
+        to_precision: c.valid_to_precision.as_deref(),
+        holds_from: None,
+        holds_to: None,
+    });
+    let range = if range.is_empty() {
+        range
+    } else {
+        format!(" [valid {range}]")
     };
     // 文件名不带 [n]：引证编号是 chunk 的，这里只有 document，发一个编号出去
     // 会在界面上落成一条指不到东西的引证
@@ -622,7 +928,7 @@ fn change_line(c: &GraphChange) -> String {
     };
     format!(
         "{} {}: {} {} {}{}{}",
-        c.at.format("%Y-%m-%d"),
+        record_stamp(c.at),
         c.kind,
         c.subject_name,
         c.predicate_label.as_deref().unwrap_or("?"),
@@ -651,6 +957,21 @@ mod tests {
     }
     fn t(s: &str) -> chrono::DateTime<chrono::Utc> {
         s.parse().unwrap()
+    }
+
+    // --- parse_when -------------------------------------------------------------
+
+    /// `at` 与 `as_of` 共用一个解析：日期按当天零点，RFC3339 原样；别的一律 None，
+    /// 不猜——猜出来的时刻会安静地把问题答到另一天上
+    #[test]
+    fn a_moment_is_a_date_or_an_rfc3339_stamp_and_nothing_else() {
+        assert_eq!(parse_when("2024-08-01"), Some(t("2024-08-01T00:00:00Z")));
+        assert_eq!(
+            parse_when(" 2026-09-05T02:43:24.197Z "),
+            Some(t("2026-09-05T02:43:24.197Z"))
+        );
+        assert_eq!(parse_when("August 2024"), None);
+        assert_eq!(parse_when(""), None);
     }
 
     // --- changes_window -----------------------------------------------------
@@ -689,6 +1010,36 @@ mod tests {
 
     // --- change_line --------------------------------------------------------
 
+    /// 年精度的起点写成年，不再印成 1 月 1 日；结束了不知哪天绝不写 now
+    #[test]
+    fn a_change_line_shows_each_end_at_its_precision() {
+        let mut c = change("asserted");
+        c.valid_from = Some(t("2019-01-01T00:00:00Z"));
+        c.valid_from_precision = Some("year".into());
+        assert!(
+            change_line(&c).contains("[valid 2019 → now]"),
+            "{}",
+            change_line(&c)
+        );
+        c.valid_to_precision = Some("unknown".into());
+        assert!(
+            change_line(&c).contains("[valid 2019 → ended, date unknown]"),
+            "{}",
+            change_line(&c)
+        );
+    }
+
+    #[test]
+    fn a_window_end_covers_the_whole_period_named() {
+        assert_eq!(period_last_day(d("2023-01-01"), "year"), d("2023-12-31"));
+        assert_eq!(period_last_day(d("2024-02-01"), "month"), d("2024-02-29"));
+        assert_eq!(period_last_day(d("2023-12-01"), "month"), d("2023-12-31"));
+        assert_eq!(period_last_day(d("2023-06-15"), "day"), d("2023-06-15"));
+        // parse_when 与 at 同一种写法
+        assert_eq!(parse_when("2023"), Some(t("2023-01-01T00:00:00Z")));
+        assert_eq!(parse_when("2023-06"), Some(t("2023-06-01T00:00:00Z")));
+    }
+
     fn change(kind: &str) -> GraphChange {
         GraphChange {
             fact_id: Uuid::nil(),
@@ -710,6 +1061,112 @@ mod tests {
             filename: None,
             quote: None,
         }
+    }
+
+    // 同一秒内也能先录入再更正；截到整秒会把这两次认知重新叠在一起。
+    #[test]
+    fn change_stamps_round_trip_without_losing_the_record_clock() {
+        let mut c = change("corrected");
+        for stamp in [
+            "2026-09-05T02:43:53Z",
+            "2026-09-05T02:43:53.382Z",
+            "2026-09-05T02:43:53.382001Z",
+            "2026-09-05T02:43:53.382002Z",
+        ] {
+            c.at = t(stamp);
+            let line = change_line(&c);
+            let printed = line.split_whitespace().next().unwrap();
+            assert_eq!(printed, stamp);
+            assert_eq!(parse_when(printed), Some(c.at));
+        }
+    }
+
+    /// `before` 减的是账本分辨率的一微秒——不是一秒、不是一天；摘要里写的是人问的那个时刻
+    #[test]
+    fn before_is_the_microsecond_before_at_the_ledgers_resolution() {
+        let t0 = t("2026-09-05T02:43:53.382Z");
+        assert_eq!(just_before(t0), t("2026-09-05T02:43:53.381999Z"));
+        assert_eq!(
+            just_before(t("2026-09-05T02:43:53Z")),
+            t("2026-09-05T02:43:52.999999Z"),
+            "小数为零要向秒借位——正是不该让模型算的那一步"
+        );
+        assert_eq!(
+            entity_facts_detail(2, None, Some(just_before(t0)), Some(t0)),
+            "2 facts as recorded before 2026-09-05T02:43:53.382Z"
+        );
+    }
+
+    #[test]
+    fn fact_details_keep_the_record_instant_beside_the_world_date() {
+        let at = Some(t("2024-08-01T00:00:00Z"));
+        let as_of = Some(t("2026-09-05T02:43:53.382001Z"));
+        assert_eq!(
+            entity_facts_detail(2, at, as_of, None),
+            "2 facts at 2024-08-01T00:00:00Z, as recorded by 2026-09-05T02:43:53.382001Z"
+        );
+        assert_eq!(
+            entity_facts_detail(2, None, as_of, None),
+            "2 facts as recorded by 2026-09-05T02:43:53.382001Z"
+        );
+        assert_eq!(
+            entity_facts_detail(2, at, None, None),
+            "2 facts as of 2024-08-01T00:00:00Z"
+        );
+        assert_eq!(entity_facts_detail(0, None, None, None), "0 facts");
+    }
+
+    fn attribute_fact(value: serde_json::Value) -> EntityFact {
+        EntityFact {
+            id: Uuid::nil(),
+            direction: "out".into(),
+            predicate_key: Some("salary".into()),
+            predicate_label: Some("salary".into()),
+            inferred: false,
+            temporal: Some("state".into()),
+            other_id: None,
+            other_name: None,
+            object_value: Some(value),
+            valid_from: Some(t("2023-06-01T00:00:00Z")),
+            valid_to: Some(t("2024-02-20T00:00:00Z")),
+            valid_from_precision: Some("day".into()),
+            valid_to_precision: Some("day".into()),
+            holds_from: Some(t("2023-06-01T00:00:00Z")),
+            holds_to: Some(t("2024-02-20T00:00:00Z")),
+            confidence: 0.9,
+            evidence_count: 1,
+            stale: false,
+            corrected: false,
+            last_evidence_time: None,
+            contested: None,
+        }
+    }
+
+    /// 属性事实的值要到模型眼前（#348）。从前这里是 `salary → ? (2023-06-01 → 2024-02-20)`：
+    /// 区间和置信度都在，唯独值没到，模型只能说"没有薪资信息"——而账本里明明有
+    #[test]
+    fn an_attribute_fact_shows_the_model_its_value() {
+        let line = fact_line(&attribute_fact(
+            serde_json::json!({ "value": 28000, "unit": "CNY" }),
+        ));
+        assert!(line.starts_with("salary → 28000 CNY"), "{line}");
+        assert!(line.contains("(2023-06-01 → 2024-02-20)"), "{line}");
+
+        // 与客户端 fmtObjectValue 同一条规则：布尔画成 ✓/✗，映射摘要读摘要本身
+        let flag = fact_line(&attribute_fact(serde_json::json!({ "value": true })));
+        assert!(flag.starts_with("salary → ✓"), "{flag}");
+        let mapped = fact_line(&attribute_fact(
+            serde_json::json!({ "summary": "orders.total" }),
+        ));
+        assert!(mapped.starts_with("salary → orders.total"), "{mapped}");
+    }
+
+    /// 本体没接住的关系仍然是 "?"：那个问号是给「没有谓词」留的，不是给「有值」用的
+    #[test]
+    fn a_missing_object_still_reads_as_a_question_mark() {
+        let mut f = attribute_fact(serde_json::json!(null));
+        f.object_value = None;
+        assert!(fact_line(&f).starts_with("salary → ?"), "{}", fact_line(&f));
     }
 
     /// 字面值要读成它自己。走 `Value::to_string()` 会把字符串连引号一起印出来，
@@ -734,8 +1191,12 @@ mod tests {
         c.object_name = Some("Berlin".to_string());
         c.predicate_label = Some("headquartered in".to_string());
         c.valid_from = Some(t("2019-01-01T00:00:00Z"));
+        c.valid_from_precision = Some("day".into());
         let line = change_line(&c);
-        assert!(line.starts_with("2026-08-28 corrected: "), "{line}");
+        assert!(
+            line.starts_with("2026-08-28T10:00:00Z corrected: "),
+            "{line}"
+        );
         assert!(line.contains("[valid 2019-01-01 → now]"), "{line}");
     }
 

@@ -13,11 +13,14 @@ use uuid::Uuid;
 
 /// 单次同步的新文档上限（防超长 feed/URL 列表拖垮任务）
 const MAX_NEW_PER_SYNC: usize = 200;
+const MAX_FEED_BYTES: usize = 4 * 1024 * 1024;
+const RSS_MAX_INFLIGHT: i64 = 25;
+const RSS_HYDRATION_ATTEMPTS: i32 = 5;
 
 /// 抓取用的 User-Agent。reqwest 默认一个都不发，而维基百科明确拒绝匿名请求
 /// （403），Cloudflare 前置的站点也普遍如此——URL 与 RSS 两类来源因此对一大批
 /// 真实网站直接失效。自报家门也是爬虫礼节：站方能认出我们、能联系到我们。
-const UA: &str = concat!(
+pub(crate) const UA: &str = concat!(
     "Utopia/",
     env!("CARGO_PKG_VERSION"),
     " (+https://utopia.bi; self-hosted knowledge platform)"
@@ -28,6 +31,20 @@ const UA: &str = concat!(
 pub struct SyncStats {
     pub created: usize,
     pub updated: usize,
+    pub discovered: usize,
+    pub queued_for_content: usize,
+    pub content_terminal: usize,
+}
+
+#[derive(Debug)]
+struct RssObservation {
+    key: String,
+    title: String,
+    article_url: Option<String>,
+    summary: String,
+    embedded_html: Option<String>,
+    doc_time: Option<DateTime<Utc>>,
+    has_usable_source: bool,
 }
 
 impl SyncStats {
@@ -82,7 +99,16 @@ pub async fn sync_source(state: &AppState, source_id: Uuid) -> anyhow::Result<()
             utopia_store::sources::finish_sync(&state.pool, source_id, None, stats.total() as i32)
                 .await?;
             state.emit_source(source.kb_id);
-            tracing::info!(%source_id, kind = %source.kind, created = stats.created, updated = stats.updated, "来源同步完成");
+            tracing::info!(
+                %source_id,
+                kind = %source.kind,
+                created = stats.created,
+                updated = stats.updated,
+                discovered = stats.discovered,
+                queued_for_content = stats.queued_for_content,
+                content_terminal = stats.content_terminal,
+                "来源同步完成"
+            );
             Ok(())
         }
         Err(e) => {
@@ -114,7 +140,12 @@ pub enum IngestAction {
     Tombstoned,
 }
 
-async fn write_blob(state: &AppState, sha256: &str, bytes: &[u8]) -> anyhow::Result<()> {
+#[derive(Debug, Clone, Copy)]
+pub struct IngestOutcome {
+    pub action: IngestAction,
+}
+
+pub(crate) async fn write_blob(state: &AppState, sha256: &str, bytes: &[u8]) -> anyhow::Result<()> {
     state.blob.put(sha256, bytes).await
 }
 
@@ -168,11 +199,7 @@ pub async fn ingest_upload(
     }
 }
 
-/// 身份感知摄入：按 (source, external_key) 三路判定——
-/// 新增（建文档）/ 变更（原地替换 + 版本记录 + 重跑管道）/ 未变（跳过）；
-/// 同内容换路径识别为移动（只改身份，不重跑）。external_key 为 URI 形态
-/// （file:/// 相对路径、页面 URL、rss guid、api:{id}），出处自描述，
-/// 也为 P5 SPARQL 投影的文档 IRI 提前对齐。
+/// Existing callers only need the action; hydration also needs the stable document UUID.
 #[allow(clippy::too_many_arguments)]
 pub async fn ingest_item(
     state: &AppState,
@@ -184,8 +211,35 @@ pub async fn ingest_item(
     bytes: &[u8],
     doc_time: Option<DateTime<Utc>>,
 ) -> anyhow::Result<IngestAction> {
+    Ok(ingest_item_with_outcome(
+        state,
+        kb_id,
+        source_id,
+        external_key,
+        filename,
+        mime,
+        bytes,
+        doc_time,
+    )
+    .await?
+    .action)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn ingest_item_with_outcome(
+    state: &AppState,
+    kb_id: Uuid,
+    source_id: Uuid,
+    external_key: &str,
+    filename: &str,
+    mime: &str,
+    bytes: &[u8],
+    doc_time: Option<DateTime<Utc>>,
+) -> anyhow::Result<IngestOutcome> {
     if bytes.is_empty() {
-        return Ok(IngestAction::Unchanged);
+        return Ok(IngestOutcome {
+            action: IngestAction::Unchanged,
+        });
     }
     let sha256 = sha_hex(bytes);
 
@@ -212,14 +266,13 @@ pub async fn ingest_item(
     }
 
     if let Some(doc) = existing {
-        // 同步撞见墓碑：源头还有这篇，本地删除对同步源本来就是暂时的——复活它，
-        // 分块与这次作废的事实原路回来，索引重建（#268）
+        // Ordinary source reappearance retains upstream restore semantics,
+        // including search and derivation repair, before comparing content.
         let revived = doc.deleted_at.is_some();
         if revived {
-            let doc = utopia_store::documents::restore(&state.pool, kb_id, doc.id).await?;
-            crate::api::documents_routes::reindex(state, &doc).await?;
+            let restored = utopia_store::documents::restore(&state.pool, kb_id, doc.id).await?;
+            crate::api::documents_routes::reindex(state, &restored).await?;
             crate::api::documents_routes::settle_derivations(state, kb_id).await?;
-            // 引擎做的，没有人：actor 留空，台账写「engine」
             let _ = utopia_store::audit::record_opt(
                 &state.pool,
                 Some(kb_id),
@@ -227,20 +280,24 @@ pub async fn ingest_item(
                 "document.restored",
                 "document",
                 Some(doc.id),
-                serde_json::json!({ "filename": doc.filename, "via": "sync" }),
+                serde_json::json!({"filename":restored.filename,"via":"sync"}),
             )
             .await;
         }
         if doc.sha256 == sha256 {
             if revived {
                 state.emit_document(kb_id, doc.id);
-                return Ok(IngestAction::Updated);
+                return Ok(IngestOutcome {
+                    action: IngestAction::Updated,
+                });
             }
-            return Ok(IngestAction::Unchanged);
+            return Ok(IngestOutcome {
+                action: IngestAction::Unchanged,
+            });
         }
-        // 变更：原地替换，旧版本入 document_versions（blob 内容寻址不删，回放有料）
+        // 变更：原地替换，旧版本入 document_versions，并与处理任务一起提交
         write_blob(state, &sha256, bytes).await?;
-        utopia_store::documents::replace_content(
+        utopia_store::documents::replace_content_and_enqueue_processing(
             &state.pool,
             doc.id,
             filename,
@@ -250,16 +307,10 @@ pub async fn ingest_item(
             doc_time,
         )
         .await?;
-        utopia_store::documents::record_version(&state.pool, doc.id, &sha256, bytes.len() as i64)
-            .await?;
-        utopia_store::jobs::enqueue(
-            &state.pool,
-            "process_document",
-            serde_json::json!({ "document_id": doc.id }),
-        )
-        .await?;
         state.emit_document(kb_id, doc.id);
-        return Ok(IngestAction::Updated);
+        return Ok(IngestOutcome {
+            action: IngestAction::Updated,
+        });
     }
 
     // 同内容出现在新路径：识别为移动/改名，不重跑管道
@@ -269,11 +320,13 @@ pub async fn ingest_item(
         utopia_store::documents::update_location(&state.pool, doc.id, filename, external_key)
             .await?;
         state.emit_document(kb_id, doc.id);
-        return Ok(IngestAction::Moved);
+        return Ok(IngestOutcome {
+            action: IngestAction::Moved,
+        });
     }
 
     write_blob(state, &sha256, bytes).await?;
-    match utopia_store::documents::create(
+    match utopia_store::documents::create_with_version_and_processing(
         &state.pool,
         kb_id,
         filename,
@@ -287,24 +340,15 @@ pub async fn ingest_item(
     .await
     {
         Ok(doc) => {
-            utopia_store::documents::record_version(
-                &state.pool,
-                doc.id,
-                &sha256,
-                bytes.len() as i64,
-            )
-            .await?;
-            utopia_store::jobs::enqueue(
-                &state.pool,
-                "process_document",
-                serde_json::json!({ "document_id": doc.id }),
-            )
-            .await?;
             state.emit_document(kb_id, doc.id);
-            Ok(IngestAction::Created)
+            Ok(IngestOutcome {
+                action: IngestAction::Created,
+            })
         }
-        // KB 内已有同内容（如手动上传过同一文件）：不重复摄入
-        Err(utopia_core::AppError::Conflict(_)) => Ok(IngestAction::Unchanged),
+        // KB 内已有同内容：不伪造新的身份，保留幂等结果
+        Err(utopia_core::AppError::Conflict(_)) => Ok(IngestOutcome {
+            action: IngestAction::Unchanged,
+        }),
         Err(e) => Err(e.into()),
     }
 }
@@ -325,14 +369,10 @@ async fn sync_urls(state: &AppState, source: &Source) -> anyhow::Result<SyncStat
         anyhow::bail!("url source is missing config.urls (a list of page URLs)");
     }
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(UA)
-        .build()?;
     let mut stats = SyncStats::default();
     let mut last_err: Option<String> = None;
     for url in urls.iter().take(MAX_NEW_PER_SYNC) {
-        match fetch_page(&http, url).await {
+        match fetch_page(url).await {
             Ok((filename, mime, bytes)) => {
                 // 逻辑身份 = URL 本身：页面内容变了就原地替换（历史进版本表）
                 let action = ingest_item(
@@ -367,26 +407,27 @@ async fn sync_urls(state: &AppState, source: &Source) -> anyhow::Result<SyncStat
     Ok(stats)
 }
 
-async fn fetch_page(
-    http: &reqwest::Client,
-    url: &str,
-) -> anyhow::Result<(String, String, Vec<u8>)> {
-    let resp = http.get(url).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("HTTP {}", resp.status());
+/// 抓一个页面。地址是这个库的人自己填的，所以内网放行（`Reach::Operator`），
+/// 但重定向不许把请求带进内网，响应体有上限（#330）。
+async fn fetch_page(url: &str) -> anyhow::Result<(String, String, Vec<u8>)> {
+    let page = crate::http_fetch::get(
+        url,
+        crate::http_fetch::Reach::Operator,
+        crate::http_fetch::Limits::default(),
+    )
+    .await?;
+    let mime = if page.mime == "application/octet-stream" {
+        "text/html".to_string()
+    } else {
+        page.mime
+    };
+    // 身份仍然是**配置里那个 URL**（同一个页面换了地址不该变成新文档），
+    // 但落到别处这件事值得留一行
+    if page.final_url.as_str() != url {
+        tracing::debug!(from = url, to = %page.final_url, "页面跟着重定向落在别处");
     }
-    let mime = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("text/html")
-        .split(';')
-        .next()
-        .unwrap_or("text/html")
-        .to_string();
-    let bytes = resp.bytes().await?.to_vec();
     let filename = filename_from_url(url, &mime);
-    Ok((filename, mime, bytes))
+    Ok((filename, mime, page.bytes))
 }
 
 fn filename_from_url(url: &str, mime: &str) -> String {
@@ -419,64 +460,250 @@ fn filename_from_url(url: &str, mime: &str) -> String {
     }
 }
 
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
+}
+
+fn rss_article_link(entry: &feed_rs::model::Entry) -> Option<String> {
+    entry.links.iter().find_map(|link| {
+        let rel_is_alternate = link
+            .rel
+            .as_deref()
+            .is_none_or(|rel| rel.eq_ignore_ascii_case("alternate"));
+        if !rel_is_alternate {
+            return None;
+        }
+        if link.media_type.as_deref().is_some_and(|media| {
+            !media.eq_ignore_ascii_case("text/html")
+                && !media.eq_ignore_ascii_case("application/xhtml+xml")
+        }) {
+            return None;
+        }
+        let parsed = reqwest::Url::parse(link.href.trim()).ok()?;
+        match parsed.scheme() {
+            "http" | "https" if parsed.host().is_some() => Some(parsed.to_string()),
+            _ => None,
+        }
+    })
+}
+
+const RSS_EXTERNAL_KEY_MAX_BYTES: usize = 4_096;
+
+fn rss_entry_key(entry: &feed_rs::model::Entry, article_url: Option<&str>) -> Option<String> {
+    let identity = if !entry.id.trim().is_empty() {
+        entry.id.trim()
+    } else {
+        article_url?.trim()
+    };
+    if identity.is_empty() {
+        return None;
+    }
+    Some(bound_rss_identity(identity))
+}
+
+fn bound_rss_identity(identity: &str) -> String {
+    if identity.len() <= RSS_EXTERNAL_KEY_MAX_BYTES {
+        return identity.to_owned();
+    }
+    // Never truncate a publisher's GUID or URL: doing so silently merges
+    // distinct feed items sharing the same prefix. A bounded digest retains
+    // the complete identity material without violating the database bound.
+    format!("rss:v1:sha256:{}", sha_hex(identity.as_bytes()))
+}
+
+fn content_is_substantive(markdown: &str, summary: &str, linked_page: bool) -> bool {
+    crate::rss_full_content::quality_check(markdown, summary, linked_page).is_ok()
+}
+
+fn has_usable_rss_content(feed_usable: bool, article_url: Option<&str>) -> bool {
+    feed_usable || article_url.is_some_and(|url| !url.trim().is_empty())
+}
+
+#[cfg(test)]
+#[path = "rss_sync_contract_tests.rs"]
+mod rss_sync_contract_tests;
+
 async fn sync_rss(state: &AppState, source: &Source) -> anyhow::Result<SyncStats> {
     let feed_url = source.config["feed_url"]
         .as_str()
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("rss source is missing config.feed_url"))?;
+    let content_mode = utopia_store::sources::rss_content_mode(&source.config)?;
+    let observation = if content_mode == utopia_store::sources::RSS_FULL_CONTENT_MODE {
+        Some(
+            utopia_store::rss_full_content::begin_feed_observation(
+                &state.pool,
+                source.id,
+                &source.config,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(UA)
-        .build()?;
-    let resp = http.get(feed_url).send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("HTTP {} fetching feed", resp.status());
-    }
-    let bytes = resp.bytes().await?;
-    let feed = feed_rs::parser::parse(&bytes[..])
+    let feed_body = crate::http_fetch::get(
+        feed_url,
+        crate::http_fetch::Reach::Operator,
+        crate::http_fetch::Limits {
+            max_bytes: MAX_FEED_BYTES,
+            ..Default::default()
+        },
+    )
+    .await?;
+    let bytes = feed_body.bytes;
+    // feed-rs normally synthesizes missing entry IDs from link + title (or a
+    // random UUID). Neither is an application-level stable identity. Leave
+    // missing IDs empty so rss_entry_key can use only the stable article URL.
+    let feed = feed_rs::parser::Builder::new()
+        .id_generator(|_, _, _| String::new())
+        .build()
+        .parse(&bytes[..])
         .map_err(|e| anyhow::anyhow!("Failed to parse feed: {e}"))?;
 
-    let mut stats = SyncStats::default();
-    for entry in feed.entries.iter().take(MAX_NEW_PER_SYNC) {
-        let title = entry
-            .title
-            .as_ref()
-            .map(|t| t.content.clone())
-            .unwrap_or_else(|| "untitled".into());
-        let link = entry
-            .links
-            .first()
-            .map(|l| l.href.clone())
-            .unwrap_or_default();
-        // 逻辑身份：feed 规范的 guid（通常已是 permalink/urn），缺失时退条目链接
-        let key = if !entry.id.trim().is_empty() {
-            entry.id.trim().to_string()
-        } else if !link.is_empty() {
-            link.clone()
-        } else {
-            format!("entry:{}", sha_hex(title.as_bytes()))
-        };
-        let body = entry
-            .content
-            .as_ref()
-            .and_then(|c| c.body.clone())
-            .or_else(|| entry.summary.as_ref().map(|s| s.content.clone()))
-            .unwrap_or_default();
-        // 条目发布时间 → 文档时间：时态抽取吃到真实时间戳（本平台的差异化正在于此）
-        let doc_time = entry.published.or(entry.updated);
+    let observations: Vec<RssObservation> = feed
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            let title = entry
+                .title
+                .as_ref()
+                .map(|t| t.content.trim().to_string())
+                .filter(|title| !title.is_empty())
+                .unwrap_or_else(|| "untitled".into());
+            let article_url = rss_article_link(entry);
+            let key = rss_entry_key(entry, article_url.as_deref())?;
+            let embedded_html = entry
+                .content
+                .as_ref()
+                .and_then(|content| content.body.as_deref())
+                .map(str::trim)
+                .filter(|body| !body.is_empty())
+                .map(|body| truncate_utf8(body, 2 * 1024 * 1024));
+            let summary = entry
+                .summary
+                .as_ref()
+                .map(|summary| summary.content.trim().to_string())
+                .unwrap_or_default();
+            let embedded_markdown = embedded_html
+                .as_deref()
+                .and_then(|html| crate::rss_full_content::normalize_feed_html(html).ok());
+            let feed_usable = embedded_markdown
+                .as_deref()
+                .is_some_and(|markdown| content_is_substantive(markdown, &summary, false));
+            let usable_source = has_usable_rss_content(feed_usable, article_url.as_deref());
+            Some(RssObservation {
+                key,
+                title,
+                article_url,
+                summary,
+                embedded_html,
+                doc_time: entry.published.or(entry.updated),
+                has_usable_source: usable_source,
+            })
+        })
+        .collect();
 
-        let html = format!(
-            "<html><head><title>{}</title></head><body><h1>{}</h1>\n<p><a href=\"{}\">{}</a></p>\n{}</body></html>",
-            title, title, link, link, body
-        );
-        let mut slug: String = title
-            .chars()
-            .map(|c| if c.is_alphanumeric() { c } else { '-' })
+    if let Some((activation, observed_at)) = observation {
+        let entries: Vec<utopia_store::rss_full_content::NewEntry> = observations
+            .iter()
+            .map(|observation| utopia_store::rss_full_content::NewEntry {
+                external_key: observation.key.clone(),
+                title: truncate_utf8(&observation.title, 2_048),
+                article_url: observation
+                    .article_url
+                    .as_deref()
+                    .map(|url| truncate_utf8(url, 8_192)),
+                summary: truncate_utf8(&observation.summary, 16_384),
+                embedded_html: observation.embedded_html.clone(),
+                doc_time: observation.doc_time,
+                has_usable_source: observation.has_usable_source,
+            })
             .collect();
-        slug.truncate(80);
-        let filename = format!("{slug}.html");
 
+        if activation.activation_state == "pending" {
+            let discovered = utopia_store::rss_full_content::record_baseline(
+                &state.pool,
+                source.id,
+                activation.activation_generation,
+                &entries,
+            )
+            .await?;
+            return Ok(SyncStats {
+                discovered,
+                ..SyncStats::default()
+            });
+        }
+        if activation.activation_state != "active" {
+            anyhow::bail!("RSS full-content activation is disabled");
+        }
+
+        let discovered = utopia_store::rss_full_content::discover_observed(
+            &state.pool,
+            source.id,
+            activation.activation_generation,
+            &entries,
+            observed_at,
+        )
+        .await?;
+        let queued = utopia_store::rss_full_content::claim_pending_and_enqueue(
+            &state.pool,
+            source.id,
+            activation.activation_generation,
+            RSS_MAX_INFLIGHT,
+            RSS_HYDRATION_ATTEMPTS,
+        )
+        .await?;
+        return Ok(SyncStats {
+            discovered: discovered.discovered,
+            queued_for_content: queued,
+            content_terminal: discovered.terminal,
+            ..SyncStats::default()
+        });
+    }
+
+    let mut stats = SyncStats::default();
+    for observation in observations.into_iter().take(MAX_NEW_PER_SYNC) {
+        let RssObservation {
+            key,
+            title,
+            article_url,
+            summary,
+            embedded_html,
+            doc_time,
+            ..
+        } = observation;
+        let body = embedded_html.unwrap_or(summary);
+        let safe_title = escape_html(&title);
+        let safe_link = article_url.as_deref().map(escape_html).unwrap_or_default();
+        let html = format!(
+            "<html><head><title>{safe_title}</title></head><body><h1>{safe_title}</h1>\n<p><a href=\"{safe_link}\">{safe_link}</a></p>\n{body}</body></html>",
+        );
+        let slug = {
+            let slug = slugify(&title);
+            if slug.is_empty() {
+                "untitled".to_string()
+            } else {
+                slug
+            }
+        };
+        let filename = format!("{slug}.html");
         let action = ingest_item(
             state,
             source.kb_id,
@@ -523,10 +750,13 @@ async fn sync_github_issues(state: &AppState, source: &Source) -> anyhow::Result
         .as_bool()
         .unwrap_or(false);
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(UA)
-        .build()?;
+    // api.github.com 是固定的公网主机，所以按内容级的严格度收（`Reach::Content`）
+    let http = crate::http_fetch::client_for(
+        &reqwest::Url::parse("https://api.github.com/")?,
+        crate::http_fetch::Reach::Content,
+        crate::http_fetch::Limits::default(),
+    )
+    .await?;
     let base = format!("https://api.github.com/repos/{repo}");
 
     // 增量：GitHub 的 since 是"这之后更新过的"
@@ -613,10 +843,12 @@ async fn sync_jira_issues(state: &AppState, source: &Source) -> anyhow::Result<S
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(45))
-        .user_agent(UA)
-        .build()?;
+    let http = crate::http_fetch::client_for(
+        &reqwest::Url::parse(base_url).map_err(|e| anyhow::anyhow!("Invalid base_url: {e}"))?,
+        crate::http_fetch::Reach::Operator,
+        crate::http_fetch::Limits::default().with_overall(std::time::Duration::from_secs(45)),
+    )
+    .await?;
 
     let jql = crate::jira_issues::jql(project, source.last_sync_at);
     let (issues, total) = crate::jira_issues::fetch_all(&http, base_url, &jql, auth).await?;
@@ -687,20 +919,14 @@ async fn sync_custom(state: &AppState, source: &Source) -> anyhow::Result<SyncSt
         url.query_pairs_mut().append_pair("since", &t.to_rfc3339());
     }
 
-    // loopback 端点不走系统代理：代理对回环地址只会 502，本机服务必须直连
-    let loopback = url
-        .host_str()
-        .map(|h| {
-            h.eq_ignore_ascii_case("localhost") || h == "127.0.0.1" || h == "::1" || h == "[::1]"
-        })
-        .unwrap_or(false);
-    let mut builder = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .user_agent(UA);
-    if loopback {
-        builder = builder.no_proxy();
-    }
-    let http = builder.build()?;
+    // 端点是操作者自己填的，内网与回环都是正当目标；代理的取舍（回环走代理
+    // 只会 502）和地址校验一起收进 `client_for`（#330）
+    let http = crate::http_fetch::client_for(
+        &url,
+        crate::http_fetch::Reach::Operator,
+        crate::http_fetch::Limits::default(),
+    )
+    .await?;
     let mut req = http.get(url);
     if let Some(auth) = source.config["auth_header"]
         .as_str()
@@ -854,9 +1080,12 @@ async fn sync_webdav(state: &AppState, source: &Source) -> anyhow::Result<SyncSt
         _ => None,
     };
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()?;
+    let http = crate::http_fetch::client_for(
+        &reqwest::Url::parse(base).map_err(|e| anyhow::anyhow!("Invalid base_url: {e}"))?,
+        crate::http_fetch::Reach::Operator,
+        crate::http_fetch::Limits::default().with_overall(std::time::Duration::from_secs(60)),
+    )
+    .await?;
     let (files, truncated) = crate::webdav::fetch(&http, base, root, auth).await?;
     if truncated {
         tracing::warn!(base, root, "文件数到达单次上限，其余留给下一次同步");
@@ -939,4 +1168,43 @@ fn ensure_extension(title: &str, mime: &str) -> String {
         "md"
     };
     format!("{title}.{ext}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bound_rss_identity, has_usable_rss_content, rss_entry_key, RSS_EXTERNAL_KEY_MAX_BYTES,
+    };
+
+    #[test]
+    fn summary_only_does_not_make_an_rss_entry_hydratable_without_an_article_link() {
+        assert!(!has_usable_rss_content(false, None));
+        assert!(has_usable_rss_content(false, Some("https://example.com/a")));
+        assert!(has_usable_rss_content(true, None));
+    }
+
+    #[test]
+    fn overlong_rss_identity_is_hashed_without_prefix_collisions_from_truncation() {
+        let first = "a".repeat(RSS_EXTERNAL_KEY_MAX_BYTES) + "-one";
+        let second = "a".repeat(RSS_EXTERNAL_KEY_MAX_BYTES) + "-two";
+        let first = bound_rss_identity(&first);
+        let second = bound_rss_identity(&second);
+        assert_ne!(first, second);
+        assert!(first.len() < RSS_EXTERNAL_KEY_MAX_BYTES);
+    }
+
+    #[test]
+    fn parser_leaves_missing_entry_ids_empty_for_application_fallback() {
+        let feed = feed_rs::parser::Builder::new()
+            .id_generator(|_, _, _| String::new())
+            .build()
+            .parse(
+                &br#"<?xml version="1.0"?><rss version="2.0"><channel><title>Test</title><link>https://example.com/</link><description>Test</description><item><title>Original</title><description>Summary</description></item></channel></rss>"#[..],
+            )
+            .expect("test feed should parse");
+        let entry = &feed.entries[0];
+        assert!(entry.id.is_empty());
+        assert!(rss_entry_key(entry, None).is_none());
+        assert!(rss_entry_key(entry, Some("https://example.com/article")).is_some());
+    }
 }
