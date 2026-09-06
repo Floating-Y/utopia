@@ -695,7 +695,7 @@ function PanelHeader({
       <div className="flex items-center gap-2">
         {color && (
           <span
-            className={`h-2.5 w-2.5 shrink-0 ${square ? "" : "rounded-full"}`}
+            className={`h-2.5 w-2.5 shrink-0 ${square ? "scale-90" : "rounded-full"}`}
             style={{ background: color, boxShadow: `0 0 8px ${color}55` }}
           />
         )}
@@ -729,7 +729,7 @@ function InstancesCard({ kbId, type }: { kbId: string; type: EntityTypeView }) {
   return (
     // 平铺在面板里：面板已经是一块面，里面不再套卡片。标题与行同一个 px-2
     <div>
-      <GroupLabel className="mb-1 px-2" count={total}>
+      <GroupLabel className="mb-1" count={total}>
         {S.ontology.instances}
       </GroupLabel>
       <div>
@@ -739,10 +739,10 @@ function InstancesCard({ kbId, type }: { kbId: string; type: EntityTypeView }) {
             to="/kb/$kbId/graph"
             params={{ kbId }}
             search={{ entity: e.id }}
-            className={rowClass()}
+            className={cn(rowClass(), "-mx-2")}
           >
             <span
-              className={`h-2 w-2 shrink-0 ${type.shape === "square" ? "" : "rounded-full"}`}
+              className={`h-2 w-2 shrink-0 ${type.shape === "square" ? "scale-90" : "rounded-full"}`}
               style={{ background: type.color }}
             />
             <span className="truncate">{e.name}</span>
@@ -845,6 +845,7 @@ function RelationshipsCard({
     // 悬停要有底色：这一行整条可点，只把文字提亮半级在深底上几乎看不出来。
     // 底色用左栏那一档（white/[0.05]），右端的类型小字跟着一起提亮
     <Row
+      className="-mx-2"
       icon={
         dir === "out" ? (
           <ArrowRight size={12} className="text-violet" />
@@ -868,13 +869,13 @@ function RelationshipsCard({
     // 平铺在面板里，与图谱面板的关系分组同一个骨架：带方向箭头的小标题 + 行
     <div>
       <GroupLabel
-        className="mb-1 px-2"
+        className="mb-1"
         count={outgoing.length + incoming.length || undefined}
       >
         {S.ontology.schemaRelationships}
       </GroupLabel>
       {outgoing.length === 0 && incoming.length === 0 ? (
-        <p className="mb-2 px-2 text-small text-ink-3">
+        <p className="mb-2 text-small text-ink-3">
           {S.ontology.schemaNoRelationships}
         </p>
       ) : (
@@ -882,7 +883,7 @@ function RelationshipsCard({
           {outgoing.length > 0 && (
             <>
               <GroupLabel
-                className="px-2 pb-1 pt-2"
+                className="pb-1 pt-2"
                 icon={<ArrowRight size={10} />}
                 count={outgoing.length > 1 ? outgoing.length : undefined}
               >
@@ -898,7 +899,7 @@ function RelationshipsCard({
           {incoming.length > 0 && (
             <>
               <GroupLabel
-                className="px-2 pb-1 pt-2"
+                className="pb-1 pt-2"
                 icon={<ArrowLeft size={10} />}
                 count={incoming.length > 1 ? incoming.length : undefined}
               >
@@ -913,7 +914,7 @@ function RelationshipsCard({
           )}
         </div>
       )}
-      <div className="border-t border-line px-2 pt-3">
+      <div className="border-t border-line pt-3">
         <p className="text-fine text-ink-3 mb-2">
           {S.ontology.schemaConnectHint}
         </p>
@@ -932,7 +933,7 @@ function RelationshipsCard({
           />
         </div>
         <div className="flex items-center gap-2 mb-2">
-          <span className="text-fine text-ink-3">
+          <span className="text-small font-medium text-ink-2">
             {S.ontology.schemaConnectAs}
           </span>
           <Segmented
@@ -992,10 +993,10 @@ export function AttributesCard({
 
   return (
     <div className="border-t border-line pt-3">
-      <GroupLabel className="mb-1 px-2" count={attributes.length || undefined}>
+      <GroupLabel className="mb-1" count={attributes.length || undefined}>
         {S.ontology.attributes}
       </GroupLabel>
-      <p className="mb-2 px-2 text-small text-ink-3">
+      <p className="mb-2 text-fine text-ink-3">
         {S.ontology.attributesHint}
       </p>
       <div className="divide-y divide-line">
@@ -1125,7 +1126,7 @@ function AttributeForm({
     onError,
   });
 
-  const lbl = "block text-small font-medium text-ink-3 mb-1";
+  const lbl = "block text-small font-medium text-ink-2 mb-1";
   return (
     <div className="py-3 space-y-3">
       {!existing && (
@@ -1317,7 +1318,7 @@ function ClassTree({
           <span className="flex items-center gap-2">
             {/* 方形是直角：与圆形拉开区分度（图谱节点同理） */}
             <span
-              className={`h-2.5 w-2.5 shrink-0 ${t.shape === "square" ? "" : "rounded-full"}`}
+              className={`h-2.5 w-2.5 shrink-0 ${t.shape === "square" ? "scale-90" : "rounded-full"}`}
               style={{ background: t.color }}
             />
             {/* 不在列表里放逐项用量读数：数量级上来后统计和渲染都是负担，用量看表单 */}
@@ -1507,13 +1508,13 @@ export function ClassForm({
     onError,
   });
 
-  const lbl = "block text-small font-medium text-ink-3 mb-1";
+  const lbl = "block text-small font-medium text-ink-2 mb-1";
   return (
     <div className="space-y-3">
       {!headless && (
         <div className="flex items-center gap-2">
           <span
-            className={`h-3 w-3 ${shape === "square" ? "" : "rounded-full"}`}
+            className={`h-3 w-3 ${shape === "square" ? "scale-90" : "rounded-full"}`}
             style={{ background: color }}
           />
           <span className="font-semibold text-ink">
@@ -1566,12 +1567,16 @@ export function ClassForm({
             options={(["circle", "square"] as const).map((sh) => ({
               value: sh,
               title: sh,
+              // 图标占一行正文的高（h-4 = text-fine 的行高）：Segmented 的高度由内容撑，
+              // 光秃秃的 12px 图标会让它比旁边 32 高的色井矮一截
               label: (
-                <span
-                  className={`h-3 w-3 border-[1.5px] border-current ${
-                    sh === "circle" ? "rounded-full" : ""
-                  }`}
-                />
+                <span className="flex h-4 items-center">
+                  <span
+                    className={`h-3 w-3 border-[1.5px] border-current ${
+                      sh === "circle" ? "rounded-full" : "scale-90"
+                    }`}
+                  />
+                </span>
               ),
             }))}
           />
@@ -1805,7 +1810,7 @@ export function PropertyForm({
     onError,
   });
 
-  const lbl = "block text-small font-medium text-ink-3 mb-1";
+  const lbl = "block text-small font-medium text-ink-2 mb-1";
   return (
     <div className="space-y-3">
       {!headless && (
@@ -1852,7 +1857,7 @@ export function PropertyForm({
         </p>
         <div className="grid gap-2 sm:grid-cols-2">
           <div className="min-w-0">
-            <div className="mb-1 text-fine font-medium text-ink-3">
+            <div className="mb-1 text-small font-medium text-ink-2">
               {S.ontology.domainLabel}
             </div>
             <MultiSearchSelect
@@ -1864,7 +1869,7 @@ export function PropertyForm({
             />
           </div>
           <div className="min-w-0">
-            <div className="mb-1 text-fine font-medium text-ink-3">
+            <div className="mb-1 text-small font-medium text-ink-2">
               {S.ontology.rangeLabel}
             </div>
             <MultiSearchSelect
