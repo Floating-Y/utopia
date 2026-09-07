@@ -13,11 +13,11 @@ import {
   BookOpen,
   Check,
   ChevronDown,
+  ChevronRight,
   Database,
   GitCompareArrows,
   History,
   Layers,
-  MessageSquare,
   MoreHorizontal,
   Search,
   Search as SearchIcon,
@@ -114,6 +114,8 @@ export function Chat() {
   const [convSearch, setConvSearch] = useState("");
   // 三点菜单展开的是哪一条。同时只开一个
   const [menuFor, setMenuFor] = useState<string | null>(null);
+  // 「最近」这一组收起来没有。默认展开：左栏本来就是为了看见这些会话
+  const [recentOpen, setRecentOpen] = useState(true);
   const scopeRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -404,15 +406,15 @@ export function Chat() {
               title={S.ask.scopeLabel}
               onClick={() => setScopeOpen((v) => !v)}
             >
-              <Layers size={12} className="shrink-0 text-ink-3" />
+              <Layers size={12} className="shrink-0 text-ink-2" />
               <span className="truncate">{kb?.name ?? "…"}</span>
               <ChevronDown
                 size={11}
-                className={cn("u-turn shrink-0 text-ink-3", scopeOpen && "rotate-180")}
+                className={cn("u-turn shrink-0 text-ink-2", scopeOpen && "rotate-180")}
               />
             </Button>
             {scopeOpen && (
-              <div className="u-menu-glass u-pop-up absolute bottom-full mb-2 left-0 z-50 w-56 rounded-lg shadow-2xl overflow-hidden">
+              <div className="u-menu-glass u-pop-up absolute bottom-full mb-2 left-0 z-50 w-56 rounded-overlay shadow-2xl overflow-hidden">
                 <div className="border-b border-line px-4 py-3 text-body font-medium text-ink">
                   {S.ask.scopeLabel}
                 </div>
@@ -435,7 +437,7 @@ export function Chat() {
               </div>
             )}
           </div>
-          <span className="text-fine text-ink-3 truncate">{S.ask.composerHint}</span>
+          <span className="text-fine text-ink-2 truncate">{S.ask.composerHint}</span>
         </div>
         {streaming ? (
           <IconButton
@@ -482,14 +484,34 @@ export function Chat() {
             onKeyDown={(e) => e.key === "Escape" && setConvSearch("")}
           />
         </div>
-        {/* 左栏里的一切都从 12 起：输入框的盒、行的盒；图标都在 20，文字都在 42。
-            会话行也带一个图标，不然它的标题会从 20 起，和上面两行错开 */}
+        {/* 左栏里的一切都从 12 起：输入框的盒、行的盒。新对话是个动作，带图标；
+            下面的会话是一组标题，不带——一列重复的气泡图标只是把每个标题往右
+            推 22px，而它们对齐的对象是彼此，不是上面这一行 */}
         <div className="px-3 pb-1">
-          {/* 与会话行同一套样式：左栏是一列同质的行，新对话只是第一行 */}
           <Row density="nav" icon={<SquarePen size={14} />} onClick={newChat}>
             {S.ask.newChat}
           </Row>
         </div>
+        {/* 「最近」是这一组的名字，不是一条会话：同一副行的身材、同一档字色
+            （字色只有两档，见 styles.css），右端的三角说明这一组收得起来
+            （朝右=收着，朝下=开着） */}
+        <div className="px-3">
+          <Row
+            density="nav"
+            flush
+            aria-expanded={recentOpen}
+            onClick={() => setRecentOpen((v) => !v)}
+            trailing={
+              <ChevronRight
+                size={12}
+                className={cn("u-turn", recentOpen && "rotate-90")}
+              />
+            }
+          >
+            {S.ask.recent}
+          </Row>
+        </div>
+        {recentOpen && (
         <div className="u-rail-list u-scroll flex-1 overflow-y-auto px-3 pb-3">
           {(convs.data?.conversations ?? []).map((c: ConversationRow) => (
             <div
@@ -513,8 +535,8 @@ export function Chat() {
               ) : (
                 <Row
                   density="nav"
+                  flush
                   active={c.id === activeId}
-                  icon={<MessageSquare size={14} />}
                   className="pr-8"
                   onClick={() => openConversation(c.id)}
                 >
@@ -547,7 +569,7 @@ export function Chat() {
                     className="fixed inset-0 z-10"
                     onClick={() => setMenuFor(null)}
                   />
-                  <div className="glass-strong absolute right-2 top-8 z-20 w-32 rounded-lg py-1 shadow-xl">
+                  <div className="glass-strong absolute right-2 top-8 z-20 w-32 rounded-overlay py-1 shadow-xl">
                     <Row
                       density="menu"
                       onClick={() => {
@@ -582,11 +604,12 @@ export function Chat() {
               )}
             </div>
           ))}
-          {/* 没图标的文字从 20 起（盒 12 + 8），与行里的图标同一条线 */}
+          {/* 文字从 20 起（盒 12 + 8），与上面每条会话的标题同一条线 */}
           {convs.data?.conversations.length === 0 && (
-            <p className="px-2 py-2 text-small text-ink-3">{S.ask.noConversations}</p>
+            <p className="px-2 py-2 text-small text-ink-2">{S.ask.noConversations}</p>
           )}
         </div>
+        )}
       </aside>
 
       {/* 对话区：新对话首屏 = 问候 + 居中 composer（ChatGPT/Claude 惯例）；
@@ -709,7 +732,7 @@ function orbState(kind?: ChatStep["kind"]): OrbState {
 /** 思考指示：thinking-orbs 球体 + 当前动作（应用是深色定妆，theme 钉死 dark）。 */
 function Thinking({ step }: { step?: ChatStep }) {
   return (
-    <span className="inline-flex items-center gap-3 text-ink-3">
+    <span className="inline-flex items-center gap-3 text-ink-2">
       <ThinkingOrb state={orbState(step?.kind)} size={20} theme="dark" />
       {step && (
         <span className="text-small truncate">
@@ -725,7 +748,7 @@ function TurnView({ turn, live }: { turn: Turn; live?: boolean }) {
   if (turn.role === "user") {
     return (
       <div className="flex justify-end">
-        <div className="u-bubble-user max-w-[85%] rounded-lg px-4 py-2 text-body whitespace-pre-wrap text-ink">
+        <div className="u-bubble-user max-w-[85%] rounded-panel px-4 py-2 text-body whitespace-pre-wrap text-ink">
           {turn.content}
         </div>
       </div>
@@ -753,9 +776,9 @@ function TurnView({ turn, live }: { turn: Turn; live?: boolean }) {
               {seg.steps.map((s, j) => (
                 <div key={j}>
                   <div className="flex items-center gap-2 text-small">
-                    <span className="text-ink-3">{stepIcon(s.kind)}</span>
+                    <span className="text-ink-2">{stepIcon(s.kind)}</span>
                     <span className="text-ink-2 truncate">{s.label}</span>
-                    <span className="text-ink-3 shrink-0">· {s.detail}</span>
+                    <span className="text-ink-2 shrink-0">· {s.detail}</span>
                   </div>
                   {/* remember 那一步后面跟着确认卡（0015）：这句话抽出的事实先等人点头。
                       抽取是异步的，卡片在任务完成时才长出来；回放时按同一个 chunk 重画 */}
@@ -784,7 +807,7 @@ function TurnView({ turn, live }: { turn: Turn; live?: boolean }) {
           不是过程的一部分——过程已经由上面的轨迹交代了 */}
       {/* 一个面板装多行（DESIGN.md 6）：引用是同构的一组，悬停归行 */}
       {!live && turn.sources && turn.sources.length > 0 && (
-        <div className="mt-2 glass rounded-lg divide-y divide-line">
+        <div className="mt-2 glass rounded-panel divide-y divide-line">
           {turn.sources.map((s) =>
             s.kind === "charter" ? (
               /* 手册引用：视觉上与数据引用隔离（BookOpen），跳排版好的 /docs 小节 */
@@ -794,10 +817,10 @@ function TurnView({ turn, live }: { turn: Turn; live?: boolean }) {
                 params={{ slug: s.slug! }}
                 hash={s.anchor || undefined}
                 title={s.excerpt}
-                className={`u-card-link flex items-center gap-2 text-small text-ink-3 px-3 py-2 ${ROW_HOVER}`}
+                className={`u-card-link flex items-center gap-2 text-small text-ink-2 px-3 py-2 ${ROW_HOVER}`}
               >
                 <span className="u-num text-accent">[{s.n}]</span>
-                <BookOpen size={11} className="shrink-0 text-ink-3" />
+                <BookOpen size={11} className="shrink-0 text-ink-2" />
                 <span className="truncate">
                   {/* 引言节 heading 即文章名，避免 "X › X" */}
                   {s.heading && s.heading !== s.filename
@@ -812,7 +835,7 @@ function TurnView({ turn, live }: { turn: Turn; live?: boolean }) {
                 params={{ kbId, docId: s.document_id! }}
                 search={{ chunk: s.chunk_id }}
                 title={s.excerpt}
-                className={`u-card-link block text-small text-ink-3 px-3 py-2 ${ROW_HOVER}`}
+                className={`u-card-link block text-small text-ink-2 px-3 py-2 ${ROW_HOVER}`}
               >
                 <span className="u-num text-accent">[{s.n}]</span> {s.filename} ·{" "}
                 {s.excerpt.slice(0, 60)}…

@@ -148,14 +148,16 @@ export const Input = forwardRef<
     InputSize & {
       /** 左侧的语义图标（筛选框的放大镜）。给了它，className 落在外层容器上 */
       icon?: ReactNode;
+      /** 没有自己的皮：装在别的面里（切换器面板顶上那道查找） */
+      bare?: boolean;
     }
->(function Input({ className, size = "md", icon, ...props }, ref) {
+>(function Input({ className, size = "md", icon, bare, ...props }, ref) {
   const control = (
     <input
       ref={ref}
       className={cn(
-        "input-dark",
-        size === "sm" ? "u-input-sm" : "u-input-md",
+        bare ? "u-input-bare" : "input-dark",
+        bare ? null : size === "sm" ? "u-input-sm" : "u-input-md",
         // 图标槽：图标离左内缘 8px，文字从 30px 起。左栏里的输入框（盒 12）
         // 于是图标在 20、文字在 42，与左栏的行（图标 20、文字 42）同一条线
         icon ? (size === "sm" ? "pl-7" : "pl-[30px]") : null,
@@ -169,7 +171,7 @@ export const Input = forwardRef<
     <div className={cn("relative", className)}>
       <span
         className={cn(
-          "pointer-events-none absolute top-1/2 -translate-y-1/2 text-ink-3",
+          "pointer-events-none absolute top-1/2 -translate-y-1/2 text-ink-2",
           "left-2",
         )}
       >
@@ -279,16 +281,16 @@ export function Dropdown({
         title={menuLabel}
         className={cn("input-dark w-full flex items-center gap-2 text-left", pad)}
       >
-        {icon && <span className="shrink-0 text-ink-3">{icon}</span>}
+        {icon && <span className="shrink-0 text-ink-2">{icon}</span>}
         <span className="flex-1 min-w-0 truncate">
           {current?.label ?? (
-            <span className="text-ink-3">{placeholder ?? ""}</span>
+            <span className="text-ink-2">{placeholder ?? ""}</span>
           )}
         </span>
         <ChevronDown
           size={12}
           className={cn(
-            "shrink-0 text-ink-3 transition-transform",
+            "shrink-0 text-ink-2 transition-transform",
             open && "rotate-180",
           )}
         />
@@ -404,7 +406,7 @@ export function SearchSelect({
     <div className={cn("relative", className)}>
       <SearchIcon
         size={size === "sm" ? 11 : 13}
-        className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ink-3 pointer-events-none"
+        className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ink-2 pointer-events-none"
       />
       <input
         ref={inputRef}
@@ -462,7 +464,7 @@ export function SearchSelect({
               <span className="min-w-0 flex-1 truncate">
                 {o.label}
                 {o.hint && (
-                  <span className="ml-2 text-ink-3">{o.hint}</span>
+                  <span className="ml-2 text-ink-2">{o.hint}</span>
                 )}
               </span>
               {o.value === value && (
@@ -471,13 +473,13 @@ export function SearchSelect({
             </button>
           ))}
           {visible.length === 0 && (
-            <p className={cn(rowPad, "text-ink-3")}>{S.ui.noMatches}</p>
+            <p className={cn(rowPad, "text-ink-2")}>{S.ui.noMatches}</p>
           )}
           {hidden > 0 && (
             <div
               className={cn(
                 rowPad,
-                "border-t border-line text-fine text-ink-3",
+                "border-t border-line text-fine text-ink-2",
               )}
             >
               {S.ui.keepTyping(hidden)}
@@ -557,7 +559,7 @@ export function MultiSearchSelect({
               title={o.hint ?? o.label}
             >
               {o.label}
-              <span className="text-ink-3 group-hover:text-ink">
+              <span className="text-ink-2 group-hover:text-ink">
                 ✕
               </span>
             </button>
@@ -565,14 +567,14 @@ export function MultiSearchSelect({
         </div>
       )}
       {picked.length === 0 && emptyHint && (
-        <p className="mb-1 text-fine text-ink-3">{emptyHint}</p>
+        <p className="mb-1 text-fine text-ink-2">{emptyHint}</p>
       )}
       {/* 图标只对输入框定位。从前它相对整个组件居中，而组件里输入框上面
           还有一行已选项或空态提示，"一半高"就落到了输入框的上方（#288） */}
       <div className="relative">
         <SearchIcon
           size={11}
-          className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ink-3 pointer-events-none"
+          className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ink-2 pointer-events-none"
         />
       <input
           ref={inputRef}
@@ -630,7 +632,7 @@ export function MultiSearchSelect({
               <span className="min-w-0 flex-1 truncate">
                 {o.label}
                 {o.hint && (
-                  <span className="ml-2 text-ink-3">{o.hint}</span>
+                  <span className="ml-2 text-ink-2">{o.hint}</span>
                 )}
               </span>
               {values.includes(o.value) && (
@@ -639,12 +641,12 @@ export function MultiSearchSelect({
             </button>
           ))}
           {visible.length === 0 && (
-            <p className="px-2.5 py-1 text-small text-ink-3">
+            <p className="px-2.5 py-1 text-small text-ink-2">
               {S.ui.noMatches}
             </p>
           )}
           {hidden > 0 && (
-            <div className="px-2.5 py-1 text-fine text-ink-3 border-t border-line">
+            <div className="px-2.5 py-1 text-fine text-ink-2 border-t border-line">
               {S.ui.keepTyping(hidden)}
             </div>
           )}
@@ -810,7 +812,7 @@ export function Pager({
   const safe = Math.min(page, pageCount - 1);
   if (total <= pageSize) return null;
   return (
-    <div className={cn("flex items-center justify-end gap-2 text-small text-ink-3", className)}>
+    <div className={cn("flex items-center justify-end gap-2 text-small text-ink-2", className)}>
       <span className="u-num">
         {S.library.pageOf(
           safe * pageSize + 1,
@@ -863,6 +865,48 @@ export function Panel({
     >
       {children}
     </div>
+  );
+}
+
+/* ---------- SettingsCard（一个保存单位） ----------
+   设置页里的一张卡：标题、一句说明、字段，底下一条横栏——左边是约束或代价，
+   右边是这张卡自己的保存。**边框圈的是这个按钮管到哪儿**：改了名字点保存，
+   不该把下面四个开关一起送上去（DESIGN.md 6）。
+   保存用 secondary：一屏最多一个 primary（规矩 5），而设置页上每张卡都有一个。 */
+export function SettingsCard({
+  title,
+  /** 标题下的一句：这个设置是什么 */
+  hint,
+  /** 底栏左边的一句：约束、代价、什么时候生效 */
+  note,
+  /** 底栏右边：通常是这张卡的保存按钮 */
+  action,
+  className,
+  children,
+}: {
+  title: ReactNode;
+  hint?: ReactNode;
+  note?: ReactNode;
+  action?: ReactNode;
+  className?: string;
+  children?: ReactNode;
+}) {
+  return (
+    <section className={cn("glass overflow-hidden rounded-panel", className)}>
+      <div className="p-6">
+        <h2 className="text-title text-ink">{title}</h2>
+        {hint && <p className="mt-1 text-small leading-relaxed text-ink-2">{hint}</p>}
+        {children && <div className="mt-4">{children}</div>}
+      </div>
+      {(note || action) && (
+        /* 底栏只靠一条线与上面分开，不另铺一层面：surface 的三档是静止/悬停/选中，
+           拿悬停那档当静止的底会让这条栏看起来一直被指着 */
+        <div className="flex items-center justify-between gap-4 border-t border-line px-6 py-3">
+          <div className="min-w-0 flex-1 text-small leading-relaxed text-ink-2">{note}</div>
+          <div className="flex shrink-0 items-center gap-3">{action}</div>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -982,7 +1026,7 @@ export function EmptyState({
       <div className="glass mx-auto mb-4 h-14 w-14 rounded-panel grid place-items-center text-title font-bold text-ink-2">
         {icon}
       </div>
-      <div className="text-body text-ink-3 whitespace-pre-line">
+      <div className="text-body text-ink-2 whitespace-pre-line">
         {children}
       </div>
     </div>
@@ -991,7 +1035,7 @@ export function EmptyState({
 
 /* ---------- Loading / ErrorText ---------- */
 export function Loading({ children }: { children: ReactNode }) {
-  return <div className="p-8 text-body text-ink-3">{children}</div>;
+  return <div className="p-8 text-body text-ink-2">{children}</div>;
 }
 
 export function ErrorText({ children }: { children: ReactNode }) {
@@ -1032,7 +1076,7 @@ export function PageHeader({
     <div className={cn(className ?? "mb-6", "flex items-center justify-between gap-4")}>
       <div className="min-w-0">
         <h1 className="u-title text-display break-words">{title}</h1>
-        {sub && <p className="mt-1 text-body text-ink-3">{sub}</p>}
+        {sub && <p className="mt-1 text-body text-ink-2">{sub}</p>}
       </div>
       {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
     </div>
@@ -1110,8 +1154,8 @@ export function rowClass(
           : "text-ink-2 hover:bg-surface-2 hover:text-ink",
   );
 }
-/** 行右端小字：静止时最淡，整行被指着时提亮一级 */
-export const ROW_TRAILING = "ml-auto shrink-0 text-fine text-ink-3 group-hover:text-ink-2";
+/** 行右端小字：小一档、淡一档，整行被指着时跟着提亮 */
+export const ROW_TRAILING = "ml-auto shrink-0 text-fine text-ink-2 group-hover:text-ink";
 
 export function Row({
   active,
@@ -1120,6 +1164,7 @@ export function Row({
   density = "list",
   indent = 0,
   icon,
+  flush,
   trailing,
   className,
   children,
@@ -1135,6 +1180,8 @@ export function Row({
   /** 树形缩进的层级 */
   indent?: number;
   icon?: ReactNode;
+  /** 收掉图标那一格：整组行都没有图标时，那一格没有对齐对象，只是把标题往右推 */
+  flush?: boolean;
   /** 右端的东西：计数、类型小字 */
   trailing?: ReactNode;
 }) {
@@ -1147,10 +1194,10 @@ export function Row({
       {...props}
     >
       {/* 图标跟文字同色：选中变白、警示变橙都一起来。导航项没图标也留出
-          图标那一格，一列里有图标的和没图标的文字对齐 */}
+          图标那一格，一列里有图标的和没图标的文字对齐——除非整组都没有（flush） */}
       {icon ? (
         <span className="shrink-0">{icon}</span>
-      ) : density === "nav" ? (
+      ) : density === "nav" && !flush ? (
         <span className="w-3.5 shrink-0" aria-hidden />
       ) : null}
       <span className="min-w-0 flex-1 truncate">{children}</span>
@@ -1280,7 +1327,7 @@ export function Checkbox({
       <input type="checkbox" className="mt-1 accent-accent" {...props} />
       <span className="min-w-0">
         <span className="block text-body text-ink">{label}</span>
-        {hint && <span className="block text-fine text-ink-3">{hint}</span>}
+        {hint && <span className="block text-fine text-ink-2">{hint}</span>}
       </span>
     </label>
   );
@@ -1300,7 +1347,7 @@ export function Disclosure({
 }) {
   return (
     <details open={defaultOpen} className={className}>
-      <summary className="cursor-pointer select-none text-small text-ink-3 transition-colors duration-fast hover:text-ink-2">
+      <summary className="cursor-pointer select-none text-small text-ink-2 transition-colors duration-fast hover:text-ink">
         {summary}
       </summary>
       <div className="mt-2">{children}</div>
@@ -1465,7 +1512,7 @@ export function ExpandCard({
       >
         <ChevronRight
           size={12}
-          className={cn("mt-1 shrink-0 text-ink-3 u-turn", open && "rotate-90")}
+          className={cn("mt-1 shrink-0 text-ink-2 u-turn", open && "rotate-90")}
         />
         <div className="min-w-0 flex-1">{header}</div>
       </button>

@@ -928,7 +928,7 @@ export function OntologySchemaGraph({
           ).map(([label, color]) => (
             <span
               key={label}
-              className="glass rounded-lg px-3 py-1 text-fine flex items-center gap-2 text-ink-2"
+              className="glass rounded-cell px-3 py-1 text-fine flex items-center gap-2 text-ink-2"
             >
               <span className="h-0.5 w-3 rounded-full" style={{ background: color }} />
               {label}
@@ -945,7 +945,7 @@ export function OntologySchemaGraph({
                   : S.ontology.schemaScopeInUseHint
               }
             >
-              <span className="glass rounded-lg px-3 py-1 text-fine flex items-center text-ink-2">
+              <span className="glass rounded-cell px-3 py-1 text-fine flex items-center text-ink-2">
                 {S.ontology.schemaMoreClasses(scope.hidden)}
               </span>
             </Tooltip>
@@ -966,13 +966,13 @@ export function OntologySchemaGraph({
               {unscopedPop.open && (
                 <div
                   ref={unscopedPop.panelRef}
-                  className="u-menu-glass absolute left-0 top-0 z-50 w-64 overflow-hidden rounded-lg p-2 shadow-2xl"
+                  className="u-menu-glass absolute left-0 top-0 z-50 w-64 overflow-hidden rounded-overlay p-2 shadow-2xl"
                 >
                   <Pill className="mb-2 w-full" onClick={() => unscopedPop.close()}>
                     {S.ontology.schemaUnscoped(schema.unscoped.length)}
-                    <X size={11} className="ml-auto text-ink-3" />
+                    <X size={11} className="ml-auto text-ink-2" />
                   </Pill>
-                  <p className="px-2 pb-2 text-fine leading-relaxed text-ink-3">
+                  <p className="px-2 pb-2 text-fine leading-relaxed text-ink-2">
                     {S.ontology.schemaUnscopedHint}
                   </p>
                   <div className="flex max-h-64 flex-col overflow-y-auto">
@@ -1027,7 +1027,7 @@ export function OntologySchemaGraph({
 
       {empty && (
         <div className="absolute inset-0 grid place-items-center pointer-events-none">
-          <div className="text-center text-body text-ink-3 max-w-xs">
+          <div className="text-center text-body text-ink-2 max-w-xs">
             {S.ontology.schemaEmpty}
           </div>
         </div>

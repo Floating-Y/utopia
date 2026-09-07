@@ -73,11 +73,11 @@ function SourceGrants({ sourceId }: { sourceId: string }) {
   return (
     <div className="border-t border-line pt-3 space-y-2">
       <div className="flex items-baseline gap-2">
-        <span className="text-fine text-ink-3">
+        <span className="text-fine text-ink-2">
           {S.settings.datasources.grants}
         </span>
         {granted.length === 0 ? (
-          <span className="text-fine text-ink-3">
+          <span className="text-fine text-ink-2">
             {S.settings.datasources.grantsNone}
           </span>
         ) : (
@@ -113,7 +113,7 @@ function SourceGrants({ sourceId }: { sourceId: string }) {
           />
         </div>
       )}
-      {notice && <p className="text-fine text-ink-3">{notice}</p>}
+      {notice && <p className="text-fine text-ink-2">{notice}</p>}
     </div>
   );
 }
@@ -176,7 +176,7 @@ function DeploymentAdmin() {
             <span className="block text-body text-ink">
               {S.settings.deployment.ontologyLang}
             </span>
-            <span className="block text-small text-ink-3 mt-1">
+            <span className="block text-small text-ink-2 mt-1">
               {S.settings.deployment.ontologyLangHint}
             </span>
           </div>
@@ -198,7 +198,7 @@ function DeploymentAdmin() {
             <span className="block text-body text-ink">
               {S.settings.deployment.workers}
             </span>
-            <span className="block text-small text-ink-3 mt-1">
+            <span className="block text-small text-ink-2 mt-1">
               {S.settings.deployment.workersHint}
             </span>
           </div>
@@ -233,12 +233,12 @@ function DeploymentAdmin() {
               <span className="block text-body text-ink">
                 {S.settings.deployment.modelConcurrency}
               </span>
-              <span className="block text-small text-ink-3 mt-1">
+              <span className="block text-small text-ink-2 mt-1">
                 {S.settings.deployment.modelConcurrencyHint}
               </span>
             </div>
             <div className="flex items-center gap-2 shrink-0">
-              <span className="text-small text-ink-3">
+              <span className="text-small text-ink-2">
                 {S.settings.deployment.modelDefault}
               </span>
               <Input size="sm" className="u-input-plain w-16 u-num text-center"
@@ -283,7 +283,7 @@ function DeploymentAdmin() {
                     <span className="font-mono text-ink-2 truncate">
                       {m.model}
                     </span>
-                    <span className="text-ink-3 truncate hidden sm:inline">
+                    <span className="text-ink-2 truncate hidden sm:inline">
                       {m.base_url}
                     </span>
                     <Input size="sm" className="u-input-plain ml-auto w-14 u-num text-center shrink-0"
@@ -350,11 +350,12 @@ function DeploymentAdmin() {
 }
 
 /** 知识库管理（部署层）：全部库总览 + 新建（建库是管理动作，切换器只切换）。 */
-function KbsAdmin() {
+/** `autoCreate`：从库切换器最后一行过来的，落地就开建库表单 */
+function KbsAdmin({ autoCreate }: { autoCreate?: boolean }) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const { workspace, setKb } = useKb();
-  const [creating, setCreating] = useState(false);
+  const [creating, setCreating] = useState(!!autoCreate);
   const list = useQuery({
     queryKey: ["myKbs", workspace?.id],
     queryFn: () => api.myKbs(workspace!.id),
@@ -364,9 +365,9 @@ function KbsAdmin() {
 
   return (
     <div className="space-y-4">
-      <p className="text-small text-ink-3">{S.settings.kbs.hint}</p>
+      <p className="text-small text-ink-2">{S.settings.kbs.hint}</p>
 
-      <div className="glass rounded-lg divide-y divide-line">
+      <div className="glass rounded-panel divide-y divide-line">
         {rows.map(({ kb, doc_count, member_count }) => (
           <div key={kb.id} className="px-4 py-3 flex items-center gap-3">
             <div className="min-w-0 flex-1">
@@ -380,13 +381,13 @@ function KbsAdmin() {
                   </span>
                 )}
                 {kb.visibility === "restricted" && (
-                  <span className="flex items-center gap-1 text-fine text-ink-3">
+                  <span className="flex items-center gap-1 text-fine text-ink-2">
                     <Lock size={10} />
                     {S.settings.kbs.visRestricted}
                   </span>
                 )}
               </div>
-              <div className="mt-1 text-small text-ink-3">
+              <div className="mt-1 text-small text-ink-2">
                 <span className="u-num">
                   {S.account.kbStats(doc_count, member_count)}
                 </span>
@@ -403,7 +404,7 @@ function KbsAdmin() {
           </div>
         ))}
         {!list.isPending && rows.length === 0 && (
-          <p className="px-4 py-6 text-body text-ink-3">{S.settings.kbs.empty}</p>
+          <p className="px-4 py-6 text-body text-ink-2">{S.settings.kbs.empty}</p>
         )}
       </div>
 
@@ -520,7 +521,7 @@ function NewKbModal({
           <div className="text-small text-ink-2 mb-1">
             {S.settings.kbs.packsLabel}
           </div>
-          <p className="text-fine leading-relaxed text-ink-3 mb-2">
+          <p className="text-fine leading-relaxed text-ink-2 mb-2">
             {S.settings.kbs.packsHint}
           </p>
           <div className="grid grid-cols-2 gap-2">
@@ -536,10 +537,10 @@ function NewKbModal({
                   <span className="block text-small text-ink">
                     {p.name}
                   </span>
-                  <span className="block text-fine leading-snug text-ink-3">
+                  <span className="block text-fine leading-snug text-ink-2">
                     {p.summary}
                   </span>
-                  <span className="mt-1 block text-fine text-ink-3">
+                  <span className="mt-1 block text-fine text-ink-2">
                     {S.settings.kbs.packsCount(p.classes, p.properties)}
                   </span>
                 </ChoiceCard>
@@ -547,7 +548,7 @@ function NewKbModal({
             })}
           </div>
           {packs.length === 0 && (
-            <p className="text-fine text-ink-3 mt-2">
+            <p className="text-fine text-ink-2 mt-2">
               {S.settings.kbs.packsNone}
             </p>
           )}
@@ -597,20 +598,20 @@ function DataSourcesAdmin() {
 
   return (
     <div className="space-y-4">
-      <p className="text-small text-ink-3">{S.settings.datasources.hint}</p>
+      <p className="text-small text-ink-2">{S.settings.datasources.hint}</p>
 
-      <div className="glass rounded-lg divide-y divide-line">
+      <div className="glass rounded-panel divide-y divide-line">
         {(list.data?.data_sources ?? []).map((d) => (
           <div key={d.id} className="px-4 py-3 space-y-3">
             <div className="flex items-center gap-3">
               <div className="min-w-0 flex-1">
                 <div className="text-body text-ink">
                   {d.name}
-                  <span className="ml-2 text-fine text-ink-3">
+                  <span className="ml-2 text-fine text-ink-2">
                     {d.engine}
                   </span>
                 </div>
-                <div className="text-small text-ink-3 font-mono truncate">
+                <div className="text-small text-ink-2 font-mono truncate">
                   {d.summary}
                 </div>
               </div>
@@ -648,13 +649,13 @@ function DataSourcesAdmin() {
           </div>
         ))}
         {list.data?.data_sources.length === 0 && (
-          <p className="px-4 py-6 text-body text-ink-3">
+          <p className="px-4 py-6 text-body text-ink-2">
             {S.settings.datasources.empty}
           </p>
         )}
       </div>
 
-      <div className="glass rounded-lg p-4">
+      <div className="glass rounded-panel p-4">
         <div className="max-w-xl space-y-2">
           <Input className="w-full"
             placeholder={S.settings.datasources.name}
@@ -666,7 +667,7 @@ function DataSourcesAdmin() {
             value={conn}
             onChange={(e) => setConn(e.target.value)}
           />
-          <p className="text-fine leading-5 text-ink-3 font-mono whitespace-pre-line">
+          <p className="text-fine leading-5 text-ink-2 font-mono whitespace-pre-line">
             {S.settings.datasources.connSchemes}
           </p>
           <div className="flex items-center gap-3">
@@ -726,7 +727,7 @@ const PRESETS: Record<
 
 export function Settings() {
   const { workspace } = useKb();
-  const { tab: tabParam } = useSearch({ from: "/account/admin" });
+  const { tab: tabParam, create } = useSearch({ from: "/account/admin" });
   const [tab, setTab] = useState<
     "models" | "members" | "kbs" | "datasources" | "deployment"
   >(tabParam ?? "models");
@@ -769,7 +770,7 @@ export function Settings() {
   });
 
   if (!workspace)
-    return <div className="p-8 text-body text-ink-3">{S.nav.loading}</div>;
+    return <div className="p-8 text-body text-ink-2">{S.nav.loading}</div>;
 
   const set =
     (k: keyof typeof form) => (e: React.ChangeEvent<HTMLInputElement>) =>
@@ -798,7 +799,7 @@ export function Settings() {
         />
 
         {tab === "members" && <Members workspaceId={workspace.id} />}
-        {tab === "kbs" && <KbsAdmin />}
+        {tab === "kbs" && <KbsAdmin autoCreate={!!create} />}
         {tab === "datasources" && <DataSourcesAdmin />}
         {tab === "deployment" && <DeploymentAdmin />}
 
@@ -827,7 +828,7 @@ export function Settings() {
               ))}
             </div>
 
-            <div className="glass rounded-lg p-6">
+            <div className="glass rounded-panel p-6">
               <div className="max-w-xl space-y-4">
                 <h3 className="text-body font-semibold text-ink">
                   {S.settings.chatModel}

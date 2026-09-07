@@ -18,13 +18,15 @@ No `text-xs`/`text-sm`, no `text-[11px]`. If a size between two steps seems nece
 
 `1 2 3 4 6 8` (4, 8, 12, 16, 24, 32 px), for padding, margin and gap alike. No half steps, no pixels. Values of `12` and above are layout, not rhythm — clearance under a floating bar, a footer's breathing room — and are allowed for that. Controls carry their own padding — a page never sets padding on a button or an input. Page gutters are `6` or `8`; the gap between two related controls is `2`; between two groups, `4`; between two sections, `6`.
 
-## 3. One radius
+## 3. Four radii, named by role
 
-`rounded-lg` (8 px) on everything that has corners — a button, an input, a panel, a popover, a dialog, a card, a chip, a pill. `rounded-full` only on things that are circles: an avatar, a status dot, a colour swatch, a graph node. Nothing else — no 12 px surfaces, no pill-shaped rectangles.
+A corner is `rounded-cell` (4 px), `rounded-control` (6 px), `rounded-panel` (8 px) or `rounded-overlay` (12 px), and which one it is follows from what the thing is: a chip, a table cell, a `kbd`, a small icon target is a cell; a button, an input, a select, a segmented group is a control; a card, a list, a dialog body, a code block is a panel; a menu, a popover, a toast, a floating dock — anything that hovers over the page — is an overlay. `rounded-full` only on things that are actually circles: an avatar, a status dot, a colour swatch, a graph node.
+
+The names are the point. `rounded-panel` says what the box is, the way `text-ink-2` says what the grey is for, and that is what the guard can check — a number cannot be wrong, only a role can. Four rather than one because the same absolute radius is not the same roundness at every size: 8 px reads as generously rounded on a 24 px chip and as nearly square on a 300 px panel. Nested corners go inwards, never outwards: a control (6) inside a panel (8), a panel inside an overlay (12).
 
 ## 4. Colour is a token, never a value
 
-Text is `text-ink`, `text-ink-2`, `text-ink-3` — three levels, primary to faint. Lines are `border-line` and `border-line-strong`. Fills are `bg-surface` (rest), `bg-surface-2` (hover), `bg-surface-3` (selected). Meaning is `ok`, `warn`, `danger`, `contest`, `violet`, and those five appear only where they mean something — a status, a contested edge, a destructive action — never as decoration. `neutral-500`, `white/10`, `rose-400`, `[var(--u-…)]` do not appear in a page; the tokens are defined once in `styles.css` and exposed as Tailwind colours, and that is the only door.
+Text is `text-ink` or `text-ink-2` — two levels: the content, and what is said about the content. There is no third, fainter level; a caption, a timestamp or a placeholder is already marked as secondary by where it sits and how big it is, and dimming it again only makes it harder to read. Lines are `border-line` and `border-line-strong`. Fills are `bg-surface` (rest), `bg-surface-2` (hover), `bg-surface-3` (selected). Meaning is `ok`, `warn`, `danger`, `contest`, `violet`, and those five appear only where they mean something — a status, a contested edge, a destructive action — never as decoration. `neutral-500`, `white/10`, `rose-400`, `[var(--u-…)]` do not appear in a page; the tokens are defined once in `styles.css` and exposed as Tailwind colours, and that is the only door.
 
 Glass is a surface treatment, not a colour: `glass` for a panel in peripheral vision, `glass-strong` for one being read, and both go solid under the pointer (see the note above `--u-surface-strong-hover`). A page does not write `backdrop-blur`.
 
@@ -43,6 +45,8 @@ A panel holds **several things of the same kind** — the rows of a table, the i
 A list is **one panel with rows**, not one card per item. Cards per item put seven or eight boxes on a page at the same level, and each card ends up being both the panel and the clickable thing — which is how a slot acquires a hover state it has no business having. With rows, hover belongs to the row (`hover:bg-surface-2`, already the pattern in `ui/table.tsx`) and the panel never responds to the pointer.
 
 Controls that operate on a panel's contents — filter, search, sort, pagination — sit **outside** it, in the page header or above it. They are not content, and when a filter empties the list the panel has to become an empty state without taking the only way to change the filter with it.
+
+The other thing a panel may be is **the reach of one action**: a settings card (`SettingsCard`) whose footer holds the Save that applies to exactly what the border encloses, and nothing else. The border earns its keep by answering "what does this button send?" — so a page of them is a page of small independent saves, not one long form with a single button at the bottom that quietly ships every field on the screen. A page with only one such card does not need it; the page is already the boundary.
 
 Settings and other read-a-column-of-fields pages are centred and width-limited (`mx-auto max-w-3xl`), not stretched to the window.
 
