@@ -1,7 +1,7 @@
 /* 账户层壳：Profile / Administration 的宿主。
    与 KB 无关，所以没有 KB 切换器、没有 tab 导航——只有字标、返回、用户菜单。 */
 import { useQuery } from "@tanstack/react-query";
-import { Link, Outlet, useNavigate } from "@tanstack/react-router";
+import { Link, Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import { usePageTitle } from "../useTitle";
 import {
   KeyRound,
@@ -18,9 +18,13 @@ import {
 } from "../ui";
 import { ServerDown } from "./ServerDown";
 import { HeaderActions } from "./HeaderActions";
+import { ADMIN_TABS } from "./Settings";
 
 export function AccountShell() {
   const navigate = useNavigate();
+  const loc = useLocation();
+  const onAdmin = loc.pathname === "/admin";
+  const adminTab = (loc.search as { tab?: string }).tab ?? "models";
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const health = useQuery({ queryKey: ["health"], queryFn: api.health, staleTime: Infinity });
   // 标题：`Utopia | Persona`——账户区整体一个名字，不逐页细分
@@ -28,7 +32,7 @@ export function AccountShell() {
 
   if (me.isPending) {
     return (
-      <div className="min-h-screen flex items-center justify-center text-ink-3 text-body">
+      <div className="min-h-screen flex items-center justify-center text-ink-2 text-body">
         {S.nav.loading}
       </div>
     );
@@ -59,7 +63,7 @@ export function AccountShell() {
 
       <div className="flex-1 min-h-0 flex">
         {/* 账户导航栏（仅两项，管理员多一项） */}
-        <aside className={`${RAIL_CLS} u-rail-list p-3`}>
+        <aside className={`${RAIL_CLS} u-rail-list px-2 py-3`}>
           {/* exact：/account 是 /account/kbs 的前缀，默认前缀匹配会双亮 */}
           <Link
             to="/account"
@@ -79,10 +83,29 @@ export function AccountShell() {
             {S.account.tokensNav}
           </Link>
           {me.data.is_admin && (
-            <Link to="/admin" className={rail} activeProps={{ className: railActive }}>
-              <ShieldCheck size={14} />
-              {S.account.administration}
-            </Link>
+            <>
+              {/* 在管理页时父行不再反白：下面已经有一条亮着，两条一起亮反而
+                  说不清人在哪儿 */}
+              <Link
+                to="/admin"
+                className={rail}
+                activeProps={onAdmin ? {} : { className: railActive }}
+              >
+                <ShieldCheck size={14} />
+                {S.account.administration}
+              </Link>
+              {onAdmin &&
+                ADMIN_TABS.map(({ key, label }) => (
+                  <Link
+                    key={key}
+                    to="/admin"
+                    search={{ tab: key }}
+                    className={rowClass(adminTab === key, "nav", undefined, true)}
+                  >
+                    {label()}
+                  </Link>
+                ))}
+            </>
           )}
         </aside>
         <main className="flex-1 min-w-0 overflow-y-auto u-scroll">

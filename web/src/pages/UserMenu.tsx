@@ -9,6 +9,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
   Check,
+  ChevronDown,
   Languages,
   Layers,
   LogOut,
@@ -74,7 +75,7 @@ export function UserMenu({ user }: { user: User }) {
       {open && (
         <div
           ref={panelRef}
-          className="u-menu-glass absolute right-0 top-0 w-64 rounded-lg shadow-2xl z-50 overflow-hidden"
+          className="u-menu-glass absolute right-0 top-0 w-64 rounded-overlay shadow-2xl z-50 overflow-hidden"
         >
           {/* 身份头：再点一下缩回胶囊 */}
           <div
@@ -93,10 +94,13 @@ export function UserMenu({ user }: { user: User }) {
                   </span>
                 )}
               </div>
-              <div className="truncate text-fine text-ink-3">
+              <div className="truncate text-fine text-ink-2">
                 {user.email}
               </div>
             </div>
+            {/* 朝上的三角：说明这一行是收回去的地方，同库切换器与告警面板。
+                三个面板都从各自的胶囊原地长出来，也都从第一行原地缩回去 */}
+            <ChevronDown size={12} className="shrink-0 rotate-180 text-ink-2" />
           </div>
 
           <div>
@@ -134,8 +138,8 @@ export function UserMenu({ user }: { user: User }) {
           {/* 界面语言：看的人自己定，不经过后端（docs/decisions/0004）。
               每个选项用**它自己的语言**写——看不懂英文的人才认得出"中文" */}
           <div className="border-t border-line">
-            <div className="flex items-center gap-3 px-4 pt-3 pb-1 text-fine text-ink-3">
-              <Languages size={13} className="text-ink-3" />
+            <div className="flex items-center gap-3 px-4 pt-3 pb-1 text-fine text-ink-2">
+              <Languages size={13} className="text-ink-2" />
               {S.account.language}
             </div>
             {LANGS.map((l) => (
