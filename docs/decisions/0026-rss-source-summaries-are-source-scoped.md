@@ -8,17 +8,21 @@
 
 ## What the source list does today
 
-`sources::list` wraps the complete `ENTRY_SELECT` projection in one global CTE and then runs a separate correlated count over that projection for every RSS summary field. `ENTRY_SELECT` is also the canonical place where observation and job state becomes `pending`, `queued`, `hydrating`, `retry_wait`, `complete`, `terminal`, `deleted` or `superseded`.
+`sources::list` wraps the complete `ENTRY_SELECT` projection in one global CTE and then runs six correlated counts over that projection for every source. `ENTRY_SELECT` is also the canonical place where observation and job state becomes `pending`, `queued`, `hydrating`, `retry_wait`, `complete`, `terminal`, `deleted` or `superseded`.
 
-The result is correct in its state classification, but the global CTE makes every Library load a candidate to project all RSS observations in the deployment before the source-specific counts are applied. The projection also exposes implementation state — `generation` and `baseline_count` — as part of the public source-list response.
+The CTE is referenced six times. PostgreSQL 12 and later inline a non-recursive, side-effect-free CTE by default only when it is referenced once; this CTE is therefore materialized. Because `ENTRY_SELECT` has no `WHERE`, materialization evaluates its three joins, deletion `EXISTS` and nine-branch state `CASE` for every RSS observation in every knowledge base and generation. The materialized result has no index, so each correlated count scans it in full for each source. The resulting shape is `O(sources × all entries × 6)` rather than `O(sources × own entries)`.
+
+The projection also exposes implementation state — `generation` and `baseline_count` — as part of the public source-list response.
 
 ## Decisions
 
 ### 1. Aggregate only the source and generation being listed
 
-The source list will use a `LEFT JOIN LATERAL` aggregate per source. The aggregate is parameterized by the outer source's `id` and current `rss_generation`, and its filters are pushed into `rss_full_content_entries` through the existing source/generation index. The `s.kind = 'rss'` predicate appears both inside the lateral subquery and on the join. The inner predicate gives PostgreSQL a one-time false/filter opportunity for non-RSS rows; the join predicate preserves the fact that a non-RSS source has no RSS summary.
+The source list will use a `LEFT JOIN LATERAL` aggregate per source. The aggregate is parameterized by the outer source's `id` and current `rss_generation`, and its filters are pushed into `rss_full_content_entries` through the existing source/generation index. The `s.kind = 'rss'` predicate appears both inside the lateral subquery and on the join. The join predicate is what excludes non-RSS sources from the lateral result; the inner predicate is retained as a defensive guard. The required execution plan will show how PostgreSQL applies both predicates rather than relying on an assumed one-time short circuit.
 
-The aggregate counts `pending`, `queued`, `retrying`, `complete` and `terminal` from the canonical `ENTRY_SELECT` projection. It does not duplicate the projection's state `CASE` in `sources.rs`. `queued` remains the union of `queued` and `hydrating`; `terminal` remains the union of `terminal`, `deleted` and `superseded`. Only rows whose `activation_generation` equals the source's current `rss_generation` are counted.
+The aggregate obtains `pending`, `queued`, `retrying`, `complete` and `terminal` with five `count(*) FILTER` expressions in one pass over the source's own entries. It reuses the canonical `ENTRY_SELECT` projection and does not duplicate its state `CASE` in `sources.rs`. `queued` remains the union of `queued` and `hydrating`; `terminal` remains the union of `terminal`, `deleted` and `superseded`. Only rows whose `activation_generation` equals the source's current `rss_generation` are counted.
+
+`baseline` rows are intentionally excluded from all five counts. They represent pre-activation feed stock, not outstanding hydration work. A source containing only baseline observations therefore reports zero for all five work counts even though its observation ledger is not empty; the summary describes hydration work, not ledger cardinality. `baseline_count` remains available only to internal activation state where it is needed.
 
 The query continues to preserve source ordering, document and missing counts, credential removal, the `SOURCE_SECRET_KEYS` bind, and `config - $2::text[]`. Observation, job and document responsibilities remain unchanged, as does `rss_full_content::counts()` and the diagnostic list.
 
@@ -49,6 +53,10 @@ The TypeScript contract and Library consumer will use the nested object and firs
 
 This change adds no migration and no new Rust or npm dependency. It changes the read query, the API model, the TypeScript contract and their tests only. SQL values continue to use binds; any dynamic SQL is assembled only from repository-owned constants.
 
+### 4. Land the decisions independently
+
+The query optimization and public contract will be implemented in two PRs against this record. The first PR changes only the store query and preserves the existing flat API fields, making the performance change independently measurable and revertible. The second PR replaces those fields with the nested Rust and TypeScript contract and updates the Library consumer. A problem in either change can then be reverted without taking back the other.
+
 ## Alternatives rejected
 
 - **Keep the global CTE.** It is simple to reuse, but its work grows with the entire deployment rather than with the source being listed. A larger observation table makes every Library load more expensive.
@@ -56,9 +64,9 @@ This change adds no migration and no new Rust or npm dependency. It changes the 
 - **Fetch every entry and count in Rust.** It transfers and retains data that the endpoint only needs as five numbers, making network and memory costs unacceptable.
 - **Add a cache table for the summary.** A cache introduces consistency and invalidation problems. The current read path is sufficient once its scope is source- and generation-bound.
 
-## Performance evidence required by the implementation
+## Performance evidence required by the query implementation
 
-The implementation PR will include before/after `EXPLAIN (ANALYZE, BUFFERS, VERBOSE)` results from a dedicated PostgreSQL database with one knowledge base, at least one full-content RSS source, several thousand current-generation observations, and observations for other sources or knowledge bases. The comparison will record actual entry scan rows, use of the `source_id`/`activation_generation` index, lateral loops, shared buffer hits/reads, execution time, and whether non-RSS sources take a one-time false/filter path without scanning entries. Temporary SQL, plans and generated data will stay out of the repository.
+The query implementation PR will include before/after `EXPLAIN (ANALYZE, BUFFERS, VERBOSE)` results from a dedicated PostgreSQL database with one knowledge base, at least one full-content RSS source, several thousand current-generation observations, and observations for other sources or knowledge bases. The comparison will record actual entry scan rows, use of the `source_id`/`activation_generation` index, lateral loops, shared buffer hits/reads, execution time, and whether non-RSS sources avoid scanning entries. Temporary SQL, plans and generated data will stay out of the repository.
 
 ## Open questions
 
