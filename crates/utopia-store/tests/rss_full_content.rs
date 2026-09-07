@@ -296,6 +296,243 @@ async fn seed_source(pool: &PgPool) -> anyhow::Result<(Uuid, Uuid, Uuid, Uuid)> 
     Ok((org_id, kb_id, source_id, workspace_id))
 }
 
+async fn insert_source(
+    pool: &PgPool,
+    kb_id: Uuid,
+    kind: &str,
+    name: &str,
+    config: serde_json::Value,
+) -> anyhow::Result<Uuid> {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO sources (id, kb_id, kind, name, config)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind(kb_id)
+    .bind(kind)
+    .bind(name)
+    .bind(config)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+async fn job_id_for(pool: &PgPool, source_id: Uuid, external_key: &str) -> anyhow::Result<i64> {
+    let job_id: Option<i64> = sqlx::query_scalar(
+        "SELECT e.current_job_id
+         FROM rss_full_content_entries e
+         WHERE e.source_id = $1 AND e.external_key = $2",
+    )
+    .bind(source_id)
+    .bind(external_key)
+    .fetch_one(pool)
+    .await?;
+    job_id.ok_or_else(|| anyhow::anyhow!("expected a hydration job for {external_key}"))
+}
+
+#[tokio::test]
+async fn source_list_exposes_scoped_rss_summary() -> anyhow::Result<()> {
+    let Some(url) = utopia_store::test_db::url() else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&url).await?;
+    let (org_id, kb_id, source_id, _) = seed_source(&pool).await?;
+    let folder_id =
+        insert_source(&pool, kb_id, "folder", "folder-test", serde_json::json!({})).await?;
+    let url_id = insert_source(
+        &pool,
+        kb_id,
+        "url",
+        "url-test",
+        serde_json::json!({"urls":["https://example.com"]}),
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE sources
+         SET created_at = CASE id
+             WHEN $1 THEN '2020-01-01T00:00:00Z'::timestamptz
+             WHEN $2 THEN '2020-01-02T00:00:00Z'::timestamptz
+             WHEN $3 THEN '2020-01-03T00:00:00Z'::timestamptz
+         END
+         WHERE id IN ($1, $2, $3)",
+    )
+    .bind(source_id)
+    .bind(folder_id)
+    .bind(url_id)
+    .execute(&pool)
+    .await?;
+
+    let mut tx = pool.begin().await?;
+    utopia_store::rss_full_content::initialize_source(&mut tx, source_id).await?;
+    tx.commit().await?;
+
+    let listed = utopia_store::sources::list(&pool, kb_id).await?;
+    assert_eq!(
+        listed
+            .iter()
+            .map(|source| source.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["rss-full-content-test", "folder-test", "url-test"]
+    );
+    for (id, kind) in [(folder_id, "folder"), (url_id, "url")] {
+        let source = listed
+            .iter()
+            .find(|source| source.id == id)
+            .ok_or_else(|| anyhow::anyhow!("{kind} source is missing"))?;
+        assert!(source.rss_full_content_state.is_none());
+        assert!(source.rss_full_content_generation.is_none());
+        assert_eq!(source.rss_full_content_baseline_count, Some(0));
+        assert_eq!(source.rss_full_content_pending_count, 0);
+        assert_eq!(source.rss_full_content_queued_count, 0);
+        assert_eq!(source.rss_full_content_retrying_count, 0);
+        assert_eq!(source.rss_full_content_complete_count, 0);
+        assert_eq!(source.rss_full_content_terminal_count, 0);
+    }
+    let rss = listed
+        .iter()
+        .find(|source| source.id == source_id)
+        .ok_or_else(|| anyhow::anyhow!("RSS source is missing"))?;
+    assert_eq!(rss.rss_full_content_state.as_deref(), Some("pending"));
+    assert_eq!(
+        (
+            rss.rss_full_content_pending_count,
+            rss.rss_full_content_queued_count,
+            rss.rss_full_content_retrying_count,
+            rss.rss_full_content_complete_count,
+            rss.rss_full_content_terminal_count
+        ),
+        (0, 0, 0, 0, 0)
+    );
+
+    utopia_store::rss_full_content::record_baseline(&pool, source_id, 1, &[]).await?;
+    let entries = vec![
+        entry("queued"),
+        entry("hydrating"),
+        entry("retrying"),
+        entry("complete"),
+        entry("superseded"),
+        entry("deleted"),
+        {
+            let mut value = entry("terminal");
+            value.has_usable_source = false;
+            value
+        },
+    ];
+    utopia_store::rss_full_content::discover(&pool, source_id, 1, &entries).await?;
+    assert_eq!(
+        utopia_store::rss_full_content::claim_pending_and_enqueue(&pool, source_id, 1, 6, 5)
+            .await?,
+        6
+    );
+    utopia_store::rss_full_content::discover(&pool, source_id, 1, &[entry("pending")]).await?;
+    let hydrating_job = job_id_for(&pool, source_id, "hydrating").await?;
+    sqlx::query("UPDATE jobs SET status = 'running' WHERE id = $1")
+        .bind(hydrating_job)
+        .execute(&pool)
+        .await?;
+    let retrying_job = job_id_for(&pool, source_id, "retrying").await?;
+    sqlx::query("UPDATE jobs SET status = 'queued', attempts = 1 WHERE id = $1")
+        .bind(retrying_job)
+        .execute(&pool)
+        .await?;
+    let superseded_job = job_id_for(&pool, source_id, "superseded").await?;
+    sqlx::query("UPDATE jobs SET status = 'done' WHERE id = $1")
+        .bind(superseded_job)
+        .execute(&pool)
+        .await?;
+
+    utopia_store::documents::create_with_version_and_processing(
+        &pool,
+        kb_id,
+        "complete.md",
+        "text/markdown",
+        10,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        Some(source_id),
+        None,
+        Some("complete"),
+    )
+    .await?;
+    let deleted = utopia_store::documents::create_with_version_and_processing(
+        &pool,
+        kb_id,
+        "deleted.md",
+        "text/markdown",
+        10,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        Some(source_id),
+        None,
+        Some("deleted"),
+    )
+    .await?;
+    utopia_store::documents::delete(&pool, kb_id, deleted.id, None).await?;
+    utopia_store::documents::purge(&pool, kb_id, deleted.id).await?;
+
+    let listed = utopia_store::sources::list(&pool, kb_id).await?;
+    let rss = listed
+        .iter()
+        .find(|source| source.id == source_id)
+        .ok_or_else(|| anyhow::anyhow!("RSS source is missing after discovery"))?;
+    assert_eq!(rss.rss_full_content_state.as_deref(), Some("active"));
+    assert_eq!(rss.rss_full_content_pending_count, 1);
+    assert_eq!(
+        rss.rss_full_content_queued_count, 2,
+        "queued and hydrating share one bucket"
+    );
+    assert_eq!(rss.rss_full_content_retrying_count, 1);
+    assert_eq!(rss.rss_full_content_complete_count, 1);
+    assert_eq!(
+        rss.rss_full_content_terminal_count, 3,
+        "terminal, deleted and superseded share one bucket"
+    );
+    assert_eq!(
+        rss.doc_count, 1,
+        "purged documents stay out of the live count"
+    );
+    assert_eq!(rss.missing_count, 0);
+
+    let mut tx = pool.begin().await?;
+    utopia_store::rss_full_content::enable_source(&mut tx, source_id).await?;
+    tx.commit().await?;
+    utopia_store::rss_full_content::record_baseline(&pool, source_id, 2, &[]).await?;
+    utopia_store::rss_full_content::discover(&pool, source_id, 2, &[entry("new-generation")])
+        .await?;
+    let listed = utopia_store::sources::list(&pool, kb_id).await?;
+    let rss = listed
+        .iter()
+        .find(|source| source.id == source_id)
+        .ok_or_else(|| anyhow::anyhow!("RSS source is missing after generation change"))?;
+    assert_eq!(rss.rss_full_content_state.as_deref(), Some("active"));
+    assert_eq!(
+        rss.rss_full_content_pending_count, 1,
+        "old-generation observations are excluded"
+    );
+    assert_eq!(rss.rss_full_content_terminal_count, 0);
+
+    sqlx::query(
+        "UPDATE sources
+         SET config = jsonb_set(config, '{content_mode}', '\"feed\"')
+         WHERE id = $1",
+    )
+    .bind(source_id)
+    .execute(&pool)
+    .await?;
+    let listed = utopia_store::sources::list(&pool, kb_id).await?;
+    let rss = listed
+        .iter()
+        .find(|source| source.id == source_id)
+        .ok_or_else(|| anyhow::anyhow!("RSS source is missing after disabling"))?;
+    assert_eq!(rss.rss_full_content_state.as_deref(), Some("disabled"));
+    assert_eq!(
+        rss.rss_full_content_terminal_count, 1,
+        "disabled current rows are superseded"
+    );
+
+    cleanup(&pool, org_id).await?;
+    Ok(())
+}
+
 fn entry(key: impl Into<String>) -> utopia_store::rss_full_content::NewEntry {
     utopia_store::rss_full_content::NewEntry {
         external_key: key.into(),
