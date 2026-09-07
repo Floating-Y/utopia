@@ -1283,6 +1283,12 @@ export const api = {
   revokeToken: (tokenId: string) =>
     request<{ ok: boolean }>(`/api/v1/me/tokens/${tokenId}`, { method: "DELETE" }),
   workspaces: () => request<Workspace[]>("/api/v1/workspaces"),
+  /** 这个工作区，以及**我在里面是什么角色**。建库要 Admin+（见 api/kbs.rs
+   *  的 create），而 `GET /workspaces` 那份列表不带角色 */
+  workspaceRole: (workspaceId: string) =>
+    request<{ workspace: Workspace; role: string }>(
+      `/api/v1/workspaces/${workspaceId}`,
+    ),
 
   kbs: (workspaceId: string) =>
     request<Kb[]>(`/api/v1/workspaces/${workspaceId}/kbs`),
@@ -1431,6 +1437,13 @@ export const api = {
     request<{ ok: boolean }>(`/api/v1/admin/data-sources/${id}`, {
       method: "DELETE",
     }),
+  /** 存之前先试一次：**不落库**。回来的是 ok，连不上时还有一句原因——
+   *  密码错、库名拼错、端口不通是三件不同的事 */
+  adminTestConnString: (conn_string: string) =>
+    request<{ ok: boolean; engine?: string; error?: string }>(
+      "/api/v1/admin/data-sources/test",
+      { method: "POST", body: JSON.stringify({ conn_string }) },
+    ),
   adminTestDataSource: (id: string) =>
     request<{ ok: boolean }>(`/api/v1/admin/data-sources/${id}/test`, {
       method: "POST",

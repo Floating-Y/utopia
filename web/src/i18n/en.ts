@@ -113,6 +113,7 @@ export const en = {
     language: "Language",
     kbsNav: "Knowledge bases",
     kbsTitle: "Knowledge bases",
+    kbsFilter: "Filter by name…",
     kbOpen: "Open",
     kbRestricted: "Restricted",
     kbStats: (docs: number, members: number) =>
@@ -997,6 +998,27 @@ export const en = {
         "databricks://:TOKEN@host/sql/1.0/warehouses/ID?catalog=main\n" +
         "snowflake://:TOKEN@account.snowflakecomputing.com/DB/SCHEMA?warehouse=WH",
       add: "Add data source",
+      newTitle: "New data source",
+      engine: "Engine",
+      engineRaw: "Connection string",
+      optional: "(optional)",
+      testConn: "Test connection",
+      testing: "Testing…",
+      colConn: "Connection",
+      colStatus: "Status",
+      grantsNoneShort: "Not granted",
+      grantsCount: (n: number) => (n === 1 ? "1 workspace" : `${n} workspaces`),
+      fHost: "Host",
+      fPort: "Port",
+      fDatabase: "Database",
+      fUser: "User",
+      fPassword: "Password",
+      fCatalog: "Catalog",
+      fSchema: "Schema",
+      fToken: "Token",
+      fWarehouse: "Warehouse",
+      fWarehouseId: "Warehouse ID",
+      fAccount: "Account host",
       test: "Test",
       testOk: "Connected",
       testFail: "Failed",
@@ -1005,7 +1027,7 @@ export const en = {
       empty: "No data sources registered yet. Register one below.",
       grants: "Available to",
       grantsHint:
-        "Which workspaces may use this source. **Once granted, KB admins in those workspaces choose whether to mount it** — " +
+        "Which workspaces may use this source. Once granted, KB admins in those workspaces choose whether to mount it — " +
         "this controls what they can reach, not what they have mounted.",
       grantsNone:
         "Not granted to any workspace — no knowledge base can mount it.",
@@ -1024,8 +1046,8 @@ export const en = {
       defaultChip: "Default",
       newKb: "New knowledge base",
       packsLabel: "Bundled ontologies",
-      packsHint:
-        "Optional. Packs declare direction, so subject and object cannot come out reversed. More can be imported later.",
+      packsHint: "Optional, and more can be imported later.",
+      packsPick: "Search packs…",
       packsNone: "None — start from the ten seed relations",
       packsCount: (c: number, p: number) => `${c} classes · ${p} properties`,
       name: "Name",
@@ -1908,8 +1930,16 @@ export const en = {
     deactivatedHint:
       "They cannot sign in and do not appear in any member list. What they did is still attributed to them — that is why the account is kept rather than deleted.",
     reactivate: "Restore",
+    roleLabel: "Role",
+    filterAll: "All users",
+    filterAllRoles: "All roles",
+    statusLabel: "Status",
+    filterActive: "Active",
+    filterDeactivated: "Deactivated",
     deactivateConfirm: (name: string) =>
       `Deactivate ${name}? They lose access everywhere. Their past decisions stay on record.`,
+    addExisting: "Add existing user",
+    userLabel: "User",
     pickUser: "Select a user to add…",
     add: "Add",
     roles: {

@@ -102,6 +102,7 @@ export const zh: Strings = {
     language: "语言",
     kbsNav: "知识库",
     kbsTitle: "知识库",
+    kbsFilter: "按名字筛选…",
     kbOpen: "公开",
     kbRestricted: "受限",
     kbStats: (docs: number, members: number) =>
@@ -890,6 +891,27 @@ export const zh: Strings = {
         "databricks://:TOKEN@host/sql/1.0/warehouses/ID?catalog=main\n" +
         "snowflake://:TOKEN@account.snowflakecomputing.com/DB/SCHEMA?warehouse=WH",
       add: "添加数据源",
+      newTitle: "登记数据源",
+      engine: "引擎",
+      engineRaw: "连接串",
+      optional: "（可不填）",
+      testConn: "测试连接",
+      testing: "连接中…",
+      colConn: "连接",
+      colStatus: "状态",
+      grantsNoneShort: "未授权",
+      grantsCount: (n: number) => `${n} 个工作区`,
+      fHost: "主机",
+      fPort: "端口",
+      fDatabase: "库",
+      fUser: "用户",
+      fPassword: "密码",
+      fCatalog: "Catalog",
+      fSchema: "Schema",
+      fToken: "令牌",
+      fWarehouse: "Warehouse",
+      fWarehouseId: "Warehouse ID",
+      fAccount: "账号主机",
       test: "测试",
       testOk: "已连接",
       testFail: "失败",
@@ -898,7 +920,7 @@ export const zh: Strings = {
       empty: "还没有注册数据源。在下面注册一个。",
       grants: "可用于",
       grantsHint:
-        "授权哪些工作区可以用这个源。**授权之后，那些工作区的知识库管理员自己挑挂不挂**——" +
+        "授权哪些工作区可以用这个源。授权之后，那些工作区的知识库管理员自己挑挂不挂——" +
         "这里管的是「能不能拿到」，不是「挂没挂」。",
       grantsNone: "还没授权给任何工作区——现在没有知识库挂得上它。",
       grantAdd: "授权工作区…",
@@ -913,8 +935,8 @@ export const zh: Strings = {
       defaultChip: "默认",
       newKb: "新建知识库",
       packsLabel: "预置本体",
-      packsHint:
-        "可不选。包里的谓语带方向声明，主宾颠倒进不来。之后还能再导入。",
+      packsHint: "可不选，之后还能再导入。",
+      packsPick: "搜索本体包…",
       packsNone: "不选 —— 从十个种子关系起步",
       packsCount: (c: number, p: number) => `${c} 个类 · ${p} 个属性`,
       name: "名称",
@@ -1672,8 +1694,16 @@ export const zh: Strings = {
     deactivatedHint:
       "他们登不进来，也不出现在任何成员列表里。做过的事仍然算在他们名下——账号被保留而不是删除，正是为了这个。",
     reactivate: "恢复",
+    roleLabel: "角色",
+    filterAll: "全部用户",
+    filterAllRoles: "全部角色",
+    statusLabel: "状态",
+    filterActive: "在用",
+    filterDeactivated: "已停用",
     deactivateConfirm: (name: string) =>
       `停用 ${name}？他将无法再登录任何地方，但过往的决定仍然留痕。`,
+    addExisting: "添加已有用户",
+    userLabel: "用户",
     pickUser: "选择要添加的用户…",
     add: "添加",
     roles: {
