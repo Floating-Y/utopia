@@ -3,7 +3,7 @@
 // 与左栏是同一套口径（服务端共用 WHERE），页面上不再各自数一遍。
 import type { ReviewSummary } from "../api";
 import { S } from "../i18n";
-import { Chip, LinkButton } from "../ui";
+import { Chip, GroupLabel, LinkButton } from "../ui";
 
 /** 总览里能点进去的七档 */
 export type WaitingQueue = keyof ReviewSummary["waiting"];
@@ -25,11 +25,7 @@ function daysSince(iso: string): number {
 }
 
 function SectionHead({ children }: { children: string }) {
-  return (
-    <h3 className="mb-3 text-fine font-medium uppercase tracking-[0.08em] text-ink-3">
-      {children}
-    </h3>
-  );
+  return <GroupLabel className="mb-3">{children}</GroupLabel>;
 }
 
 /** 一格统计：大数在上，说明在下。卡片本身不是控件——想进那一档，点下面的
@@ -46,7 +42,7 @@ function Stat({
   action?: { label: string; onClick: () => void };
 }) {
   return (
-    <div className="glass flex flex-col gap-1 rounded-xl p-4">
+    <div className="glass flex flex-col gap-1 rounded-lg p-4">
       <div className="u-num text-display text-ink">{value}</div>
       <div className="text-body text-ink-2">{label}</div>
       {note && <div className="text-fine text-ink-3">{note}</div>}
@@ -111,7 +107,7 @@ export function ReviewOverview({
       <section>
         <SectionHead>{S.review.overviewWaiting}</SectionHead>
         {waitingTotal === 0 ? (
-          <div className="glass rounded-xl p-8 text-center text-body text-ink-3">
+          <div className="glass rounded-lg p-8 text-center text-body text-ink-3">
             {S.review.overviewAllClear}
           </div>
         ) : (
@@ -147,7 +143,7 @@ export function ReviewOverview({
             note={S.review.overviewAutomatic(decided.last_30d.automatic)}
           />
         </div>
-        <div className="glass mt-3 rounded-xl p-4">
+        <div className="glass mt-3 rounded-lg p-4">
           <div className="mb-3 text-fine text-ink-3">{S.review.overviewDaily}</div>
           <DailyBars days={decided.daily} />
         </div>
@@ -155,7 +151,7 @@ export function ReviewOverview({
           <p className="mt-3 text-small text-ink-3">{S.review.overviewNoDecisions}</p>
         ) : (
           <div className="mt-3 grid gap-3 md:grid-cols-2">
-            <div className="glass rounded-xl p-4">
+            <div className="glass rounded-lg p-4">
               <div className="mb-2 text-fine text-ink-3">{S.review.overviewByAction}</div>
               <div className="flex flex-wrap gap-2">
                 {decided.last_30d.by_action.map((a) => (
@@ -165,7 +161,7 @@ export function ReviewOverview({
                 ))}
               </div>
             </div>
-            <div className="glass rounded-xl p-4">
+            <div className="glass rounded-lg p-4">
               <div className="mb-2 text-fine text-ink-3">{S.review.overviewByActor}</div>
               <div className="space-y-1">
                 {decided.last_30d.by_actor.map((a) => (
@@ -195,6 +191,15 @@ export function ReviewOverview({
             <LinkButton onClick={onSettings}>{S.review.overviewAgentSettings}</LinkButton>
           </p>
         )}
+        {/* 此刻在跑：一颗脉动的点加还剩几对；没跑但有积压：几对等它 */}
+        {agent.running ? (
+          <p className="mb-3 flex items-center text-small text-ink-2">
+            <span className="mr-2 inline-block h-2 w-2 rounded-full bg-warn animate-pulse" />
+            {S.review.overviewAgentRunning(agent.queue)}
+          </p>
+        ) : governance && agent.queue > 0 ? (
+          <p className="mb-3 text-small text-ink-3">{S.review.overviewAgentQueue(agent.queue)}</p>
+        ) : null}
         {(governance || agent.open > 0 || agent.last_30d.applied > 0) && (
           <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
             <Stat

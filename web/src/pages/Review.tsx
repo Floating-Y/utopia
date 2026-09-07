@@ -37,6 +37,8 @@ import {
   RAIL_CLS,
   RailItem,
   Segmented,
+  GroupLabel,
+  PageHeader,
 } from "../ui";
 
 const DUP_PAGE = 6;
@@ -108,12 +110,15 @@ function typesDiffer(item: ReviewItem): boolean {
 function DuplicateCard({
   item,
   busy,
+  locked,
   picked,
   onPick,
   onDecide,
 }: {
   item: ReviewItem;
   busy: boolean;
+  /** agent 正在裁这一对（0025）：这几分钟里人不能动它，接口也会拒绝 */
+  locked: boolean;
   /** 批量选中（#428）：勾在卡片左上，选了就跟着上面的批量按钮走 */
   picked: boolean;
   onPick: (picked: boolean) => void;
@@ -122,12 +127,12 @@ function DuplicateCard({
   const reasonCode = item.reason?.split("|", 1)[0];
 
   return (
-    <div className={cn("glass rounded-xl p-4", picked && "u-picked")}>
+    <div className={cn("glass rounded-lg p-4", picked && "u-picked")}>
       <div className="flex gap-4">
         <Checkbox
           className="shrink-0 self-start"
           checked={picked}
-          disabled={busy}
+          disabled={busy || locked}
           onChange={(e) => onPick(e.target.checked)}
           label={<span className="sr-only">{S.review.pickPair}</span>}
         />
@@ -136,13 +141,20 @@ function DuplicateCard({
         <SideCard side={item.right} />
       </div>
       <div className="mt-3 pt-3 flex items-center gap-3 border-t border-line">
-        <span
-          className={`u-chip ${item.stage === "human" ? "u-chip-warn" : "u-chip-neutral"}`}
-        >
-          {item.stage === "human"
-            ? S.review.stageHuman
-            : S.review.stageAdjudicating}
-        </span>
+        {locked ? (
+          <span className="u-chip u-chip-info">
+            <span className="mr-2 inline-block h-2 w-2 rounded-full bg-warn animate-pulse" />
+            {S.review.agentDeciding}
+          </span>
+        ) : (
+          <span
+            className={`u-chip ${item.stage === "human" ? "u-chip-warn" : "u-chip-neutral"}`}
+          >
+            {item.stage === "human"
+              ? S.review.stageHuman
+              : S.review.stageAdjudicating}
+          </span>
+        )}
         {typesDiffer(item) && (
           <Chip tone="warn" title={S.review.typesDifferHint}>
             {S.review.typesDiffer(
@@ -172,13 +184,13 @@ function DuplicateCard({
         )}
         <div className="ml-auto flex gap-2 shrink-0">
           <Button variant="secondary" size="sm"
-            disabled={busy}
+            disabled={busy || locked}
             onClick={() => onDecide("keep")}
           >
             {S.review.keep}
           </Button>
           <Button variant="primary" size="sm"
-            disabled={busy}
+            disabled={busy || locked}
             onClick={() => onDecide("merge")}
           >
             {S.review.merge}
@@ -202,7 +214,7 @@ function FactRow({
 }) {
   const range = dateRange(fact.valid_from, fact.valid_to);
   return (
-    <div className="glass rounded-xl p-4">
+    <div className="glass rounded-lg p-4">
       <div className="flex items-center gap-2 flex-wrap">
         <span className="text-body font-medium text-ink">
           {fact.subject_name}
@@ -273,7 +285,7 @@ function ConflictRow({
   const closeAtIso = closeParsed?.iso;
 
   return (
-    <div className="glass rounded-xl p-4">
+    <div className="glass rounded-lg p-4">
       <div className="flex items-center gap-2 flex-wrap">
         <span className="text-body font-medium text-ink">{c.old_subject}</span>
         <span className="text-small text-ink-3">
@@ -355,7 +367,7 @@ function UnconfirmedRow({
   const range = dateRange(fact.valid_from, fact.valid_to);
 
   return (
-    <div className="glass rounded-xl p-4">
+    <div className="glass rounded-lg p-4">
       <div className="flex items-center gap-2 flex-wrap">
         <span className="text-body font-medium text-ink">
           {fact.subject_name}
@@ -422,7 +434,7 @@ function MergeRow({
   onRevert: () => void;
 }) {
   return (
-    <div className="glass rounded-xl px-4 py-3 flex items-center gap-3">
+    <div className="glass rounded-lg px-4 py-3 flex items-center gap-3">
       <div className="min-w-0 flex-1">
         <div className="text-body text-ink-2 truncate">
           <span className="text-ink-3">{merge.source_name}</span>
@@ -498,7 +510,7 @@ function AgentRow({
   const trace = d.trace ?? [];
   const hasDetail = precedents.length > 0 || trace.length > 0;
   return (
-    <div className="glass rounded-xl px-4 py-3">
+    <div className="glass rounded-lg px-4 py-3">
       <div className="flex items-center gap-3">
         <Chip tone={AGENT_ACTION_TONE[d.action]}>{S.review.agentActions[d.action]}</Chip>
         <span className="text-body text-ink-2 truncate min-w-0">
@@ -611,7 +623,7 @@ function DecisionRow({ e }: { e: ReviewHistoryEvent }) {
   else text = `${d.source} → ${d.target}`;
 
   return (
-    <div className="glass rounded-xl px-4 py-3 flex items-center gap-3">
+    <div className="glass rounded-lg px-4 py-3 flex items-center gap-3">
       <Chip tone={DECISION_TONE[e.action] ?? "neutral"}>
         {S.review.decisionActions[e.action] ?? e.action}
       </Chip>
@@ -666,7 +678,7 @@ function DefectRow({
   const unsatisfiable =
     d.kind === "disjoint_with_ancestor" || d.kind === "inherits_disjoint";
   return (
-    <div className="glass rounded-xl p-3">
+    <div className="glass rounded-lg p-3">
       <div className="flex items-baseline gap-2 flex-wrap">
         <span className="text-body text-danger">{what}</span>
         {d.subject_label && (
@@ -764,7 +776,7 @@ function ViolationRow({
             { id: v.right_fact, text: v.right_text },
           ];
   return (
-    <div className="glass rounded-xl p-3">
+    <div className="glass rounded-lg p-3">
       <div className="flex items-baseline gap-2 flex-wrap">
         <span className="text-body text-warn">{what}</span>
         {v.predicate && (
@@ -850,7 +862,7 @@ function ContradictionRow({
           ? S.review.hintUnsure
           : S.review.hintReadBoth;
   return (
-    <div className="glass rounded-xl p-3 border border-[color-mix(in_srgb,var(--u-contest)_35%,transparent)]">
+    <div className="glass rounded-lg p-3 border border-[color-mix(in_srgb,var(--u-contest)_35%,transparent)]">
       <div className="flex items-baseline gap-2 flex-wrap">
         <span className="text-body text-contest">{what}</span>
         {v.predicate && (
@@ -990,9 +1002,7 @@ const PAGE_SIZE: Record<Paged, number> = {
 function RailHeader({ label }: { label: string }) {
   return (
     // 文字从 20 起，与行里的图标同一条线（盒 12 + 行内 8）
-    <div className="mx-3 px-2 pt-4 pb-2 text-fine font-medium uppercase tracking-[0.08em] text-ink-3">
-      {label}
-    </div>
+    <GroupLabel className="mx-3 px-2 pt-4 pb-2">{label}</GroupLabel>
   );
 }
 
@@ -1214,6 +1224,10 @@ export function Review() {
   const asDefects = () => rows as OntologyDefect[];
   const asMerges = () => rows as MergeLog[];
   const asAgent = () => rows as AgentDecision[];
+  // agent 正在裁的一对（0025）：任务在跑、这一对标着 adjudicating。批量选页时跳过它们
+  const lockedByAgent = (item: ReviewItem) =>
+    !!c?.agent_running && item.stage === "adjudicating";
+  const selectable = () => asDuplicates().filter((d) => !lockedByAgent(d));
   const queueEmpty = QUEUE_ORDER.every((k) => counts[k] === 0);
 
   // 没带 ?queue= 进来就落在总览上——从前是「第一个非空队列」，那等于替人
@@ -1258,7 +1272,7 @@ export function Review() {
       <aside className={`${RAIL_CLS} flex flex-col overflow-y-auto u-scroll`}>
         {/* 总览在最上面，七档队列直接排在它下面，不另起标题——「队列」这个词
             说的是它们是什么，而人要的是它们有多少 */}
-        <div className="px-3 pt-3 space-y-1">
+        <div className="u-rail-list px-3 pt-3">
           <RailItem
             active={active === "overview"}
             icon={<LayoutDashboard size={14} />}
@@ -1267,7 +1281,7 @@ export function Review() {
             {S.review.railOverview}
           </RailItem>
         </div>
-        <div className="px-3 pt-2 space-y-1">
+        <div className="u-rail-list px-3 pt-1">
           <RailItem
             active={active === "pending"}
             count={counts.pending}
@@ -1321,13 +1335,14 @@ export function Review() {
           <RailItem
             active={active === "agent"}
             count={counts.agent}
+            dot={c?.agent_running ? "bg-warn animate-pulse" : undefined}
             onClick={() => select("agent")}
           >
             {S.review.railAgent}
           </RailItem>
         </div>
         <RailHeader label={S.review.tabHistory} />
-        <div className="px-3 space-y-1">
+        <div className="u-rail-list px-3">
           <RailItem
             active={active === "decisions"}
                         onClick={() => select("decisions")}
@@ -1365,7 +1380,7 @@ export function Review() {
 
       {/* 右侧：一次只显示选中的一类，单一分页 */}
       <div className="flex-1 min-w-0 overflow-y-auto u-scroll px-8 py-6">
-        <div className="max-w-4xl">
+        <div>
           {review.isPending && (
             <p className="text-body text-ink-3">{S.nav.loading}</p>
           )}
@@ -1377,13 +1392,7 @@ export function Review() {
 
           {review.data && (
             <section>
-              {/* 页级标题：与 Library/KB Settings 同级（text-title），不是卡片头 */}
-              <h2 className="u-title text-title mb-1">{SECTION[active].title}</h2>
-              {SECTION[active].hint && (
-                <p className="text-small text-ink-3 mb-3">
-                  {SECTION[active].hint}
-                </p>
-              )}
+              <PageHeader title={SECTION[active].title} sub={SECTION[active].hint} />
 
               {/* 空态：整个待办全清 vs 单类清空。**公理这一档除外**——它自己那句要
                   分清「查过、没矛盾」和「还没查过」，通用空态说不出这个差别 */}
@@ -1391,7 +1400,7 @@ export function Review() {
                 active !== "violations" &&
                 active !== "defects" &&
                 counts[active] === 0 && (
-                  <div className="glass rounded-xl p-8 text-center text-body text-ink-3">
+                  <div className="glass rounded-lg p-8 text-center text-body text-ink-3">
                     {queueEmpty ? S.review.empty : S.review.categoryEmpty}
                   </div>
                 )}
@@ -1444,13 +1453,13 @@ export function Review() {
                     <Checkbox
                       className="ml-auto"
                       checked={
-                        asDuplicates().length > 0 &&
-                        asDuplicates().every((d) => picked.has(d.id))
+                        selectable().length > 0 &&
+                        selectable().every((d) => picked.has(d.id))
                       }
                       onChange={(e) =>
                         setPicked(
                           e.target.checked
-                            ? new Set(asDuplicates().map((d) => d.id))
+                            ? new Set(selectable().map((d) => d.id))
                             : new Set(),
                         )
                       }
@@ -1485,7 +1494,7 @@ export function Review() {
                     )}
                   </div>
                   {asDuplicates().length === 0 && (
-                    <div className="glass rounded-xl p-8 text-center text-body text-ink-3">
+                    <div className="glass rounded-lg p-8 text-center text-body text-ink-3">
                       {S.review.typesEmpty}
                     </div>
                   )}
@@ -1493,6 +1502,7 @@ export function Review() {
                     <DuplicateCard
                       key={item.id}
                       item={item}
+                      locked={lockedByAgent(item)}
                       picked={picked.has(item.id)}
                       onPick={(on) =>
                         setPicked((prev) => {
@@ -1606,7 +1616,7 @@ export function Review() {
               {active === "defects" && (
                 <div className="space-y-3">
                   {counts.defects === 0 && (
-                    <div className="glass rounded-xl p-8 text-center text-body text-ink-3">
+                    <div className="glass rounded-lg p-8 text-center text-body text-ink-3">
                       {S.review.categoryEmpty}
                     </div>
                   )}
@@ -1658,7 +1668,7 @@ export function Review() {
                     )}
                   </div>
                   {counts.violations === 0 && !runCheck.data && (
-                    <div className="glass rounded-xl p-8 text-center text-body text-ink-3">
+                    <div className="glass rounded-lg p-8 text-center text-body text-ink-3">
                       {S.review.checkNeverRun}
                     </div>
                   )}
@@ -1667,7 +1677,7 @@ export function Review() {
                       key={v.id}
                       className={
                         v.id === search.item
-                          ? "rounded-xl ring-1 ring-contest"
+                          ? "rounded-lg ring-1 ring-contest"
                           : undefined
                       }
                     >
@@ -1690,7 +1700,7 @@ export function Review() {
 
               {active === "agent" &&
                 ((c?.agent_rows ?? 0) === 0 ? (
-                  <div className="glass rounded-xl p-8 text-center text-body text-ink-3">
+                  <div className="glass rounded-lg p-8 text-center text-body text-ink-3">
                     {S.review.agentEmpty}
                     {!kb?.governance && (
                       <>
@@ -1721,7 +1731,7 @@ export function Review() {
 
               {active === "merges" &&
                 (counts.merges === 0 ? (
-                  <div className="glass rounded-xl p-8 text-center text-body text-ink-3">
+                  <div className="glass rounded-lg p-8 text-center text-body text-ink-3">
                     {S.review.historyEmpty}
                   </div>
                 ) : (
@@ -1741,7 +1751,7 @@ export function Review() {
                 (history.isPending ? (
                   <p className="text-body text-ink-3">{S.nav.loading}</p>
                 ) : (history.data?.total ?? 0) === 0 ? (
-                  <div className="glass rounded-xl p-8 text-center text-body text-ink-3">
+                  <div className="glass rounded-lg p-8 text-center text-body text-ink-3">
                     {S.review.decisionsEmpty}
                   </div>
                 ) : (
