@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { createRequire } from "node:module";
+import { normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { createServer } from "vite";
@@ -29,9 +30,9 @@ const source = {
   config: { feed_url: 'https://example.com/feed.xml', content_mode: 'full_new_items' },
   last_sync_status: 'never', last_sync_at: null, last_sync_error: null,
   sync_interval_minutes: null, sync_cron: null, missing_count: 0,
-  rss_full_content_pending_count: 1, rss_full_content_queued_count: 2,
-  rss_full_content_retrying_count: 3, rss_full_content_complete_count: 4,
-  rss_full_content_terminal_count: 5,
+  rss_full_content: {
+    state: 'active', pending: 1, queued: 2, retrying: 3, complete: 4, terminal: 5,
+  },
 };
 createRoot(document.getElementById('bar')).render(
   React.createElement(SourceBar, { kbId: 'rss-form-test', source,
@@ -57,7 +58,7 @@ function fixturePlugin() {
       if (id === "\0rss-test-entry.js") return entry;
     },
     transform(code, id) {
-      if (id.split("?")[0] !== `${root}src/pages/Library.tsx`) return;
+      if (normalize(id.split("?")[0]) !== normalize(`${root}src/pages/Library.tsx`)) return;
       if (mutation) {
         const [before, after] = mutation === "wrong-default"
           ? ['useState<RssContentMode>("feed")', 'useState<RssContentMode>("full_new_items")']

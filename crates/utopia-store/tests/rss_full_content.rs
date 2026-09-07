@@ -162,7 +162,13 @@ async fn delayed_observation_cannot_cross_purge_and_diagnostics_hide_job_errors(
         .unwrap();
     assert_eq!(counts.terminal_count, 1);
     let sources = utopia_store::sources::list(&pool, kb).await?;
-    assert_eq!(sources[0].rss_full_content_terminal_count, 1);
+    assert_eq!(
+        sources[0]
+            .rss_full_content
+            .as_ref()
+            .map(|summary| summary.terminal),
+        Some(1)
+    );
     // A live document is the accepted-content authority even if an older job failed.
     utopia_store::documents::create_with_version_and_processing(
         &pool,
@@ -375,32 +381,34 @@ async fn source_list_exposes_scoped_rss_summary() -> anyhow::Result<()> {
             .collect::<Vec<_>>(),
         vec!["rss-full-content-test", "folder-test", "url-test"]
     );
-    for (id, kind) in [(folder_id, "folder"), (url_id, "url")] {
-        let source = listed
-            .iter()
-            .find(|source| source.id == id)
-            .ok_or_else(|| anyhow::anyhow!("{kind} source is missing"))?;
-        assert!(source.rss_full_content_state.is_none());
-        assert!(source.rss_full_content_generation.is_none());
-        assert_eq!(source.rss_full_content_baseline_count, Some(0));
-        assert_eq!(source.rss_full_content_pending_count, 0);
-        assert_eq!(source.rss_full_content_queued_count, 0);
-        assert_eq!(source.rss_full_content_retrying_count, 0);
-        assert_eq!(source.rss_full_content_complete_count, 0);
-        assert_eq!(source.rss_full_content_terminal_count, 0);
-    }
+    assert!(listed
+        .iter()
+        .find(|source| source.id == folder_id)
+        .ok_or_else(|| anyhow::anyhow!("folder source is missing"))?
+        .rss_full_content
+        .is_none());
+    assert!(listed
+        .iter()
+        .find(|source| source.id == url_id)
+        .ok_or_else(|| anyhow::anyhow!("url source is missing"))?
+        .rss_full_content
+        .is_none());
     let rss = listed
         .iter()
         .find(|source| source.id == source_id)
         .ok_or_else(|| anyhow::anyhow!("RSS source is missing"))?;
-    assert_eq!(rss.rss_full_content_state.as_deref(), Some("pending"));
+    let summary = rss
+        .rss_full_content
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("RSS source has no summary"))?;
+    assert_eq!(summary.state, "pending");
     assert_eq!(
         (
-            rss.rss_full_content_pending_count,
-            rss.rss_full_content_queued_count,
-            rss.rss_full_content_retrying_count,
-            rss.rss_full_content_complete_count,
-            rss.rss_full_content_terminal_count
+            summary.pending,
+            summary.queued,
+            summary.retrying,
+            summary.complete,
+            summary.terminal
         ),
         (0, 0, 0, 0, 0)
     );
@@ -474,16 +482,17 @@ async fn source_list_exposes_scoped_rss_summary() -> anyhow::Result<()> {
         .iter()
         .find(|source| source.id == source_id)
         .ok_or_else(|| anyhow::anyhow!("RSS source is missing after discovery"))?;
-    assert_eq!(rss.rss_full_content_state.as_deref(), Some("active"));
-    assert_eq!(rss.rss_full_content_pending_count, 1);
+    let summary = rss
+        .rss_full_content
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("RSS summary disappeared after discovery"))?;
+    assert_eq!(summary.state, "active");
+    assert_eq!(summary.pending, 1);
+    assert_eq!(summary.queued, 2, "queued and hydrating share one bucket");
+    assert_eq!(summary.retrying, 1);
+    assert_eq!(summary.complete, 1);
     assert_eq!(
-        rss.rss_full_content_queued_count, 2,
-        "queued and hydrating share one bucket"
-    );
-    assert_eq!(rss.rss_full_content_retrying_count, 1);
-    assert_eq!(rss.rss_full_content_complete_count, 1);
-    assert_eq!(
-        rss.rss_full_content_terminal_count, 3,
+        summary.terminal, 3,
         "terminal, deleted and superseded share one bucket"
     );
     assert_eq!(
@@ -503,12 +512,16 @@ async fn source_list_exposes_scoped_rss_summary() -> anyhow::Result<()> {
         .iter()
         .find(|source| source.id == source_id)
         .ok_or_else(|| anyhow::anyhow!("RSS source is missing after generation change"))?;
-    assert_eq!(rss.rss_full_content_state.as_deref(), Some("active"));
+    let summary = rss
+        .rss_full_content
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("RSS summary disappeared after generation change"))?;
+    assert_eq!(summary.state, "active");
     assert_eq!(
-        rss.rss_full_content_pending_count, 1,
+        summary.pending, 1,
         "old-generation observations are excluded"
     );
-    assert_eq!(rss.rss_full_content_terminal_count, 0);
+    assert_eq!(summary.terminal, 0);
 
     sqlx::query(
         "UPDATE sources
@@ -523,11 +536,12 @@ async fn source_list_exposes_scoped_rss_summary() -> anyhow::Result<()> {
         .iter()
         .find(|source| source.id == source_id)
         .ok_or_else(|| anyhow::anyhow!("RSS source is missing after disabling"))?;
-    assert_eq!(rss.rss_full_content_state.as_deref(), Some("disabled"));
-    assert_eq!(
-        rss.rss_full_content_terminal_count, 1,
-        "disabled current rows are superseded"
-    );
+    let summary = rss
+        .rss_full_content
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("disabled RSS source has no summary"))?;
+    assert_eq!(summary.state, "disabled");
+    assert_eq!(summary.terminal, 1, "disabled current rows are superseded");
 
     cleanup(&pool, org_id).await?;
     Ok(())

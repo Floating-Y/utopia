@@ -2,7 +2,9 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
-use utopia_core::models::{Role, Source, SourceKind, SourceView, SyncRun, SOURCE_SECRET_KEYS};
+use utopia_core::models::{
+    Role, RssFullContentSummary, Source, SourceKind, SourceView, SyncRun, SOURCE_SECRET_KEYS,
+};
 use utopia_core::{secrets, AppError, AppResult};
 use uuid::Uuid;
 
@@ -69,6 +71,74 @@ pub fn rss_full_content_enabled(kind: &str, config: &serde_json::Value) -> AppRe
     Ok(rss_content_mode(config)? == RSS_FULL_CONTENT_MODE)
 }
 
+/// SQL 行保持扁平，公开对象在这里显式组装；否则 `NULL` 计数很容易被默认值吞掉，
+/// API 反而会掩盖 lateral 聚合或字段别名缺失。
+#[derive(sqlx::FromRow)]
+struct SourceListRow {
+    id: Uuid,
+    kind: String,
+    name: String,
+    config: serde_json::Value,
+    icon: Option<String>,
+    sync_interval_minutes: Option<i32>,
+    sync_cron: Option<String>,
+    last_sync_at: Option<DateTime<Utc>>,
+    last_sync_status: String,
+    last_sync_error: Option<String>,
+    last_sync_added: i32,
+    doc_count: i64,
+    missing_count: i64,
+    rss_state: Option<String>,
+    rss_pending: Option<i64>,
+    rss_queued: Option<i64>,
+    rss_retrying: Option<i64>,
+    rss_complete: Option<i64>,
+    rss_terminal: Option<i64>,
+}
+
+fn required_rss_field<T>(source_id: Uuid, field: &'static str, value: Option<T>) -> AppResult<T> {
+    value.ok_or_else(|| {
+        AppError::Other(anyhow::anyhow!(
+            "source list row {source_id} is missing RSS summary field {field}"
+        ))
+    })
+}
+
+impl SourceListRow {
+    fn into_view(self) -> AppResult<SourceView> {
+        let rss_full_content = if self.kind == SourceKind::Rss.as_str() {
+            let source_id = self.id;
+            Some(RssFullContentSummary {
+                state: required_rss_field(source_id, "state", self.rss_state)?,
+                pending: required_rss_field(source_id, "pending", self.rss_pending)?,
+                queued: required_rss_field(source_id, "queued", self.rss_queued)?,
+                retrying: required_rss_field(source_id, "retrying", self.rss_retrying)?,
+                complete: required_rss_field(source_id, "complete", self.rss_complete)?,
+                terminal: required_rss_field(source_id, "terminal", self.rss_terminal)?,
+            })
+        } else {
+            None
+        };
+
+        Ok(SourceView {
+            id: self.id,
+            kind: self.kind,
+            name: self.name,
+            config: self.config,
+            icon: self.icon,
+            sync_interval_minutes: self.sync_interval_minutes,
+            sync_cron: self.sync_cron,
+            last_sync_at: self.last_sync_at,
+            last_sync_status: self.last_sync_status,
+            last_sync_error: self.last_sync_error,
+            last_sync_added: self.last_sync_added,
+            doc_count: self.doc_count,
+            missing_count: self.missing_count,
+            rss_full_content,
+        })
+    }
+}
+
 /// cron 的下一次触发时刻（服务器本地时区）。
 fn cron_next_after(expr: &str, after: DateTime<Utc>) -> Option<DateTime<Utc>> {
     use std::str::FromStr;
@@ -86,7 +156,7 @@ pub async fn list(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<SourceView>> {
     // 的密钥就这么漏出去的（#246）
     // 外层别名不能与 ENTRY_SELECT 的来源别名重名；来源和当前代谓词必须留在投影内部，
     // 否则 PostgreSQL 会先计算部署中的全部 observation，再丢弃与当前来源无关的行。
-    let rows: Vec<SourceView> = sqlx::query_as(
+    let rows: Vec<SourceListRow> = sqlx::query_as(
         &format!("SELECT listed_source.id, listed_source.kind, listed_source.name,
                 listed_source.config - $2::text[] AS config, listed_source.icon,
                 listed_source.sync_interval_minutes, listed_source.sync_cron,
@@ -99,18 +169,15 @@ pub async fn list(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<SourceView>> {
                    AND d.deleted_at IS NULL) AS missing_count,
                 CASE WHEN listed_source.kind <> 'rss' THEN NULL
                   WHEN listed_source.config->>'content_mode' IS DISTINCT FROM 'full_new_items' THEN 'disabled'
-                  WHEN listed_source.rss_baselined_at IS NULL THEN 'pending' ELSE 'active' END AS rss_full_content_state,
-                CASE WHEN listed_source.kind='rss' THEN listed_source.rss_generation END AS rss_full_content_generation,
-                COALESCE(hydration.baseline_count, 0) AS rss_full_content_baseline_count,
-                COALESCE(hydration.pending, 0) AS rss_full_content_pending_count,
-                COALESCE(hydration.queued, 0) AS rss_full_content_queued_count,
-                COALESCE(hydration.retrying, 0) AS rss_full_content_retrying_count,
-                COALESCE(hydration.complete, 0) AS rss_full_content_complete_count,
-                COALESCE(hydration.terminal, 0) AS rss_full_content_terminal_count
+                  WHEN listed_source.rss_baselined_at IS NULL THEN 'pending' ELSE 'active' END AS rss_state,
+                hydration.pending AS rss_pending,
+                hydration.queued AS rss_queued,
+                hydration.retrying AS rss_retrying,
+                hydration.complete AS rss_complete,
+                hydration.terminal AS rss_terminal
          FROM sources listed_source
          LEFT JOIN LATERAL (
              SELECT
-                 (count(*) FILTER (WHERE projected.state = 'baseline'))::int AS baseline_count,
                  count(*) FILTER (WHERE projected.state = 'pending') AS pending,
                  count(*) FILTER (WHERE projected.state IN ('queued', 'hydrating')) AS queued,
                  count(*) FILTER (WHERE projected.state = 'retry_wait') AS retrying,
@@ -133,7 +200,7 @@ pub async fn list(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<SourceView>> {
     .bind(SOURCE_SECRET_KEYS)
     .fetch_all(pool)
     .await?;
-    Ok(rows)
+    rows.into_iter().map(SourceListRow::into_view).collect()
 }
 
 /// 出库即开封：配置里的凭据键与推送密钥在库里是封印的（`utopia_core::secrets`）。

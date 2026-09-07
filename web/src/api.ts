@@ -216,14 +216,14 @@ export interface SourceView {
   last_sync_added: number;
   doc_count: number;
   missing_count: number;
-  rss_full_content_state: "pending" | "active" | "disabled" | null;
-  rss_full_content_generation: number | null;
-  rss_full_content_baseline_count: number | null;
-  rss_full_content_pending_count: number;
-  rss_full_content_queued_count: number;
-  rss_full_content_retrying_count: number;
-  rss_full_content_complete_count: number;
-  rss_full_content_terminal_count: number;
+  rss_full_content: {
+    state: "pending" | "active" | "disabled";
+    pending: number;
+    queued: number;
+    retrying: number;
+    complete: number;
+    terminal: number;
+  } | null;
 }
 
 export interface SearchResult {

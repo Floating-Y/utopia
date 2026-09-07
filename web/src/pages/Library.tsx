@@ -937,6 +937,7 @@ function SourceBar({
     (cfg.urls ? `${cfg.urls.length} URLs` : "");
   const rssMode: RssContentMode =
     cfg.content_mode === "full_new_items" ? "full_new_items" : "feed";
+  const hydration = source.rss_full_content;
 
   return (
     <div className="glass rounded-lg mb-3">
@@ -979,15 +980,15 @@ function SourceBar({
                         ? S.library.rssModeFullShort
                         : S.library.rssModeFeedShort}
                     </span>
-                    {rssMode === "full_new_items" && (
+                    {rssMode === "full_new_items" && hydration && (
                       <>
                         <span className="text-ink-3 shrink-0 u-num">
                           {S.library.rssHydrationCounts(
-                            source.rss_full_content_pending_count,
-                            source.rss_full_content_queued_count,
-                            source.rss_full_content_retrying_count,
-                            source.rss_full_content_complete_count,
-                            source.rss_full_content_terminal_count,
+                            hydration.pending,
+                            hydration.queued,
+                            hydration.retrying,
+                            hydration.complete,
+                            hydration.terminal,
                           )}
                         </span>
                       </>
