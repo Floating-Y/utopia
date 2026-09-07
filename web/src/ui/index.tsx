@@ -1078,12 +1078,15 @@ export function PageHeader({
   className?: string;
 }) {
   return (
-    <div className={cn(className ?? "mb-6", "flex items-center justify-between gap-4")}>
-      <div className="min-w-0">
-        <h1 className="u-title text-display break-words">{title}</h1>
-        {sub && <p className="mt-1 text-body text-ink-2">{sub}</p>}
+    <div className={cn(className ?? "mb-6")}>
+      {/* 动作跟**标题那一行**走，不跟「标题 + 副标题」这一整块走：整块居中的话，
+          有副标题时按钮就浮在两行中间，看着既不属于标题也不属于说明。
+          items-baseline：按钮上的字与标题坐在同一条基线上 */}
+      <div className="flex items-baseline justify-between gap-4">
+        <h1 className="u-title min-w-0 text-display break-words">{title}</h1>
+        {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
       </div>
-      {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
+      {sub && <p className="mt-1 text-body text-ink-2">{sub}</p>}
     </div>
   );
 }
@@ -1140,10 +1143,15 @@ export function rowClass(
   active?: boolean,
   density: RowDensity = "list",
   tone?: RowTone,
+  /** 二级：左栏里挂在某一项下面的那几条。文字缩到父行标签的位置
+      （内距 12 + 图标 14 + 间距 8 = 34），底色仍然铺满整行——
+      缩的是字，不是那一格 */
+  sub?: boolean,
 ): string {
   return cn(
     "group flex w-full items-center gap-2 text-left transition-colors duration-fast",
     density === "menu" ? "rounded-none" : "rounded-cell",
+    sub && "pl-[34px]",
     // 左栏导航项 32 高（py 6）：36 在一列十几条里显得松
     density === "nav"
       ? "px-3 py-1.5 text-body font-medium"

@@ -93,6 +93,10 @@ export const en = {
     /* 网页标题用的短名：`Utopia | Persona` */
     titleTag: "Persona",
     profile: "Profile",
+    cancel: "Cancel",
+    colLastUsed: "Last used",
+    colCreated: "Created",
+    pickBases: "Search bases…",
     administration: "Administration",
     adminChip: "Admin",
     backToApp: "← Back to app",
@@ -130,8 +134,7 @@ export const en = {
     tokenScope: "Scope",
     scopeRead: "Read",
     scopeWrite: "Write",
-    scopeHint:
-      "Effective rights are your own role ∩ this scope. Write is a ceiling, not a grant: a viewer's write token still cannot write.",
+    scopeHint: "A ceiling, not a grant — a token never does more than you can.",
     tokenKbs: "Knowledge bases",
     kbsAllHint: "Nothing selected means every base you can open.",
     tokenExpires: "Expires",
