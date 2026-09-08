@@ -23,8 +23,6 @@ import { toast } from "../toast";
 import {
   Button,
   Checkbox,
-  Chip,
-  type ChipTone,
   cn,
   DangerConfirm,
   Dialog,
@@ -33,10 +31,11 @@ import {
   Input,
   LinkButton,
   Loading,
-  NativeSelect,
   Pager,
   Segmented,
+  StatusCell,
   Textarea,
+  PageHeader,
 } from "../ui";
 import {
   KIND_ICON,
@@ -50,21 +49,6 @@ import {
 
 const PAGE_SIZE = 15;
 
-const STATUS_TONE: Record<string, ChipTone> = {
-  pending: "neutral",
-  parsing: "warn",
-  indexing: "warn",
-  embedding: "warn",
-  ready: "info",
-  failed: "danger",
-};
-
-const GRAPH_TONE: Record<string, ChipTone> = {
-  queued: "neutral",
-  extracting: "warn",
-  done: "violet",
-  failed: "danger",
-};
 
 /** 调度器产出的值：interval 与 cron 互斥。 */
 interface ScheduleValue {
@@ -567,23 +551,24 @@ export function Library() {
         onDragLeave={() => setDragging(false)}
         onDrop={onDrop}
       >
-        {/* 工作页居左：与 Review/Ontology 同规——左缘随栏起步，切页不跳 */}
-        <div className="max-w-4xl">
-          <div className="flex items-center justify-between mb-4">
-            <h1 className="u-title text-title">
-              {selectedSource?.name ??
-                (selection === "uploads"
-                  ? S.library.uploads
-                  : selection === "deleted"
-                    ? S.library.deleted
-                    : S.library.title)}
-            </h1>
-            <div className="flex items-center gap-2">
+        {/* 工作页铺满栏右的整个宽度：与 Review/Ontology/设置页同规，切页不跳 */}
+        <div>
+          <PageHeader
+            title={
+              selectedSource?.name ??
+              (selection === "uploads"
+                ? S.library.uploads
+                : selection === "deleted"
+                  ? S.library.deleted
+                  : S.library.title)
+            }
+            actions={
+              <>
               {/* 历史视图下过滤框只藏不撤（invisible 保留占位），标题行高度不塌、不抖 */}
               <div className={`relative ${showHistory ? "invisible" : ""}`}>
                 <Search
                   size={13}
-                  className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ink-3 pointer-events-none"
+                  className="absolute left-2.5 top-1/2 -translate-y-1/2 text-ink-2 pointer-events-none"
                 />
                 <Input size="sm" className="w-52 pl-8 pr-8"
                   placeholder={S.library.filterPlaceholder}
@@ -603,20 +588,23 @@ export function Library() {
                   它是一组固定的管道状态，而「这个库现在没有失败的」正是用户
                   想通过筛一下确认的事 */}
               {selection !== "deleted" && (
-              <NativeSelect size="sm" className="shrink-0"
-                value={graphFilter}
-                onChange={(e) => {
-                  setGraphFilter(e.target.value);
-                  setPage(0);
-                }}
-              >
-                <option value="">{S.library.anyStatus}</option>
-                <option value="failed">{S.library.statusFailed}</option>
-                <option value="done">{S.library.statusDone}</option>
-                <option value="queued">{S.library.statusQueued}</option>
-                <option value="extracting">{S.library.statusExtracting}</option>
-                <option value="none">{S.library.statusNone}</option>
-              </NativeSelect>
+                <Dropdown
+                  size="sm"
+                  className="w-44 shrink-0"
+                  value={graphFilter}
+                  onChange={(v) => {
+                    setGraphFilter(v);
+                    setPage(0);
+                  }}
+                  options={[
+                    { value: "", label: S.library.anyStatus },
+                    { value: "failed", label: S.library.statusFailed },
+                    { value: "done", label: S.library.statusDone },
+                    { value: "queued", label: S.library.statusQueued },
+                    { value: "extracting", label: S.library.statusExtracting },
+                    { value: "none", label: S.library.statusNone },
+                  ]}
+                />
               )}
               {/* 一键重试。**只在真有失败时出现**——没有失败的库不该看到一个
                   点了什么都不会发生的按钮。数字写在按钮上，点之前就知道会动几篇 */}
@@ -651,7 +639,9 @@ export function Library() {
                   {S.library.upload}
                 </Button>
               )}
-            </div>
+              </>
+            }
+          />
             <input
               ref={fileInput}
               type="file"
@@ -660,7 +650,6 @@ export function Library() {
               accept=".pdf,.docx,.xlsx,.xls,.ods,.pptx,.md,.txt,.html,.htm,.csv,.tsv,.json,.yaml,.yml,.xml,.log"
               onChange={(e) => e.target.files?.length && upload.mutate(e.target.files)}
             />
-          </div>
 
           {selectedSource && (
             <SourceBar
@@ -685,10 +674,10 @@ export function Library() {
             const total = (docs.data?.ready ?? 0) + pending;
             const done = total - pending;
             return (
-              <div className="mb-3 glass rounded-xl px-4 py-3">
+              <div className="mb-3 glass rounded-panel px-4 py-3">
                 <div className="flex items-center justify-between text-small text-ink-2 mb-2">
                   <span>{S.library.extractProgress(done, total)}</span>
-                  <span className="u-num text-ink-3">
+                  <span className="u-num text-ink-2">
                     {Math.round((done / Math.max(total, 1)) * 100)}%
                   </span>
                 </div>
@@ -715,7 +704,9 @@ export function Library() {
             <RunsPanel kbId={kb.id} sourceId={selectedSource.id} />
           ) : (
           <>
-          <div className={`glass rounded-xl glass-hover ${dragging ? "u-highlight" : ""}`}>
+          {/* 这块是拖放区，不是可点对象：真反馈是 dragging 时的 u-highlight。
+              常态下指针经过时亮一下边框，等于对一个不接受点击的槽做交互暗示 */}
+          <div className={`glass rounded-panel ${dragging ? "u-highlight" : ""}`}>
             {selection === "deleted" ? (
               <DeletedTable
                 docs={pagedDocs}
@@ -727,7 +718,7 @@ export function Library() {
             ) : pagedDocs.length ? (
               <table className="w-full text-body">
                 <thead>
-                  <tr className="text-left text-small text-ink-3 border-b border-line">
+                  <tr className="text-left text-small text-ink-2 border-b border-line">
                     <th className="px-4 py-3 font-medium">{S.library.colFile}</th>
                     {selection === "all" && (
                       <th className="px-4 py-3 font-medium">{S.library.colSource}</th>
@@ -736,6 +727,9 @@ export function Library() {
                     <th className="px-4 py-3 font-medium">{S.library.colGraph}</th>
                     <th className="px-4 py-3 font-medium">{S.library.colChunks}</th>
                     <th className="px-4 py-3 font-medium">{S.library.colSize}</th>
+                    {/* 动作两列都不带表头：列名说的是「这一格是什么」，
+                        而这两格是「能做什么」，标题是多出来的一行噪声 */}
+                    <th className="px-4 py-3"></th>
                     <th className="px-4 py-3"></th>
                   </tr>
                 </thead>
@@ -762,15 +756,15 @@ export function Library() {
                 </tbody>
               </table>
             ) : query || graphFilter ? (
-              <div className="py-20 text-center text-body text-ink-3">
+              <div className="py-20 text-center text-body text-ink-2">
                 {S.library.filterNoMatch}
               </div>
             ) : (
-              <div className="py-20 text-center text-body text-ink-3">
+              <div className="py-20 text-center text-body text-ink-2">
                 {canUpload ? (
                   <>
                     {S.library.dropHint}
-                    <div className="mt-2 text-small text-ink-3">{S.library.formats}</div>
+                    <div className="mt-2 text-small text-ink-2">{S.library.formats}</div>
                   </>
                 ) : (
                   S.library.emptyPull
@@ -936,7 +930,7 @@ function SourceBar({
     cfg.content_mode === "full_new_items" ? "full_new_items" : "feed";
 
   return (
-    <div className="glass rounded-xl mb-3">
+    <div className="glass rounded-panel mb-3">
       <div className="px-4 py-3 flex items-center gap-3 text-small">
         {/* api 与拉取型同一状态语汇：点 + 状态 + 时刻 + 产出/错误；
             端点是一次性集成信息，放 Token 弹窗，不占常驻条 */}
@@ -951,7 +945,7 @@ function SourceBar({
                 : S.library.syncStatus[source.last_sync_status]}
             </span>
             {source.last_sync_at && (
-              <span className="text-ink-3 u-num whitespace-nowrap shrink-0">
+              <span className="text-ink-2 u-num whitespace-nowrap shrink-0">
                 {source.last_sync_at.slice(0, 16).replace("T", " ")}
               </span>
             )}
@@ -967,18 +961,18 @@ function SourceBar({
             )}
             {isPull && (
               <>
-                <span className="text-ink-3 truncate min-w-0">{configSummary}</span>
-                <span className="text-ink-3 shrink-0 u-num">{scheduleLabel(source)}</span>
+                <span className="text-ink-2 truncate min-w-0">{configSummary}</span>
+                <span className="text-ink-2 shrink-0 u-num">{scheduleLabel(source)}</span>
                 {source.kind === "rss" && (
                   <>
-                    <span className="text-ink-3 shrink-0" title={S.library.rssContentModeHint}>
+                    <span className="text-ink-2 shrink-0" title={S.library.rssContentModeHint}>
                       {rssMode === "full_new_items"
                         ? S.library.rssModeFullShort
                         : S.library.rssModeFeedShort}
                     </span>
                     {rssMode === "full_new_items" && (
                       <>
-                        <span className="text-ink-3 shrink-0 u-num">
+                        <span className="text-ink-2 shrink-0 u-num">
                           {S.library.rssHydrationCounts(
                             source.rss_full_content_pending_count,
                             source.rss_full_content_queued_count,
@@ -996,7 +990,7 @@ function SourceBar({
           </>
         )}
         {!isPull && !isApi && (
-          <span className="text-ink-3 truncate min-w-0">
+          <span className="text-ink-2 truncate min-w-0">
             {S.library.sourceKindHints[source.kind as "folder"] ?? ""}
           </span>
         )}
@@ -1107,13 +1101,13 @@ function DropsModal({
                 <span className="text-body text-ink">
                   {S.library.dropReason[r.reason] ?? r.reason}
                 </span>
-                <span className="u-num ml-auto text-small text-ink-3">×{r.count}</span>
+                <span className="u-num ml-auto text-small text-ink-2">×{r.count}</span>
               </div>
               <div className="mt-1 font-mono text-fine text-ink-2 break-all">
                 {r.detail}
               </div>
               {r.example && (
-                <div className="mt-1 text-fine text-ink-3 break-all">
+                <div className="mt-1 text-fine text-ink-2 break-all">
                   {S.library.dropsExample} {r.example}
                 </div>
               )}
@@ -1166,7 +1160,7 @@ function ErrorModal({
         </>
       }
     >
-      <pre className="u-scroll max-h-72 overflow-auto rounded-lg border border-line bg-surface p-3 text-small leading-relaxed text-ink-2 whitespace-pre-wrap break-words">
+      <pre className="u-scroll max-h-72 overflow-auto rounded-panel border border-line bg-surface p-3 text-small leading-relaxed text-ink-2 whitespace-pre-wrap break-words">
         {text}
       </pre>
     </Dialog>
@@ -1232,7 +1226,7 @@ function TokenModal({
     >
       <div className="space-y-3">
           {tokenQuery.isPending ? (
-            <p className="text-body text-ink-3">{S.nav.loading}</p>
+            <p className="text-body text-ink-2">{S.nav.loading}</p>
           ) : token ? (
             <>
               <Button
@@ -1243,11 +1237,11 @@ function TokenModal({
               >
                 {token}
               </Button>
-              <p className="text-fine leading-relaxed text-ink-3">
+              <p className="text-fine leading-relaxed text-ink-2">
                 {S.library.tokenWarning}
               </p>
               <div>
-                <p className="mb-1 text-fine text-ink-3">{S.library.tokenUsage}</p>
+                <p className="mb-1 text-fine text-ink-2">{S.library.tokenUsage}</p>
                 <Button
                   variant="secondary"
                   className="h-auto w-full justify-start whitespace-pre-wrap break-all py-2 text-left font-mono text-ink-2"
@@ -1260,7 +1254,7 @@ function TokenModal({
               </div>
             </>
           ) : (
-            <p className="text-body text-ink-3">{S.library.noToken}</p>
+            <p className="text-body text-ink-2">{S.library.noToken}</p>
           )}
       </div>
     </Dialog>
@@ -1276,11 +1270,11 @@ function RunsPanel({ kbId, sourceId }: { kbId: string; sourceId: string }) {
   const list = runs.data?.runs ?? [];
 
   return (
-    <div className="glass rounded-xl">
+    <div className="glass rounded-panel">
       {runs.isLoading ? (
-        <div className="py-20 text-center text-body text-ink-3">{S.nav.loading}</div>
+        <div className="py-20 text-center text-body text-ink-2">{S.nav.loading}</div>
       ) : list.length === 0 ? (
-        <div className="py-20 text-center text-body text-ink-3">{S.library.noRuns}</div>
+        <div className="py-20 text-center text-body text-ink-2">{S.library.noRuns}</div>
       ) : (
         <div className="px-4 py-2">
           {list.map((r) => (
@@ -1300,12 +1294,12 @@ function RunsPanel({ kbId, sourceId }: { kbId: string; sourceId: string }) {
               <span className="u-num text-ink-2 whitespace-nowrap shrink-0">
                 {r.started_at.slice(0, 16).replace("T", " ")}
               </span>
-              <span className="text-ink-3 whitespace-nowrap shrink-0">
+              <span className="text-ink-2 whitespace-nowrap shrink-0">
                 {r.created_docs > 0 && S.library.runNew(r.created_docs)}
                 {r.created_docs > 0 && r.updated_docs > 0 && " · "}
                 {r.updated_docs > 0 && S.library.runUpdated(r.updated_docs)}
                 {r.status === "ok" && r.created_docs === 0 && r.updated_docs === 0 && (
-                  <span className="text-ink-3">{S.library.runNothing}</span>
+                  <span className="text-ink-2">{S.library.runNothing}</span>
                 )}
               </span>
               {r.error && (
@@ -1475,7 +1469,7 @@ function SourceModal({
   //（button 也算），导致图标网格/日程选择器悬停时第一个按钮常亮
   const field = (label: string, node: React.ReactNode) => (
     <div className="mb-3">
-      <div className="mb-1 text-fine font-medium text-ink-3">{label}</div>
+      <div className="mb-1 text-fine font-medium text-ink-2">{label}</div>
       {node}
     </div>
   );
@@ -1518,7 +1512,7 @@ function SourceModal({
                   value: k,
                   label: (
                     <span className="flex items-center gap-2">
-                      <Icon size={12} className="shrink-0 text-ink-3" />
+                      <Icon size={12} className="shrink-0 text-ink-2" />
                       {S.library.sourceKinds[k]}
                     </span>
                   ),
@@ -1527,7 +1521,7 @@ function SourceModal({
             />,
           )}
           {/* 类型自解释：一行说明；接口细节移入内置文档，弹窗只留链接 */}
-          <p className="mb-4 text-fine leading-relaxed text-ink-3">
+          <p className="mb-4 text-fine leading-relaxed text-ink-2">
             {S.library.sourceKindHints[kind]}
             {kind === "custom" && (
               <>
@@ -1613,16 +1607,17 @@ function SourceModal({
               )}
               {field(
                 S.library.rssContentMode,
-                <NativeSelect
+                <Dropdown
                   className="w-full"
                   value={rssContentMode}
-                  onChange={(e) => setRssContentMode(e.target.value as RssContentMode)}
-                >
-                  <option value="full_new_items">{S.library.rssModeFull}</option>
-                  <option value="feed">{S.library.rssModeFeed}</option>
-                </NativeSelect>,
+                  onChange={(v) => setRssContentMode(v as RssContentMode)}
+                  options={[
+                    { value: "full_new_items", label: S.library.rssModeFull },
+                    { value: "feed", label: S.library.rssModeFeed },
+                  ]}
+                />,
               )}
-              <p className="-mt-1 mb-3 text-fine leading-relaxed text-ink-3">
+              <p className="-mt-1 mb-3 text-fine leading-relaxed text-ink-2">
                 {rssContentMode === "full_new_items"
                   ? S.library.rssFullModeHint
                   : S.library.rssFeedModeHint}
@@ -1923,7 +1918,7 @@ function SourceEditModal({
   // div 而非 label：label 会把 :hover/click 转发给第一个可标记控件
   const field = (label: string, node: React.ReactNode) => (
     <div className="mb-3">
-      <div className="mb-1 text-fine font-medium text-ink-3">{label}</div>
+      <div className="mb-1 text-fine font-medium text-ink-2">{label}</div>
       {node}
     </div>
   );
@@ -1953,7 +1948,7 @@ function SourceEditModal({
       <div>
           {/* 类型只读：换类型 = 换身份，应新建来源 */}
           <div className="mb-4 flex items-center gap-2 text-small text-ink-2">
-            <KindIcon size={13} className="text-ink-3" />
+            <KindIcon size={13} className="text-ink-2" />
             {S.library.sourceKinds[kind as keyof typeof S.library.sourceKinds] ?? kind}
           </div>
 
@@ -2002,16 +1997,17 @@ function SourceEditModal({
               )}
               {field(
                 S.library.rssContentMode,
-                <NativeSelect
+                <Dropdown
                   className="w-full"
                   value={rssContentMode}
-                  onChange={(e) => setRssContentMode(e.target.value as RssContentMode)}
-                >
-                  <option value="full_new_items">{S.library.rssModeFull}</option>
-                  <option value="feed">{S.library.rssModeFeed}</option>
-                </NativeSelect>,
+                  onChange={(v) => setRssContentMode(v as RssContentMode)}
+                  options={[
+                    { value: "full_new_items", label: S.library.rssModeFull },
+                    { value: "feed", label: S.library.rssModeFeed },
+                  ]}
+                />,
               )}
-              <p className="-mt-1 mb-3 text-fine leading-relaxed text-ink-3">
+              <p className="-mt-1 mb-3 text-fine leading-relaxed text-ink-2">
                 {rssContentMode === "full_new_items"
                   ? S.library.rssFullModeHint
                   : S.library.rssFeedModeHint}
@@ -2067,7 +2063,7 @@ function SourceEditModal({
           )}
 
           {ingestChanged && (
-            <p className="mb-3 text-fine leading-relaxed text-ink-3">
+            <p className="mb-3 text-fine leading-relaxed text-ink-2">
               {S.library.editKeepNote}
             </p>
           )}
@@ -2090,11 +2086,11 @@ function SourceEditModal({
 
           {/* Danger zone：删除来源（文档保留，落回 Uploads） */}
           <div className="mt-4 pt-3 border-t border-line">
-            <div className="mb-1 text-fine font-medium text-ink-3">
+            <div className="mb-1 text-fine font-medium text-ink-2">
               {S.library.dangerZone}
             </div>
             <div className="flex items-center justify-between gap-3">
-              <span className="text-fine text-ink-3">{S.library.deleteSourceHint}</span>
+              <span className="text-fine text-ink-2">{S.library.deleteSourceHint}</span>
               {/* 同一个道理：这里只打开确认框，红色在确认框里 */}
               <Button variant="secondary" size="sm" className="shrink-0"
                 onClick={() => setConfirmingDelete(true)}
@@ -2137,13 +2133,13 @@ function DeletedTable({
 }) {
   if (!docs.length) {
     return (
-      <div className="py-20 text-center text-body text-ink-3">{S.library.deletedEmpty}</div>
+      <div className="py-20 text-center text-body text-ink-2">{S.library.deletedEmpty}</div>
     );
   }
   return (
     <table className="w-full text-body">
       <thead>
-        <tr className="text-left text-small text-ink-3 border-b border-line">
+        <tr className="text-left text-small text-ink-2 border-b border-line">
           <th className="px-4 py-3 font-medium">{S.library.colFile}</th>
           <th className="px-4 py-3 font-medium">{S.library.colSource}</th>
           <th className="px-4 py-3 font-medium">{S.library.colDeleted}</th>
@@ -2156,8 +2152,8 @@ function DeletedTable({
           return (
             <tr key={d.id} className="border-b border-line last:border-0">
               <td className="px-4 py-3 text-ink-2">{d.filename}</td>
-              <td className="px-4 py-3 text-ink-3">{src?.name ?? S.library.uploads}</td>
-              <td className="px-4 py-3 u-num text-ink-3">
+              <td className="px-4 py-3 text-ink-2">{src?.name ?? S.library.uploads}</td>
+              <td className="px-4 py-3 u-num text-ink-2">
                 {d.deleted_at ? new Date(d.deleted_at).toLocaleString() : ""}
               </td>
               <td className="px-4 py-3 text-right whitespace-nowrap">
@@ -2222,64 +2218,78 @@ function DocRow({
       {source !== undefined && (
         <td className="px-4 py-3">
           <span className="flex items-center gap-2 text-small text-ink-2">
-            <SrcIcon size={12} className="shrink-0 text-ink-3" />
+            <SrcIcon size={12} className="shrink-0 text-ink-2" />
             <span className="truncate max-w-28">{source?.name ?? S.library.uploads}</span>
           </span>
         </td>
       )}
       <td className="px-4 py-3">
         {/* 失败可点开看原文：tooltip 会截断、也没法复制 */}
-        {doc.status === "failed" && doc.error ? (
-          <Chip
-            tone="danger"
-            onClick={() => onShowError(S.library.errorParse, doc.error!)}
-          >
-            {statusText}
-          </Chip>
-        ) : (
-          <Chip tone={STATUS_TONE[doc.status] ?? "neutral"}>{statusText}</Chip>
-        )}
-        {/* 解析管道失败：重跑 解析→索引→嵌入（解析器升级/瞬时故障重试） */}
-        {doc.status === "failed" && (
-          <LinkButton underline className="ml-2" onClick={onReprocess}>
-            {S.library.reprocess}
-          </LinkButton>
-        )}
+        <StatusCell
+          danger={doc.status === "failed"}
+          onClick={
+            doc.status === "failed" && doc.error
+              ? () => onShowError(S.library.errorParse, doc.error!)
+              : undefined
+          }
+        >
+          {statusText}
+        </StatusCell>
         {doc.missing_since && (
-          <span className="ml-2 inline-block" title={doc.missing_since.slice(0, 16).replace("T", " ")}>
-            <Chip tone="neutral">{S.library.notInSource}</Chip>
+          <span
+            className="ml-3 text-small text-ink-2"
+            title={doc.missing_since.slice(0, 16).replace("T", " ")}
+          >
+            {S.library.notInSource}
           </span>
         )}
       </td>
       <td className="px-4 py-3">
-        {doc.graph_status === "none" ? (
-          <span className="text-small text-ink-3">{graphText}</span>
-        ) : doc.graph_status === "failed" && doc.graph_error ? (
-          <Chip
-            tone="danger"
-            onClick={() => onShowError(S.library.errorGraph, doc.graph_error!)}
-          >
-            {graphText}
-          </Chip>
-        ) : (
-          <Chip tone={GRAPH_TONE[doc.graph_status] ?? "neutral"}>{graphText}</Chip>
-        )}
-        {/* 抽出来却没落地的事实。抽取成功不代表全须全尾，所以这个 chip 与
-            graph_status 并列而不是替代它——"done" 和 "3 dropped" 同时为真 */}
+        <StatusCell
+          danger={doc.graph_status === "failed"}
+          onClick={
+            doc.graph_status === "failed" && doc.graph_error
+              ? () => onShowError(S.library.errorGraph, doc.graph_error!)
+              : undefined
+          }
+        >
+          {graphText}
+        </StatusCell>
+        {/* 抽出来却没落地的事实。抽取成功不代表全须全尾，所以它与 graph_status
+            并列而不是替代它——"done" 和 "3 dropped" 同时为真。
+            **不给警示色**：漏掉的事实不是故障，是窄本体本来就会做的事；
+            琥珀挨着红色，会让人以为一行里坏了两件事。它只是个值得点开看看的数 */}
         {dropTotal > 0 && drops && (
-          <Chip tone="warn" className="ml-2" onClick={() => onShowDrops(drops)}>
+          /* 带下划线但不提亮：它是可以点开看的，可它不该比旁边的状态更响 */
+          <LinkButton
+            underline
+            className="ml-3 text-ink-2"
+            onClick={() => onShowDrops(drops)}
+          >
             {S.library.dropsChip(dropTotal)}
-          </Chip>
-        )}
-        {/* done 也可重抽：本体（描述/新类）调整后强制全量重抽正是常规操作 */}
-        {doc.status === "ready" && ["none", "failed", "done"].includes(doc.graph_status) && (
-          <LinkButton underline className="ml-2" onClick={onExtract}>
-            {doc.graph_status === "done" ? S.library.reExtract : S.library.extract}
           </LinkButton>
         )}
       </td>
       <td className="px-4 py-3 text-ink-2">{doc.chunk_count || "—"}</td>
       <td className="px-4 py-3 text-ink-2">{formatSize(doc.size_bytes)}</td>
+      {/* 动作自成一列。徽章说的是这一行现在是什么状态，动作说的是能拿它怎么办；
+          两件事挤在一格里，读的人得先分辨哪个字是可点的。
+          这一格至多一个动作：重跑解析要 status=failed，重抽要 status=ready，
+          两者互斥——所以不必再排一次谁在前 */}
+      <td className="px-4 py-3">
+        {doc.status === "failed" ? (
+          /* 解析管道失败：重跑 解析→索引→嵌入（解析器升级/瞬时故障重试） */
+          <LinkButton underline onClick={onReprocess}>
+            {S.library.reprocess}
+          </LinkButton>
+        ) : doc.status === "ready" &&
+          ["none", "failed", "done"].includes(doc.graph_status) ? (
+          /* done 也可重抽：本体（描述/新类）调整后强制全量重抽正是常规操作 */
+          <LinkButton underline onClick={onExtract}>
+            {doc.graph_status === "done" ? S.library.reExtract : S.library.extract}
+          </LinkButton>
+        ) : null}
+      </td>
       <td className="px-4 py-3 text-right">
         <LinkButton tone="danger" onClick={onDelete}>
           {S.library.delete}

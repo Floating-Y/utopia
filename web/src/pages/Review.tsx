@@ -38,6 +38,7 @@ import {
   RailItem,
   Segmented,
   GroupLabel,
+  PageHeader,
 } from "../ui";
 
 const DUP_PAGE = 6;
@@ -72,12 +73,12 @@ function SideCard({ side }: { side: ReviewSide }) {
           {side.name}
         </span>
         {side.disambiguator && (
-          <span className="text-small text-ink-3 truncate">
+          <span className="text-small text-ink-2 truncate">
             · {side.disambiguator}
           </span>
         )}
       </div>
-      <div className="text-small text-ink-3 mb-2">
+      <div className="text-small text-ink-2 mb-2">
         {side.type_label ?? S.graph.untyped} ·{" "}
         {S.review.factsCount(side.degree)}
       </div>
@@ -90,7 +91,7 @@ function SideCard({ side }: { side: ReviewSide }) {
           ))}
         </ul>
       ) : (
-        <p className="text-small text-ink-3">{S.review.noFacts}</p>
+        <p className="text-small text-ink-2">{S.review.noFacts}</p>
       )}
     </div>
   );
@@ -109,12 +110,15 @@ function typesDiffer(item: ReviewItem): boolean {
 function DuplicateCard({
   item,
   busy,
+  locked,
   picked,
   onPick,
   onDecide,
 }: {
   item: ReviewItem;
   busy: boolean;
+  /** agent 正在裁这一对（0025）：这几分钟里人不能动它，接口也会拒绝 */
+  locked: boolean;
   /** 批量选中（#428）：勾在卡片左上，选了就跟着上面的批量按钮走 */
   picked: boolean;
   onPick: (picked: boolean) => void;
@@ -123,27 +127,34 @@ function DuplicateCard({
   const reasonCode = item.reason?.split("|", 1)[0];
 
   return (
-    <div className={cn("glass rounded-xl p-4", picked && "u-picked")}>
+    <div className={cn("glass rounded-panel p-4", picked && "u-picked")}>
       <div className="flex gap-4">
         <Checkbox
           className="shrink-0 self-start"
           checked={picked}
-          disabled={busy}
+          disabled={busy || locked}
           onChange={(e) => onPick(e.target.checked)}
           label={<span className="sr-only">{S.review.pickPair}</span>}
         />
         <SideCard side={item.left} />
-        <div className="self-center text-ink-3 text-body shrink-0">≟</div>
+        <div className="self-center text-ink-2 text-body shrink-0">≟</div>
         <SideCard side={item.right} />
       </div>
       <div className="mt-3 pt-3 flex items-center gap-3 border-t border-line">
-        <span
-          className={`u-chip ${item.stage === "human" ? "u-chip-warn" : "u-chip-neutral"}`}
-        >
-          {item.stage === "human"
-            ? S.review.stageHuman
-            : S.review.stageAdjudicating}
-        </span>
+        {locked ? (
+          <span className="u-chip u-chip-info">
+            <span className="mr-2 inline-block h-2 w-2 rounded-full bg-warn animate-pulse" />
+            {S.review.agentDeciding}
+          </span>
+        ) : (
+          <span
+            className={`u-chip ${item.stage === "human" ? "u-chip-warn" : "u-chip-neutral"}`}
+          >
+            {item.stage === "human"
+              ? S.review.stageHuman
+              : S.review.stageAdjudicating}
+          </span>
+        )}
         {typesDiffer(item) && (
           <Chip tone="warn" title={S.review.typesDifferHint}>
             {S.review.typesDiffer(
@@ -162,24 +173,24 @@ function DuplicateCard({
           </Chip>
         )}
         {reasonCode !== "namesake" && (
-          <span className="text-small text-ink-3">
+          <span className="text-small text-ink-2">
             {S.review.similarity(Math.round(item.score * 100))}
           </span>
         )}
         {item.reason && (
-          <span className="text-small text-ink-3 truncate min-w-0">
+          <span className="text-small text-ink-2 truncate min-w-0">
             {escalationText(item.reason)}
           </span>
         )}
         <div className="ml-auto flex gap-2 shrink-0">
           <Button variant="secondary" size="sm"
-            disabled={busy}
+            disabled={busy || locked}
             onClick={() => onDecide("keep")}
           >
             {S.review.keep}
           </Button>
           <Button variant="primary" size="sm"
-            disabled={busy}
+            disabled={busy || locked}
             onClick={() => onDecide("merge")}
           >
             {S.review.merge}
@@ -203,17 +214,17 @@ function FactRow({
 }) {
   const range = dateRange(fact.valid_from, fact.valid_to);
   return (
-    <div className="glass rounded-xl p-4">
+    <div className="glass rounded-panel p-4">
       <div className="flex items-center gap-2 flex-wrap">
         <span className="text-body font-medium text-ink">
           {fact.subject_name}
         </span>
-        <span className="text-small text-ink-3">
+        <span className="text-small text-ink-2">
           —{" "}
           <span
             className={
               fact.predicate_label === null
-                ? "italic text-ink-3"
+                ? "italic text-ink-2"
                 : undefined
             }
           >
@@ -224,13 +235,13 @@ function FactRow({
         <span className="text-body font-medium text-ink">
           {fact.object_name ?? "?"}
         </span>
-        {range && <span className="text-small text-ink-3">({range})</span>}
+        {range && <span className="text-small text-ink-2">({range})</span>}
         <span className="u-chip u-chip-warn ml-auto">
           {S.review.confidence(Math.round(fact.confidence * 100))}
         </span>
       </div>
       {fact.quote && (
-        <p className="mt-2 text-small text-ink-3 italic line-clamp-2">
+        <p className="mt-2 text-small text-ink-2 italic line-clamp-2">
           “{fact.quote}”
         </p>
       )}
@@ -274,30 +285,30 @@ function ConflictRow({
   const closeAtIso = closeParsed?.iso;
 
   return (
-    <div className="glass rounded-xl p-4">
+    <div className="glass rounded-panel p-4">
       <div className="flex items-center gap-2 flex-wrap">
         <span className="text-body font-medium text-ink">{c.old_subject}</span>
-        <span className="text-small text-ink-3">
+        <span className="text-small text-ink-2">
           — {c.predicate_label} →
         </span>
         <span className="text-body font-medium text-ink">
           {c.old_object ?? "?"}
         </span>
         {c.old_valid_from && (
-          <span className="u-num text-small text-ink-3">
+          <span className="u-num text-small text-ink-2">
             ({S.review.conflictSince(c.old_valid_from.slice(0, 10))})
           </span>
         )}
-        <span className="text-small text-ink-3">{S.review.conflictVs}</span>
+        <span className="text-small text-ink-2">{S.review.conflictVs}</span>
         <span className="text-body font-medium text-ink">{c.new_subject}</span>
-        <span className="text-small text-ink-3">
+        <span className="text-small text-ink-2">
           — {c.predicate_label} →
         </span>
         <span className="text-body font-medium text-ink">
           {c.new_object ?? "?"}
         </span>
         {c.new_valid_from && (
-          <span className="u-num text-small text-ink-3">
+          <span className="u-num text-small text-ink-2">
             ({S.review.conflictSince(c.new_valid_from.slice(0, 10))})
           </span>
         )}
@@ -356,17 +367,17 @@ function UnconfirmedRow({
   const range = dateRange(fact.valid_from, fact.valid_to);
 
   return (
-    <div className="glass rounded-xl p-4">
+    <div className="glass rounded-panel p-4">
       <div className="flex items-center gap-2 flex-wrap">
         <span className="text-body font-medium text-ink">
           {fact.subject_name}
         </span>
-        <span className="text-small text-ink-3">
+        <span className="text-small text-ink-2">
           —{" "}
           <span
             className={
               fact.predicate_label === null
-                ? "italic text-ink-3"
+                ? "italic text-ink-2"
                 : undefined
             }
           >
@@ -378,11 +389,11 @@ function UnconfirmedRow({
           {fact.object_name ?? "?"}
         </span>
         {range && (
-          <span className="u-num text-small text-ink-3">({range})</span>
+          <span className="u-num text-small text-ink-2">({range})</span>
         )}
       </div>
       {fact.quote && (
-        <p className="mt-2 text-small text-ink-3 italic line-clamp-2">
+        <p className="mt-2 text-small text-ink-2 italic line-clamp-2">
           “{fact.quote}”
         </p>
       )}
@@ -423,14 +434,14 @@ function MergeRow({
   onRevert: () => void;
 }) {
   return (
-    <div className="glass rounded-xl px-4 py-3 flex items-center gap-3">
+    <div className="glass rounded-panel px-4 py-3 flex items-center gap-3">
       <div className="min-w-0 flex-1">
         <div className="text-body text-ink-2 truncate">
-          <span className="text-ink-3">{merge.source_name}</span>
-          <span className="text-ink-3"> → </span>
+          <span className="text-ink-2">{merge.source_name}</span>
+          <span className="text-ink-2"> → </span>
           <span className="text-ink">{merge.target_name}</span>
         </div>
-        <div className="text-small text-ink-3 truncate">
+        <div className="text-small text-ink-2 truncate">
           {merge.merged_by_name
             ? S.review.mergedBy(merge.merged_by_name)
             : S.review.mergedByAi}
@@ -499,13 +510,13 @@ function AgentRow({
   const trace = d.trace ?? [];
   const hasDetail = precedents.length > 0 || trace.length > 0;
   return (
-    <div className="glass rounded-xl px-4 py-3">
+    <div className="glass rounded-panel px-4 py-3">
       <div className="flex items-center gap-3">
         <Chip tone={AGENT_ACTION_TONE[d.action]}>{S.review.agentActions[d.action]}</Chip>
         <span className="text-body text-ink-2 truncate min-w-0">
           {d.left ?? "?"} ≟ {d.right ?? "?"}
         </span>
-        <span className="u-num text-small text-ink-3 shrink-0">
+        <span className="u-num text-small text-ink-2 shrink-0">
           {Math.round(d.confidence * 100)}%
         </span>
         <Chip tone={AGENT_STATUS_TONE[d.status]} className="ml-auto shrink-0">
@@ -515,12 +526,12 @@ function AgentRow({
       {/* defer 留下的问题（第二刀）：这是给人看的正文，不是注脚 */}
       {d.question && (
         <p className="mt-1 text-body text-ink">
-          <span className="text-ink-3">{S.review.agentAsks} </span>
+          <span className="text-ink-2">{S.review.agentAsks} </span>
           {d.question}
         </p>
       )}
       {(d.reason || hasDetail) && (
-        <div className="mt-1 flex items-center gap-3 text-small text-ink-3">
+        <div className="mt-1 flex items-center gap-3 text-small text-ink-2">
           {d.reason && <span className="truncate min-w-0">{d.reason}</span>}
           {hasDetail && (
             <LinkButton className="shrink-0" onClick={() => setOpen((v) => !v)}>
@@ -535,7 +546,7 @@ function AgentRow({
         </div>
       )}
       {open && hasDetail && (
-        <ul className="mt-2 space-y-1 border-t border-line pt-2 text-small text-ink-3">
+        <ul className="mt-2 space-y-1 border-t border-line pt-2 text-small text-ink-2">
           {precedents.map((p, i) => (
             <li key={`p${i}`} className="truncate">
               {precedentText(p)}
@@ -550,7 +561,7 @@ function AgentRow({
         </ul>
       )}
       <div className="mt-2 flex items-center gap-2">
-        <span className="text-fine text-ink-3">
+        <span className="text-fine text-ink-2">
           {d.decided_by_name
             ? S.review.agentAnsweredBy(d.decided_by_name, (d.decided_at ?? d.created_at).slice(0, 10))
             : d.created_at.slice(0, 10)}
@@ -612,22 +623,22 @@ function DecisionRow({ e }: { e: ReviewHistoryEvent }) {
   else text = `${d.source} → ${d.target}`;
 
   return (
-    <div className="glass rounded-xl px-4 py-3 flex items-center gap-3">
+    <div className="glass rounded-panel px-4 py-3 flex items-center gap-3">
       <Chip tone={DECISION_TONE[e.action] ?? "neutral"}>
         {S.review.decisionActions[e.action] ?? e.action}
       </Chip>
       <span className="text-body text-ink-2 truncate min-w-0">{text}</span>
       {typeof d.confidence === "number" && (
-        <span className="u-num text-small text-ink-3 shrink-0">
+        <span className="u-num text-small text-ink-2 shrink-0">
           {Math.round(d.confidence * 100)}%
         </span>
       )}
       {typeof d.valid_to === "string" && (
-        <span className="u-num text-small text-ink-3 shrink-0">
+        <span className="u-num text-small text-ink-2 shrink-0">
           → {d.valid_to.slice(0, 10)}
         </span>
       )}
-      <span className="ml-auto shrink-0 text-small text-ink-3">
+      <span className="ml-auto shrink-0 text-small text-ink-2">
         {e.actor_name ?? S.review.aiActor}
         {" · "}
         <span className="u-num">{e.created_at.slice(0, 10)}</span>
@@ -667,14 +678,14 @@ function DefectRow({
   const unsatisfiable =
     d.kind === "disjoint_with_ancestor" || d.kind === "inherits_disjoint";
   return (
-    <div className="glass rounded-xl p-3">
+    <div className="glass rounded-panel p-3">
       <div className="flex items-baseline gap-2 flex-wrap">
         <span className="text-body text-danger">{what}</span>
         {d.subject_label && (
           <span className="text-small text-ink-2">{d.subject_label}</span>
         )}
         {d.other_label && (
-          <span className="text-small text-ink-3">↔ {d.other_label}</span>
+          <span className="text-small text-ink-2">↔ {d.other_label}</span>
         )}
       </div>
       {d.path_labels.length > 0 && (
@@ -683,7 +694,7 @@ function DefectRow({
         </div>
       )}
       {unsatisfiable && (
-        <p className="mt-1 text-small text-ink-3">
+        <p className="mt-1 text-small text-ink-2">
           {S.review.defectNeverInstantiable}
         </p>
       )}
@@ -692,12 +703,12 @@ function DefectRow({
           <div>{S.review.rulesDisagreeCount(d.detail.count ?? 0)}</div>
           {rules.map((r, i) => (
             <div key={i}>
-              <div className="text-ink-3">
+              <div className="text-ink-2">
                 {S.review.rulesDisagreeRule(r.rule_a, r.via_a, r.rule_b, r.via_b, r.axiom)}
               </div>
               {r.examples.map(([x, y], j) => (
                 <div key={j} className="pl-3 text-ink-2">
-                  {x} <span className="text-ink-3">·</span> {y}
+                  {x} <span className="text-ink-2">·</span> {y}
                 </div>
               ))}
             </div>
@@ -765,16 +776,16 @@ function ViolationRow({
             { id: v.right_fact, text: v.right_text },
           ];
   return (
-    <div className="glass rounded-xl p-3">
+    <div className="glass rounded-panel p-3">
       <div className="flex items-baseline gap-2 flex-wrap">
         <span className="text-body text-warn">{what}</span>
         {v.predicate && (
-          <span className="text-fine text-ink-3">
+          <span className="text-fine text-ink-2">
             {S.review.violationVia(v.predicate)}
           </span>
         )}
         {v.path_len > 0 && (
-          <span className="text-fine text-ink-3">
+          <span className="text-fine text-ink-2">
             {S.review.violationPath(v.path_len)}
           </span>
         )}
@@ -851,11 +862,11 @@ function ContradictionRow({
           ? S.review.hintUnsure
           : S.review.hintReadBoth;
   return (
-    <div className="glass rounded-xl p-3 border border-[color-mix(in_srgb,var(--u-contest)_35%,transparent)]">
+    <div className="glass rounded-panel p-3 border border-[color-mix(in_srgb,var(--u-contest)_35%,transparent)]">
       <div className="flex items-baseline gap-2 flex-wrap">
         <span className="text-body text-contest">{what}</span>
         {v.predicate && (
-          <span className="text-fine text-ink-3">
+          <span className="text-fine text-ink-2">
             {S.review.violationVia(v.predicate)}
           </span>
         )}
@@ -864,7 +875,7 @@ function ContradictionRow({
         <div className="text-small text-ink-2">
           {S.review.derivedLine(d.subject ?? "?", d.predicate ?? "?", d.object ?? "?")}
           {d.rule && d.via_label && (
-            <span className="ml-2 text-ink-3">
+            <span className="ml-2 text-ink-2">
               {S.review.derivedBy(d.rule, d.via_label)}
             </span>
           )}
@@ -873,7 +884,7 @@ function ContradictionRow({
           {S.review.assertedLine(v.left_text)}
         </div>
       </div>
-      <p className="mt-2 text-small text-ink-3">{hint}</p>
+      <p className="mt-2 text-small text-ink-2">{hint}</p>
       <div className="mt-2 flex gap-2 flex-wrap items-center">
         {/* 不用日期选择器：它逼人给出一个日，而「那年结束的」正是这里常见的答案。
             写多少位就是多少精度（time.ts） */}
@@ -991,7 +1002,7 @@ const PAGE_SIZE: Record<Paged, number> = {
 function RailHeader({ label }: { label: string }) {
   return (
     // 文字从 20 起，与行里的图标同一条线（盒 12 + 行内 8）
-    <GroupLabel className="mx-3 px-2 pt-4 pb-2">{label}</GroupLabel>
+    <GroupLabel className="mx-2 px-3 pt-4 pb-2">{label}</GroupLabel>
   );
 }
 
@@ -1213,6 +1224,10 @@ export function Review() {
   const asDefects = () => rows as OntologyDefect[];
   const asMerges = () => rows as MergeLog[];
   const asAgent = () => rows as AgentDecision[];
+  // agent 正在裁的一对（0025）：任务在跑、这一对标着 adjudicating。批量选页时跳过它们
+  const lockedByAgent = (item: ReviewItem) =>
+    !!c?.agent_running && item.stage === "adjudicating";
+  const selectable = () => asDuplicates().filter((d) => !lockedByAgent(d));
   const queueEmpty = QUEUE_ORDER.every((k) => counts[k] === 0);
 
   // 没带 ?queue= 进来就落在总览上——从前是「第一个非空队列」，那等于替人
@@ -1257,7 +1272,7 @@ export function Review() {
       <aside className={`${RAIL_CLS} flex flex-col overflow-y-auto u-scroll`}>
         {/* 总览在最上面，七档队列直接排在它下面，不另起标题——「队列」这个词
             说的是它们是什么，而人要的是它们有多少 */}
-        <div className="px-3 pt-3 space-y-1">
+        <div className="u-rail-list px-2 pt-3">
           <RailItem
             active={active === "overview"}
             icon={<LayoutDashboard size={14} />}
@@ -1266,7 +1281,7 @@ export function Review() {
             {S.review.railOverview}
           </RailItem>
         </div>
-        <div className="px-3 pt-2 space-y-1">
+        <div className="u-rail-list px-2 pt-1">
           <RailItem
             active={active === "pending"}
             count={counts.pending}
@@ -1320,13 +1335,14 @@ export function Review() {
           <RailItem
             active={active === "agent"}
             count={counts.agent}
+            dot={c?.agent_running ? "bg-warn animate-pulse" : undefined}
             onClick={() => select("agent")}
           >
             {S.review.railAgent}
           </RailItem>
         </div>
         <RailHeader label={S.review.tabHistory} />
-        <div className="px-3 space-y-1">
+        <div className="u-rail-list px-2">
           <RailItem
             active={active === "decisions"}
                         onClick={() => select("decisions")}
@@ -1348,7 +1364,7 @@ export function Review() {
             而口径的决定从来不进 `review_history`（它只捞 review./fact./
             conflict./merge.，口径记的是 mapping.decided）。
             **计数留着**——收件箱该说「有几条等你」，但活在有上下文的那一页干 */}
-        <div className="mt-auto border-t border-line px-3 py-2">
+        <div className="mt-auto border-t border-line px-2 py-2">
           <RailItem
             active={false}
             count={counts.mappings}
@@ -1364,9 +1380,9 @@ export function Review() {
 
       {/* 右侧：一次只显示选中的一类，单一分页 */}
       <div className="flex-1 min-w-0 overflow-y-auto u-scroll px-8 py-6">
-        <div className="max-w-4xl">
+        <div>
           {review.isPending && (
-            <p className="text-body text-ink-3">{S.nav.loading}</p>
+            <p className="text-body text-ink-2">{S.nav.loading}</p>
           )}
           {review.isError && (
             <p className="text-body text-danger">
@@ -1376,13 +1392,7 @@ export function Review() {
 
           {review.data && (
             <section>
-              {/* 页级标题：与 Library/KB Settings 同级（text-title），不是卡片头 */}
-              <h2 className="u-title text-title mb-1">{SECTION[active].title}</h2>
-              {SECTION[active].hint && (
-                <p className="text-small text-ink-3 mb-3">
-                  {SECTION[active].hint}
-                </p>
-              )}
+              <PageHeader title={SECTION[active].title} sub={SECTION[active].hint} />
 
               {/* 空态：整个待办全清 vs 单类清空。**公理这一档除外**——它自己那句要
                   分清「查过、没矛盾」和「还没查过」，通用空态说不出这个差别 */}
@@ -1390,14 +1400,14 @@ export function Review() {
                 active !== "violations" &&
                 active !== "defects" &&
                 counts[active] === 0 && (
-                  <div className="glass rounded-xl p-8 text-center text-body text-ink-3">
+                  <div className="glass rounded-panel p-8 text-center text-body text-ink-2">
                     {queueEmpty ? S.review.empty : S.review.categoryEmpty}
                   </div>
                 )}
 
               {active === "overview" &&
                 (summary.isPending ? (
-                  <p className="text-body text-ink-3">{S.nav.loading}</p>
+                  <p className="text-body text-ink-2">{S.nav.loading}</p>
                 ) : summary.isError ? (
                   <p className="text-body text-danger">
                     {(summary.error as Error).message}
@@ -1443,13 +1453,13 @@ export function Review() {
                     <Checkbox
                       className="ml-auto"
                       checked={
-                        asDuplicates().length > 0 &&
-                        asDuplicates().every((d) => picked.has(d.id))
+                        selectable().length > 0 &&
+                        selectable().every((d) => picked.has(d.id))
                       }
                       onChange={(e) =>
                         setPicked(
                           e.target.checked
-                            ? new Set(asDuplicates().map((d) => d.id))
+                            ? new Set(selectable().map((d) => d.id))
                             : new Set(),
                         )
                       }
@@ -1457,7 +1467,7 @@ export function Review() {
                     />
                     {picked.size > 0 && (
                       <>
-                        <span className="u-num text-small text-ink-3">
+                        <span className="u-num text-small text-ink-2">
                           {S.review.selected(picked.size)}
                         </span>
                         <Button
@@ -1484,7 +1494,7 @@ export function Review() {
                     )}
                   </div>
                   {asDuplicates().length === 0 && (
-                    <div className="glass rounded-xl p-8 text-center text-body text-ink-3">
+                    <div className="glass rounded-panel p-8 text-center text-body text-ink-2">
                       {S.review.typesEmpty}
                     </div>
                   )}
@@ -1492,6 +1502,7 @@ export function Review() {
                     <DuplicateCard
                       key={item.id}
                       item={item}
+                      locked={lockedByAgent(item)}
                       picked={picked.has(item.id)}
                       onPick={(on) =>
                         setPicked((prev) => {
@@ -1605,7 +1616,7 @@ export function Review() {
               {active === "defects" && (
                 <div className="space-y-3">
                   {counts.defects === 0 && (
-                    <div className="glass rounded-xl p-8 text-center text-body text-ink-3">
+                    <div className="glass rounded-panel p-8 text-center text-body text-ink-2">
                       {S.review.categoryEmpty}
                     </div>
                   )}
@@ -1642,7 +1653,7 @@ export function Review() {
                         : S.review.runCheck}
                     </Button>
                     {runCheck.data && (
-                      <span className="text-small text-ink-3">
+                      <span className="text-small text-ink-2">
                         {/* 三种结果说三句话。**`found` 不是要报的数**：
                             重跑会把已裁决的那些重新算出来，说「3 处矛盾」而
                             列表只剩一条，看起来像界面漏了东西 */}
@@ -1657,7 +1668,7 @@ export function Review() {
                     )}
                   </div>
                   {counts.violations === 0 && !runCheck.data && (
-                    <div className="glass rounded-xl p-8 text-center text-body text-ink-3">
+                    <div className="glass rounded-panel p-8 text-center text-body text-ink-2">
                       {S.review.checkNeverRun}
                     </div>
                   )}
@@ -1666,7 +1677,7 @@ export function Review() {
                       key={v.id}
                       className={
                         v.id === search.item
-                          ? "rounded-xl ring-1 ring-contest"
+                          ? "rounded-panel ring-1 ring-contest"
                           : undefined
                       }
                     >
@@ -1689,7 +1700,7 @@ export function Review() {
 
               {active === "agent" &&
                 ((c?.agent_rows ?? 0) === 0 ? (
-                  <div className="glass rounded-xl p-8 text-center text-body text-ink-3">
+                  <div className="glass rounded-panel p-8 text-center text-body text-ink-2">
                     {S.review.agentEmpty}
                     {!kb?.governance && (
                       <>
@@ -1720,7 +1731,7 @@ export function Review() {
 
               {active === "merges" &&
                 (counts.merges === 0 ? (
-                  <div className="glass rounded-xl p-8 text-center text-body text-ink-3">
+                  <div className="glass rounded-panel p-8 text-center text-body text-ink-2">
                     {S.review.historyEmpty}
                   </div>
                 ) : (
@@ -1738,9 +1749,9 @@ export function Review() {
 
               {active === "decisions" &&
                 (history.isPending ? (
-                  <p className="text-body text-ink-3">{S.nav.loading}</p>
+                  <p className="text-body text-ink-2">{S.nav.loading}</p>
                 ) : (history.data?.total ?? 0) === 0 ? (
-                  <div className="glass rounded-xl p-8 text-center text-body text-ink-3">
+                  <div className="glass rounded-panel p-8 text-center text-body text-ink-2">
                     {S.review.decisionsEmpty}
                   </div>
                 ) : (

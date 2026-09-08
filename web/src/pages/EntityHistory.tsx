@@ -20,17 +20,29 @@ const KIND_ICON = {
   rejected: Undo2,
   // 并入不是撤回：内容一字未少地进了另一条断言
   merged: Merge,
+  /* 实体合并：这条轴上最大的一次认识改变——从此它和另一个实体算同一个东西。
+     两个方向共用一个图标，方向写在正文里（"←" 是别人并进来） */
+  merged_in: Merge,
+  merged_away: Merge,
+  merge_reverted: Undo2,
   // 改类不是事实变更：图上的节点换了个类，事实一条没动
   retyped: Tag,
   retype_reverted: Undo2,
 } as const;
 
+/** 实体合并那三种：正文换成对方实体，而不是谓词 + 宾语 */
+const MERGE_KINDS = new Set(["merged_in", "merged_away", "merge_reverted"]);
+
 const KIND_TONE: Record<string, string> = {
-  asserted: "text-ink-3",
+  asserted: "text-ink-2",
   corrected: "text-warn",
   rejected: "text-danger",
-  merged: "text-ink-3",
-  retyped: "text-ink-3",
+  merged: "text-ink-2",
+  merged_in: "text-ink-2",
+  merged_away: "text-ink-2",
+  // 撤销与「改类被撤销」同一档：做过、又收回了
+  merge_reverted: "text-warn",
+  retyped: "text-ink-2",
   retype_reverted: "text-warn",
 };
 
@@ -85,29 +97,38 @@ function EventRow({ e }: { e: EntityHistoryEvent }) {
   const Icon = KIND_ICON[e.kind] ?? FileText;
   const note = intervalNote(e);
   return (
-    <div className="flex gap-3 px-2 py-2">
-      <Icon size={13} className={`mt-1 shrink-0 ${KIND_TONE[e.kind] ?? ""}`} />
+    <div className="flex gap-2 px-2 py-2">
+      <Icon size={12} className={`mt-1 shrink-0 ${KIND_TONE[e.kind] ?? ""}`} />
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline gap-2 flex-wrap">
-          <span className="text-fine font-medium text-ink-2">
+          <span className="text-small font-medium text-ink-2">
             {S.graph.historyKind[e.kind] ?? e.kind}
           </span>
-          {note && <span className="u-num text-fine text-ink-3">{note}</span>}
+          {note && <span className="u-num text-fine text-ink-2">{note}</span>}
         </div>
         {/* 改类事件没有谓词也没有宾语，正文换成类的两端。
             起点为空 = 从「未分类」改过来，0009 之后最常见的一种 */}
         {e.kind === "retyped" || e.kind === "retype_reverted" ? (
-          <div className="mt-1 text-small text-ink-2 truncate">
-            <span className="text-ink-3">
+          <div className="mt-1 text-body text-ink-2 truncate">
+            <span className="text-small text-ink-2">
               {e.from_type_label ?? S.graph.untyped} →{" "}
             </span>
             <span className="text-ink">{e.to_type_label}</span>
           </div>
+        ) : MERGE_KINDS.has(e.kind) ? (
+          /* 合并事件的正文只有对方。**箭头指方向**：并进来是「←」，
+             并出去是「→」，与上面事实那一行的读法一致 */
+          <div className="mt-1 text-body text-ink-2 truncate">
+            <span className="text-small text-ink-2">
+              {e.kind === "merged_away" ? "→ " : "← "}
+            </span>
+            <span className="text-ink">{e.other_name ?? S.graph.historyGoneEntity}</span>
+          </div>
         ) : (
-          <div className="mt-1 text-small text-ink-2 truncate">
-            <span className="text-ink-3">
+          <div className="mt-1 text-body text-ink-2 truncate">
+            <span className="text-small text-ink-2">
               {e.direction === "in" ? "← " : ""}
-              <span className={e.predicate_label === null ? "italic text-ink-3" : undefined}>
+              <span className={e.predicate_label === null ? "italic text-ink-2" : undefined}>
                 {e.predicate_label ?? S.graph.unknownPredicate}
               </span>
               {e.direction === "in" ? "" : " →"}
@@ -115,7 +136,7 @@ function EventRow({ e }: { e: EntityHistoryEvent }) {
             <span className="text-ink">{objectText(e)}</span>
           </div>
         )}
-        <div className="mt-1 flex items-center gap-2 text-fine text-ink-3">
+        <div className="mt-1 flex items-center gap-2 text-fine text-ink-2">
           <span className="u-num">{ymd(e.at)}</span>
           <span>·</span>
           {/* 归因：人名，或引擎（抽取写入 / 时态对账自动闭合） */}
@@ -149,14 +170,14 @@ export function EntityHistory({ kbId, entityId }: { kbId: string; entityId: stri
   });
 
   const total = q.data?.total ?? 0;
-  if (q.isPending) return <p className="p-2 text-body text-ink-3">{S.nav.loading}</p>;
+  if (q.isPending) return <p className="p-2 text-body text-ink-2">{S.nav.loading}</p>;
   // 只有"一条都没有"才是空。记录轴上首次断言本身就是一次事件——
   // "我们何时、从哪份文档得知这件事"是这条轴要回答的问题的一半
-  if (total === 0) return <p className="p-2 text-small text-ink-3">{S.graph.historyEmpty}</p>;
+  if (total === 0) return <p className="p-2 text-small text-ink-2">{S.graph.historyEmpty}</p>;
 
   return (
     <div>
-      <p className="px-2 pb-2 text-fine text-ink-3">{S.graph.historyHint}</p>
+      <p className="px-2 pb-2 text-fine text-ink-2">{S.graph.historyHint}</p>
       <div className="divide-y divide-line">
         {/* key 里用 fact_id ?? at：改类事件没有 fact_id */}
         {(q.data?.events ?? []).map((e) => (

@@ -93,6 +93,10 @@ export const en = {
     /* 网页标题用的短名：`Utopia | Persona` */
     titleTag: "Persona",
     profile: "Profile",
+    cancel: "Cancel",
+    colLastUsed: "Last used",
+    colCreated: "Created",
+    pickBases: "Search bases…",
     administration: "Administration",
     adminChip: "Admin",
     backToApp: "← Back to app",
@@ -109,6 +113,7 @@ export const en = {
     language: "Language",
     kbsNav: "Knowledge bases",
     kbsTitle: "Knowledge bases",
+    kbsFilter: "Filter by name…",
     kbOpen: "Open",
     kbRestricted: "Restricted",
     kbStats: (docs: number, members: number) =>
@@ -130,8 +135,7 @@ export const en = {
     tokenScope: "Scope",
     scopeRead: "Read",
     scopeWrite: "Write",
-    scopeHint:
-      "Effective rights are your own role ∩ this scope. Write is a ceiling, not a grant: a viewer's write token still cannot write.",
+    scopeHint: "A ceiling, not a grant — a token never does more than you can.",
     tokenKbs: "Knowledge bases",
     kbsAllHint: "Nothing selected means every base you can open.",
     tokenExpires: "Expires",
@@ -242,6 +246,8 @@ export const en = {
   nav: {
     workspaceLabel: "Workspace",
     kbLabel: "Knowledge base",
+    findKb: "Find a knowledge base…",
+    noKbMatch: "No knowledge base matches",
     ask: "Chat",
     askHint: "Converse with your knowledge base — it can remember",
     search: "Search",
@@ -701,6 +707,7 @@ export const en = {
     stop: "Stop",
     thinking: "Thinking…",
     newChat: "New chat",
+    recent: "Recent",
     untitled: "Untitled",
     noConversations: "No conversations yet.",
     deleteConversation: "Delete conversation",
@@ -855,10 +862,17 @@ export const en = {
       rejected: "Withdrawn",
       /* 并入另一条断言：内容一字未少，不是撤回 */
       merged: "Merged into an existing fact",
+      /* 实体合并。**两个方向分开说**——「吸收了谁」和「被谁吸收」在图上
+         是两件事，回滚也是按方向做的 */
+      merged_in: "Another entity was merged into this one",
+      merged_away: "Merged into another entity",
+      merge_reverted: "Merge undone",
       /* 改的是节点上的类,一条事实都没动 */
       retyped: "Type changed",
       retype_reverted: "Type change undone",
     } as Record<string, string>,
+    /* 对方实体已经不在了（库被清理过）：合并事件仍然要列出来 */
+    historyGoneEntity: "an entity that is gone",
     historyEngine: "engine",
     /* 有效区间的变化：修正后区间闭合到某个时点 */
     historyClosedAt: (t: string) => `closed at ${t}`,
@@ -941,6 +955,7 @@ export const en = {
     tabMembers: "Users",
     tabKbs: "Knowledge bases",
     tabDeployment: "Deployment",
+    cardAccounts: "Accounts",
     newUser: "Create user",
     initialPassword: "Initial password (min. 8 characters)",
     createUserBtn: "Create",
@@ -990,6 +1005,27 @@ export const en = {
         "databricks://:TOKEN@host/sql/1.0/warehouses/ID?catalog=main\n" +
         "snowflake://:TOKEN@account.snowflakecomputing.com/DB/SCHEMA?warehouse=WH",
       add: "Add data source",
+      newTitle: "New data source",
+      engine: "Engine",
+      engineRaw: "Connection string",
+      optional: "(optional)",
+      testConn: "Test connection",
+      testing: "Testing…",
+      colConn: "Connection",
+      colStatus: "Status",
+      grantsNoneShort: "Not granted",
+      grantsCount: (n: number) => (n === 1 ? "1 workspace" : `${n} workspaces`),
+      fHost: "Host",
+      fPort: "Port",
+      fDatabase: "Database",
+      fUser: "User",
+      fPassword: "Password",
+      fCatalog: "Catalog",
+      fSchema: "Schema",
+      fToken: "Token",
+      fWarehouse: "Warehouse",
+      fWarehouseId: "Warehouse ID",
+      fAccount: "Account host",
       test: "Test",
       testOk: "Connected",
       testFail: "Failed",
@@ -998,7 +1034,7 @@ export const en = {
       empty: "No data sources registered yet. Register one below.",
       grants: "Available to",
       grantsHint:
-        "Which workspaces may use this source. **Once granted, KB admins in those workspaces choose whether to mount it** — " +
+        "Which workspaces may use this source. Once granted, KB admins in those workspaces choose whether to mount it — " +
         "this controls what they can reach, not what they have mounted.",
       grantsNone:
         "Not granted to any workspace — no knowledge base can mount it.",
@@ -1017,8 +1053,8 @@ export const en = {
       defaultChip: "Default",
       newKb: "New knowledge base",
       packsLabel: "Bundled ontologies",
-      packsHint:
-        "Optional. Packs declare direction, so subject and object cannot come out reversed. More can be imported later.",
+      packsHint: "Optional, and more can be imported later.",
+      packsPick: "Search packs…",
       packsNone: "None — start from the ten seed relations",
       packsCount: (c: number, p: number) => `${c} classes · ${p} properties`,
       name: "Name",
@@ -1390,10 +1426,11 @@ export const en = {
     schemaScopeTopHint:
       "No class has instances yet, so the top two levels are drawn. Pick any other class in the rail to add it.",
     schemaClosePanel: "Close",
-    // 面板里的三段：定义（表单）/ 属性（关系 + 字面值字段）/ 实例。
-    // 用页面自己的词——左栏就叫 Classes / Properties
+    // 面板里的四段：定义（表单）/ 关系（边）/ 属性（字面值字段）/ 实例。
+    // 关系和属性是两种东西——左栏的 Properties 只列关系，属性挂在类下
     schemaTabDefinition: "Definition",
-    schemaTabProperties: "Properties",
+    schemaTabRelations: "Relations",
+    schemaTabAttributes: "Attributes",
     schemaTabInstances: "Instances",
     schemaAddRelationship: "New relationship…",
     schemaCheckDefects: (n: number) =>
@@ -1401,12 +1438,12 @@ export const en = {
         ? "1 new ontology issue from this change"
         : `${n} new ontology issues from this change`,
     schemaCheckReview: "Review",
-    schemaRelationships: "Relationships",
     /** 画布上并成一条的关系边写的字 */
     schemaBundle: (n: number) => `${n} relations`,
     schemaOutgoing: "From this class",
     schemaIncoming: "To this class",
     schemaNoRelationships: "No relationships yet.",
+    schemaNoInstances: "No instances yet.",
     schemaConnectHint: "Connect using an existing relationship",
     schemaConnectPlaceholder: "Search relationships…",
     schemaConnectAs: "As",
@@ -1532,6 +1569,10 @@ export const en = {
     overviewAgentOverridden: (n: number) =>
       n === 1 ? "1 overridden, last 30 days" : `${n} overridden, last 30 days`,
     overviewAgentReverted: "Reverted by you",
+    overviewAgentRunning: (n: number) =>
+      n === 0 ? "The agent is working on its last cluster" : `The agent is working · ${n} pairs still to look at`,
+    overviewAgentQueue: (n: number) => (n === 1 ? "1 pair waiting for the agent" : `${n} pairs waiting for the agent`),
+    agentDeciding: "The agent is deciding this pair",
     // 总览（#377）
     overviewTitle: "Overview",
     overviewHint:
@@ -1792,6 +1833,16 @@ export const en = {
     requeued: (n: number) =>
       n === 1 ? "1 job back in the queue" : `${n} jobs back in the queue`,
     /* 语料语言。措辞要把"这不是界面语言"讲清楚，否则一定有人当成界面开关 */
+    cardIdentity: "Name and description",
+    cardIdentityNote:
+      "Up to 64 characters. This is the name in the switcher and at the top of every page of this base.",
+    cardVisibilityNote:
+      "Open means everyone in the deployment can read this base. Restricted means only the people listed under Members.",
+    cardVisibilityFoot: "Takes effect immediately. Roles granted under Members are kept either way.",
+    cardAutomation: "What runs on its own",
+    cardAutomationNote:
+      "Applies from the next extraction on. Everything these do is listed and can be undone.",
+    cardJobs: "Background jobs",
     ontologyLang: "Language of this ontology",
     ontologyLangNote:
       "Which language class and relation descriptions are written in. Those go straight " +
@@ -1859,6 +1910,7 @@ export const en = {
       "Only the people listed here can see this knowledge base, and their role decides " +
       "what they can change. Deployment admins always have access.",
     addMember: "Add…",
+    addMemberTitle: "Add member",
     roles: { viewer: "Viewer", editor: "Editor", admin: "Admin" },
     remove: "Remove",
     noMembers: "No per-KB roles set.",
@@ -1886,8 +1938,16 @@ export const en = {
     deactivatedHint:
       "They cannot sign in and do not appear in any member list. What they did is still attributed to them — that is why the account is kept rather than deleted.",
     reactivate: "Restore",
+    roleLabel: "Role",
+    filterAll: "All users",
+    filterAllRoles: "All roles",
+    statusLabel: "Status",
+    filterActive: "Active",
+    filterDeactivated: "Deactivated",
     deactivateConfirm: (name: string) =>
       `Deactivate ${name}? They lose access everywhere. Their past decisions stay on record.`,
+    addExisting: "Add existing user",
+    userLabel: "User",
     pickUser: "Select a user to add…",
     add: "Add",
     roles: {

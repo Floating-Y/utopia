@@ -4,7 +4,7 @@ import { Link, useNavigate, useParams, useSearch } from "@tanstack/react-router"
 import { api, type ChunkFact } from "../api";
 import { S } from "../i18n";
 import { useKbId } from "../kb";
-import { GroupLabel, Pager, pageSlice } from "../ui";
+import { GroupLabel, PageHeader, Pager, pageSlice } from "../ui";
 import { SourcesRail } from "./SourcesRail";
 
 const DOC_PAGE = 12;
@@ -58,7 +58,7 @@ export function DocViewer() {
   }, [detail.data, chunk]);
 
   if (detail.isPending)
-    return <div className="p-8 text-body text-ink-3">{S.doc.loading}</div>;
+    return <div className="p-8 text-body text-ink-2">{S.doc.loading}</div>;
   if (detail.isError)
     return (
       <div className="p-8 text-body text-danger">
@@ -80,21 +80,23 @@ export function DocViewer() {
         onSelect={(sel) => navigate({ to: "/kb/$kbId/library", params: { kbId }, search: { src: sel } })}
       />
       <div className="flex-1 min-w-0 overflow-y-auto u-scroll">
-        {/* 靠左排，与文库列表同一个内距（px-8 py-6），不居中；上限放宽到 6xl，
-            分块那一栏才有地方摊开——原来 4xl 居中，减掉右边的抽取栏只剩六百来像素 */}
-        <div className="max-w-6xl px-8 py-6">
-        <div className="mb-4 flex items-baseline justify-between gap-4">
-          <div>
-            <h2 className="text-title font-semibold text-ink break-all">{doc.filename}</h2>
-            <p className="mt-1 text-small text-ink-3">
+        {/* 靠左排，与文库列表同一个内距（px-8 py-6），铺满栏右的整个宽度：
+            分块那一栏和右边的抽取栏一起摊开 */}
+        <div className="px-8 py-6">
+        <PageHeader
+          title={doc.filename}
+          sub={
+            <>
               {chunks.length} {S.doc.sections} · {(doc.size_bytes / 1024).toFixed(0)} KB ·{" "}
               {new Date(doc.created_at).toLocaleDateString()}
-            </p>
-          </div>
-          <Link to="/kb/$kbId/library" params={{ kbId }} className="u-link shrink-0 text-body">
-            {S.doc.backToLibrary}
-          </Link>
-        </div>
+            </>
+          }
+          actions={
+            <Link to="/kb/$kbId/library" params={{ kbId }} className="u-link shrink-0 text-body">
+              {S.doc.backToLibrary}
+            </Link>
+          }
+        />
 
         <div className="space-y-3">
           {pagedChunks.map((c) => {
@@ -103,11 +105,11 @@ export function DocViewer() {
             return (
               <div key={c.id} ref={hit ? highlightRef : undefined} className="flex gap-3">
                 <div
-                  className={`u-chunk flex-1 min-w-0 rounded-xl border p-4 text-body leading-relaxed whitespace-pre-wrap border-line ${
+                  className={`u-chunk flex-1 min-w-0 rounded-panel border p-4 text-body leading-relaxed whitespace-pre-wrap border-line ${
                     hit && flash ? "u-flash" : "bg-surface"
                   }`}
                 >
-                  <div className="mb-2 text-small text-ink-3">
+                  <div className="mb-2 text-small text-ink-2">
                     {S.doc.section} {c.seq + 1}
                     {hit && (
                       <span
@@ -124,7 +126,7 @@ export function DocViewer() {
 
                 {/* 抽取对照栏：这个分块产出了哪些事实（实体可跳图谱） */}
                 {facts.length > 0 && (
-                  <aside className="w-64 shrink-0 rounded-xl border border-line bg-surface p-3">
+                  <aside className="w-64 shrink-0 rounded-panel border border-line bg-surface p-3">
                     <GroupLabel className="mb-2" count={facts.length}>
                       {S.doc.extracted}
                     </GroupLabel>
@@ -145,8 +147,8 @@ export function DocViewer() {
                               <span
                                 className={
                                   f.predicate === null
-                                    ? "italic text-ink-3"
-                                    : "text-ink-3"
+                                    ? "italic text-ink-2"
+                                    : "text-ink-2"
                                 }
                                 title={
                                   f.predicate && f.inferred
@@ -170,7 +172,7 @@ export function DocViewer() {
                                 <span className="text-ink-2">{f.object ?? ""}</span>
                               )}
                             </div>
-                            {range && <div className="u-num text-fine text-ink-3">{range}</div>}
+                            {range && <div className="u-num text-fine text-ink-2">{range}</div>}
                           </div>
                         );
                       })}

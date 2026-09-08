@@ -8,7 +8,7 @@
 // 搬的是界面不是逻辑：判断一条口径对不对要看得见表结构，而那在这一页。
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Database, History, Pencil, Plus } from "lucide-react";
+import { Database, Plus } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
 import { api, type ConceptMapping } from "../api";
 import { S } from "../i18n";
@@ -93,13 +93,13 @@ export function Mappings() {
     <div className="p-6 max-w-4xl mx-auto space-y-4">
       <div>
         <PageTitle>{S.mapping.title}</PageTitle>
-        <p className="mt-1 text-small text-ink-3">{S.mapping.hint}</p>
+        <p className="mt-1 text-small text-ink-2">{S.mapping.hint}</p>
       </div>
 
       {/* 分段控件用全站那一套（`bg-surface-3` 选中 + 静默的未选中），
           不是 `u-btn-primary`——那是主操作的实心白，用在这里每个标签都像
           一个行动号召 */}
-      <div className="flex w-fit rounded-lg overflow-hidden border border-line">
+      <div className="flex w-fit rounded-control overflow-hidden border border-line">
         {(["definitions", "sources"] as const).map((t) => (
           <Button
             variant={tab === t ? "primary" : "ghost"}
@@ -119,7 +119,7 @@ export function Mappings() {
       ) : (
         <>
           <div className="flex items-center gap-2 flex-wrap">
-            <div className="flex rounded-lg overflow-hidden border border-line">
+            <div className="flex rounded-control overflow-hidden border border-line">
               {FILTERS.map((f) => (
                 <Button
                   variant={status === f.key ? "primary" : "ghost"}
@@ -137,7 +137,7 @@ export function Mappings() {
                         "u-num",
                         status === f.key
                           ? "text-ink-2"
-                          : "text-ink-3",
+                          : "text-ink-2",
                       )}
                     >
                       {f.n}
@@ -159,7 +159,7 @@ export function Mappings() {
           </div>
 
           {status === "rejected" && (
-            <p className="text-small text-ink-3">{S.mapping.rejectedHint}</p>
+            <p className="text-small text-ink-2">{S.mapping.rejectedHint}</p>
           )}
 
           {data.isPending ? (
@@ -173,9 +173,11 @@ export function Mappings() {
               </EmptyState>
             </div>
           ) : (
-            <div className="space-y-2">
+            /* 一个面板装多行，不是一行一张卡片（DESIGN.md 6）：这一页是
+               一队待表态的口径，同构的一组，跟文库、检索、成员一副样子 */
+            <div className="glass rounded-panel divide-y divide-line">
               {data.data?.items.map((m) => (
-                <MappingCard
+                <MappingRow
                   key={m.id}
                   kbId={kb.id}
                   mapping={m}
@@ -198,7 +200,7 @@ export function Mappings() {
 
 /** 一条口径。**未表态的才给确认/拒绝两个按钮**——已表过态的给「编辑」，
  *  因为改口径和第一次拍板是两件事：前者要留痕（revisions），后者不用。 */
-function MappingCard({
+function MappingRow({
   kbId,
   mapping: m,
   onChanged,
@@ -219,12 +221,12 @@ function MappingCard({
 
   const how = howComputed(m);
   return (
-    <div className="glass rounded-xl p-3">
+    <div className="px-4 py-3">
       <div className="flex items-baseline gap-2 flex-wrap">
         <span className="text-body text-ink">{m.concept_name}</span>
-        <span className="text-fine text-ink-3">{m.source}</span>
+        <span className="text-fine text-ink-2">{m.source}</span>
         {m.unit && (
-          <span className="text-fine text-ink-3">[{m.unit}]</span>
+          <span className="text-fine text-ink-2">[{m.unit}]</span>
         )}
         {m.derived && (
           <Chip tone="warn" className="text-fine">
@@ -240,13 +242,13 @@ function MappingCard({
       <div
         className={cn(
           "mt-1 u-num text-small break-all",
-          how ? "text-ink-2" : "text-ink-3",
+          how ? "text-ink-2" : "text-ink-2",
         )}
       >
         {how ?? S.mapping.noDefinition}
       </div>
       {m.summary && (
-        <p className="mt-1 text-small text-ink-3">{m.summary}</p>
+        <p className="mt-1 text-small text-ink-2">{m.summary}</p>
       )}
 
       {editing ? (
@@ -260,35 +262,30 @@ function MappingCard({
           onCancel={() => setEditing(false)}
         />
       ) : (
-        <div className="mt-2 flex items-center gap-2 flex-wrap">
+        /* 行里的动作：拍板那一下是个按钮，其余是链接。**十一行十一个实底
+           按钮**（原来「确认」是 primary）等于把一页都染成动作，而一屏最多
+           一个 primary。拒绝是点了就生效的那种，所以它红（同成员页的移出） */
+        <div className="mt-2 flex items-center gap-3 flex-wrap">
           {m.status === "proposed" && (
             <>
               <Button variant="secondary" size="sm"
-                disabled={decide.isPending}
-                onClick={() => decide.mutate("rejected")}
-              >
-                {S.mapping.reject}
-              </Button>
-              <Button variant="primary" size="sm"
                 disabled={decide.isPending}
                 onClick={() => decide.mutate("confirmed")}
               >
                 {S.mapping.approve}
               </Button>
+              <LinkButton
+                tone="danger"
+                onClick={() => !decide.isPending && decide.mutate("rejected")}
+              >
+                {S.mapping.reject}
+              </LinkButton>
             </>
           )}
-          <Button variant="secondary" size="sm" className="flex items-center gap-1"
-            onClick={() => setEditing(true)}
-          >
-            <Pencil size={11} />
-            {S.mapping.edit}
-          </Button>
-          <Button variant="secondary" size="sm" className="flex items-center gap-1"
-            onClick={() => setShowHistory((v) => !v)}
-          >
-            <History size={11} />
+          <LinkButton onClick={() => setEditing(true)}>{S.mapping.edit}</LinkButton>
+          <LinkButton onClick={() => setShowHistory((v) => !v)}>
             {S.mapping.history}
-          </Button>
+          </LinkButton>
         </div>
       )}
 
@@ -337,7 +334,7 @@ function EditForm({
     mono = false,
   ) => (
     <label className="block">
-      <span className="text-fine text-ink-3">{label}</span>
+      <span className="text-fine text-ink-2">{label}</span>
       <Input
         size="sm"
         className={cn("mt-1 w-full", mono && "u-num")}
@@ -349,7 +346,7 @@ function EditForm({
 
   return (
     <div className="mt-3 space-y-2 border-t border-line pt-3">
-      <p className="text-fine text-ink-3">{S.mapping.editTitle}</p>
+      <p className="text-fine text-ink-2">{S.mapping.editTitle}</p>
       <div className="grid grid-cols-2 gap-2">
         {field(S.mapping.fieldTable, table, setTable, true)}
         {field(S.mapping.fieldUnit, unit, setUnit)}
@@ -410,20 +407,20 @@ function RevisionList({
   const list = revs.data?.revisions ?? [];
   return (
     <div className="mt-3 border-t border-line pt-3 space-y-2">
-      <p className="text-fine text-ink-3">{S.mapping.historyHint}</p>
+      <p className="text-fine text-ink-2">{S.mapping.historyHint}</p>
       {list.length === 0 ? (
-        <p className="text-small text-ink-3">{S.mapping.historyEmpty}</p>
+        <p className="text-small text-ink-2">{S.mapping.historyEmpty}</p>
       ) : (
         list.map((r) => {
           const b = r.before;
           const was = (b.sql ?? b.expr ?? b.table_name) as string | null;
           return (
             <div key={r.id} className="text-small">
-              <div className="text-ink-3">
+              <div className="text-ink-2">
                 {S.mapping.historyBy(
                   r.changed_by_name ?? S.mapping.historyUnknown,
                 )}
-                <span className="u-num ml-2 text-ink-3">
+                <span className="u-num ml-2 text-ink-2">
                   {r.changed_at.slice(0, 16).replace("T", " ")}
                 </span>
               </div>
@@ -508,14 +505,14 @@ function DataSources({
 
   return (
     <div className="space-y-4">
-      <p className="text-small text-ink-3">{S.mapping.sourcesHint}</p>
+      <p className="text-small text-ink-2">{S.mapping.sourcesHint}</p>
 
-      <div className="glass rounded-xl divide-y divide-line">
+      <div className="glass rounded-panel divide-y divide-line">
         {(mounted.data?.data_sources ?? []).map((d) => (
           <div key={d.id} className="px-4 py-3 flex items-center gap-3">
             <div className="min-w-0 flex-1">
               <div className="text-body text-ink">{d.name}</div>
-              <div className="text-small text-ink-3 u-num truncate">
+              <div className="text-small text-ink-2 u-num truncate">
                 {d.summary}
               </div>
             </div>
@@ -536,7 +533,7 @@ function DataSources({
           </div>
         ))}
         {!hasMounted && (
-          <p className="px-4 py-6 text-body text-ink-3">
+          <p className="px-4 py-6 text-body text-ink-2">
             {S.mapping.sourcesEmpty}
           </p>
         )}
@@ -580,15 +577,15 @@ function DataSources({
         mountable.length === 0 &&
         available.data &&
         !hasMounted && (
-          <p className="text-small text-ink-3">
+          <p className="text-small text-ink-2">
             {S.mapping.sourcesNoneAvailable}
           </p>
         )
       )}
 
       {hasMounted && (
-        <div className="glass rounded-xl px-4 py-3 flex items-center gap-3">
-          <p className="text-small text-ink-3 flex-1">
+        <div className="glass rounded-panel px-4 py-3 flex items-center gap-3">
+          <p className="text-small text-ink-2 flex-1">
             {S.mapping.exploreHint}
           </p>
           <Button variant="secondary" size="sm" className="shrink-0"

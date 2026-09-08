@@ -24,12 +24,16 @@ import {
   LinkButton,
   Loading,
   localDateTime,
-  NativeSelect,
   Pager,
   RAIL_CLS,
+  type RowTone,
   Row,
   SearchSelect,
   Segmented,
+  SettingsCard,
+  PageHeader,
+  Dialog,
+  Field,
 } from "../ui";
 
 const KB_ROLES = [
@@ -53,6 +57,22 @@ function rolesFor(isOpen: boolean) {
 }
 
 type Section = "general" | "members" | "activity" | "danger";
+
+/** 一张设置卡的保存：**只送自己那几项**。PATCH 本来就是部分更新，把整张表
+    一起送过去，等于用改名字的那一下覆盖别人刚改的开关。四张卡各自一个
+    mutation，于是"在存""存好了"也各是各的。 */
+function useKbPatch(kbId: string, onError: (m: string | null) => void) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (patch: Record<string, unknown>) => api.updateKb(kbId, patch),
+    onSuccess: () => {
+      onError(null);
+      queryClient.invalidateQueries({ queryKey: ["kbOne", kbId] });
+      queryClient.invalidateQueries({ queryKey: ["kbs"] });
+    },
+    onError: (e) => onError((e as Error).message),
+  });
+}
 
 export function KbSettings() {
   const navigate = useNavigate();
@@ -111,30 +131,11 @@ export function KbSettings() {
     }
   }, [kb.data]);
 
-  const invalidate = () => {
-    queryClient.invalidateQueries({ queryKey: ["kbOne", kbId] });
-    queryClient.invalidateQueries({ queryKey: ["kbs"] });
-  };
-
-  const save = useMutation({
-    mutationFn: () =>
-      api.updateKb(kbId!, {
-        name: name.trim(),
-        description: desc.trim() || null,
-        visibility,
-        auto_extend_ontology: autoExtend,
-        materialize_inferences: materialize,
-        auto_type_resolution: autoResolve,
-        governance,
-        inference_interval_minutes: inferMins,
-        ontology_lang: ontoLang,
-      }),
-    onSuccess: () => {
-      setError(null);
-      invalidate();
-    },
-    onError: (e) => setError((e as Error).message),
-  });
+  // 四张卡，四个保存：改名字那一下不该把下面的开关一起送上去
+  const saveIdentity = useKbPatch(kbId!, setError);
+  const saveVisibility = useKbPatch(kbId!, setError);
+  const saveAutomation = useKbPatch(kbId!, setError);
+  const saveLang = useKbPatch(kbId!, setError);
 
   const removeKb = useMutation({
     mutationFn: () => api.deleteKb(kbId!),
@@ -153,19 +154,34 @@ export function KbSettings() {
       </div>
     );
 
-  const lbl = "block text-small font-medium text-ink-3 mb-1";
+  const lbl = "block text-small font-medium text-ink-2 mb-1";
+
+  /* 每张卡自己的"改过没有"：按钮亮不亮说的是这张卡里的东西动没动，
+     所以拿本地状态跟服务端最新的那份逐项比，而不是记一个全局的脏位 */
+  const identityDirty =
+    name.trim() !== kb.data.name ||
+    desc.trim() !== (kb.data.description ?? "");
+  const visibilityDirty = visibility !== kb.data.visibility;
+  const automationDirty =
+    autoExtend !== kb.data.auto_extend_ontology ||
+    materialize !== kb.data.materialize_inferences ||
+    autoResolve !== kb.data.auto_type_resolution ||
+    governance !== kb.data.governance ||
+    inferMins !== kb.data.inference_interval_minutes;
+  const langDirty = ontoLang !== kb.data.ontology_lang;
 
   const isDefault = kb.data.is_default;
   const sections: {
     key: Section;
     label: string;
     Icon: typeof Settings2;
-    danger?: boolean;
+    tone?: RowTone;
   }[] = [
     { key: "general", label: S.kbset.general, Icon: Settings2 },
     { key: "members", label: S.kbset.members, Icon: Users },
     { key: "activity", label: S.kbset.activity, Icon: HistoryIcon },
-    // 默认库不可删除：danger 节整个不出现
+    // 默认库不可删除：danger 节整个不出现。入口用警示色：这一条只是去往危险区，
+    // 真正删库的那个按钮才是危险色
     ...(isDefault
       ? []
       : [
@@ -173,7 +189,7 @@ export function KbSettings() {
             key: "danger" as Section,
             label: S.kbset.danger,
             Icon: TriangleAlert,
-            danger: true,
+            tone: "warn" as const,
           },
         ]),
   ];
@@ -181,13 +197,13 @@ export function KbSettings() {
   return (
     <div className="h-full flex">
       {/* 分节导航：未来的抽取设置/保留策略/令牌等在此扩展 */}
-      <aside className={`${RAIL_CLS} p-3 space-y-1`}>
-        {sections.map(({ key, label, Icon, danger }) => (
+      <aside className={`${RAIL_CLS} u-rail-list px-2 py-3`}>
+        {sections.map(({ key, label, Icon, tone }) => (
           <Row
             key={key}
             density="nav"
             active={section === key}
-            danger={danger}
+            tone={tone}
             icon={<Icon size={14} />}
             onClick={() => setSection(key)}
           >
@@ -197,144 +213,208 @@ export function KbSettings() {
       </aside>
 
       <main className="flex-1 min-w-0 overflow-y-auto u-scroll px-8 py-6">
-        <div className="max-w-xl space-y-6">
+        {/* 设置是读一列字段，不是铺一张桌子：内容居中限宽，行长不随窗口拉长 */}
+        <div className="mx-auto w-full max-w-4xl">
           {/* 不缀库名：顶栏切换器已标明当前库 */}
-          <h2 className="u-title text-title">{S.kbset.title}</h2>
+          <PageHeader title={S.kbset.title} />
 
           {section === "general" && (
-            <div className="glass rounded-xl p-4 space-y-3">
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className={lbl}>{S.settings.kbs.name}</label>
-                  <Input className="w-full"
-                    value={name}
-                    onChange={(e) => setName(e.target.value)}
-                  />
-                </div>
-                <div>
-                  <label className={lbl}>{S.settings.kbs.visibility}</label>
-                  {isDefault ? (
-                    /* 默认库锁 open：说明常驻可见（藏在 hover 里等于没解释）,详情见 grid 下方整行 */
-                    <div className="flex items-center gap-2 rounded-lg border border-line px-3 py-2 text-fine text-ink-3 cursor-not-allowed">
-                      <Lock size={11} className="shrink-0 text-ink-3" />
-                      {S.kbset.defaultOpenLabel}
-                    </div>
-                  ) : (
-                    <Segmented
-                      fill
-                      size="sm"
-                      value={visibility}
-                      onChange={setVisibility}
-                      options={(
-                        [
-                          ["open", "Open"],
-                          ["restricted", S.settings.kbs.visRestricted],
-                        ] as const
-                      ).map(([v, label]) => ({ value: v, label, title: label }))}
+            /* Vercel 设置页那种排法：一张卡是一个保存单位。从前这一节是一张
+               长表加末尾一个保存——改个名字要连着四个开关一起送上去，而
+               "存好了"也说不清存的是哪一件 */
+            <div className="space-y-4">
+              <SettingsCard
+                title={S.kbset.cardIdentity}
+                note={S.kbset.cardIdentityNote}
+                action={
+                  <>
+                    {saveIdentity.isSuccess && !identityDirty && (
+                      <span className="text-small text-ink-2">{S.kbset.saved}</span>
+                    )}
+                    <Button variant="secondary" size="sm"
+                      disabled={!name.trim() || !identityDirty || saveIdentity.isPending}
+                      onClick={() =>
+                        saveIdentity.mutate({
+                          name: name.trim(),
+                          // 空串才是"清空描述"：null 在服务端是 COALESCE 的
+                          // "这项不改"，把描述删干净会悄悄地什么都没发生
+                          description: desc.trim(),
+                        })
+                      }
+                    >
+                      {S.kbset.save}
+                    </Button>
+                  </>
+                }
+              >
+                <div className="space-y-3">
+                  <div>
+                    <label className={lbl}>{S.settings.kbs.name}</label>
+                    <Input className="w-full"
+                      value={name}
+                      onChange={(e) => setName(e.target.value)}
                     />
-                  )}
+                  </div>
+                  <div>
+                    <label className={lbl}>{S.settings.kbs.description}</label>
+                    <Input className="w-full"
+                      value={desc}
+                      onChange={(e) => setDesc(e.target.value)}
+                    />
+                  </div>
                 </div>
-              </div>
-              {isDefault && (
-                <p className="text-small leading-relaxed text-ink-3">
-                  {S.kbset.defaultOpenNote}
-                </p>
-              )}
-              <div>
-                <label className={lbl}>{S.settings.kbs.description}</label>
-                <Input className="w-full"
-                  value={desc}
-                  onChange={(e) => setDesc(e.target.value)}
-                />
-              </div>
-              {/* 自动扩本体：默认开，因为新库的十个默认关系不是任何人选的。
-                  说明里要讲清关掉之后失去的**只是**代劳，不是留意 */}
-              <Checkbox
-                className="pt-1"
-                checked={autoExtend}
-                onChange={(e) => setAutoExtend(e.target.checked)}
-                label={S.kbset.autoExtend}
-                hint={S.kbset.autoExtendNote}
-              />
-              {/* 物化推理：**默认关**，与上面那个相反。自动扩本体动的是词表，
-                  这个动的是账本——它按公理往图里写事实，而声明可能是错的 */}
-              <Checkbox
-                className="pt-1"
-                checked={materialize}
-                onChange={(e) => setMaterialize(e.target.checked)}
-                label={S.kbset.materialize}
-                hint={S.kbset.materializeNote}
-              />
-              {/* 类型消解自动跑：抽完排一轮，只自动改子树内精化的那一档，跨轴的仍留给人 */}
-              <Checkbox
-                className="pt-1"
-                checked={autoResolve}
-                onChange={(e) => setAutoResolve(e.target.checked)}
-                label={S.kbset.autoResolveTypes}
-                hint={S.kbset.autoResolveTypesNote}
-              />
-              {/* 治理（0025）：agent 按先进先出过等人的重复对，先读台账里人的先例再裁。
-                  说明里要讲清三件事：读的是这个库的人的决定、合并要有先例撑着、
-                  关掉队列就停 */}
-              <Checkbox
-                className="pt-1"
-                checked={governance}
-                onChange={(e) => setGovernance(e.target.checked)}
-                label={S.kbset.governance}
-                hint={S.kbset.governanceNote}
-              />
-              {/* 重推间隔。**只在开着的时候露出来**——关着时它不影响任何事，
-                  摆在那里只会让人以为设了就会推 */}
-              {materialize && (
-                <div className="pl-6 flex items-center gap-2">
-                  <label className="text-small text-ink-3">
-                    {S.kbset.inferEvery}
-                  </label>
-                  <Input size="sm" className="w-24 u-num"
-                    type="number"
-                    min={5}
-                    max={10080}
-                    value={inferMins}
-                    onChange={(e) => setInferMins(Number(e.target.value))}
-                  />
-                  <span className="text-small text-ink-3">
-                    {S.kbset.minutes}
-                  </span>
-                  {kb.data.last_inference_at && (
-                    <span className="text-fine text-ink-3">
-                      {S.kbset.lastInference(
-                        new Date(kb.data.last_inference_at).toLocaleString(),
+              </SettingsCard>
+
+              {/* 默认库的可见性是锁死的：卡还在（这个库确实有可见性这件事），
+                  但底栏没有保存——没有可改的东西就不摆一个按钮 */}
+              <SettingsCard
+                title={S.settings.kbs.visibility}
+                hint={isDefault ? S.kbset.defaultOpenNote : S.kbset.cardVisibilityNote}
+                note={isDefault ? undefined : S.kbset.cardVisibilityFoot}
+                action={
+                  isDefault ? undefined : (
+                    <>
+                      {saveVisibility.isSuccess && !visibilityDirty && (
+                        <span className="text-small text-ink-2">{S.kbset.saved}</span>
                       )}
-                    </span>
+                      <Button variant="secondary" size="sm"
+                        disabled={!visibilityDirty || saveVisibility.isPending}
+                        onClick={() => saveVisibility.mutate({ visibility })}
+                      >
+                        {S.kbset.save}
+                      </Button>
+                    </>
+                  )
+                }
+              >
+                {isDefault ? (
+                  <div className="flex w-fit items-center gap-2 rounded-control border border-line px-3 py-2 text-fine text-ink-2">
+                    <Lock size={11} className="shrink-0 text-ink-2" />
+                    {S.kbset.defaultOpenLabel}
+                  </div>
+                ) : (
+                  <Segmented
+                    size="sm"
+                    className="w-fit"
+                    value={visibility}
+                    onChange={setVisibility}
+                    options={(
+                      [
+                        ["open", "Open"],
+                        ["restricted", S.settings.kbs.visRestricted],
+                      ] as const
+                    ).map(([v, label]) => ({ value: v, label, title: label }))}
+                  />
+                )}
+              </SettingsCard>
+
+              <SettingsCard
+                title={S.kbset.cardAutomation}
+                note={S.kbset.cardAutomationNote}
+                action={
+                  <>
+                    {saveAutomation.isSuccess && !automationDirty && (
+                      <span className="text-small text-ink-2">{S.kbset.saved}</span>
+                    )}
+                    <Button variant="secondary" size="sm"
+                      disabled={!automationDirty || saveAutomation.isPending}
+                      onClick={() =>
+                        saveAutomation.mutate({
+                          auto_extend_ontology: autoExtend,
+                          materialize_inferences: materialize,
+                          auto_type_resolution: autoResolve,
+                          governance,
+                          inference_interval_minutes: inferMins,
+                        })
+                      }
+                    >
+                      {S.kbset.save}
+                    </Button>
+                  </>
+                }
+              >
+                <div className="space-y-3">
+                  {/* 自动扩本体：默认开，因为新库的十个默认关系不是任何人选的。
+                      说明里要讲清关掉之后失去的**只是**代劳，不是留意 */}
+                  <Checkbox
+                    checked={autoExtend}
+                    onChange={(e) => setAutoExtend(e.target.checked)}
+                    label={S.kbset.autoExtend}
+                    hint={S.kbset.autoExtendNote}
+                  />
+                  {/* 物化推理：**默认关**，与上面那个相反。自动扩本体动的是词表，
+                      这个动的是账本——它按公理往图里写事实，而声明可能是错的 */}
+                  <Checkbox
+                    checked={materialize}
+                    onChange={(e) => setMaterialize(e.target.checked)}
+                    label={S.kbset.materialize}
+                    hint={S.kbset.materializeNote}
+                  />
+                  {/* 重推间隔。**只在开着的时候露出来**——关着时它不影响任何事，
+                      摆在那里只会让人以为设了就会推 */}
+                  {materialize && (
+                    <div className="pl-6 flex flex-wrap items-center gap-2">
+                      <label className="text-small text-ink-2">
+                        {S.kbset.inferEvery}
+                      </label>
+                      <Input size="sm" className="w-24 u-num"
+                        type="number"
+                        min={5}
+                        max={10080}
+                        value={inferMins}
+                        onChange={(e) => setInferMins(Number(e.target.value))}
+                      />
+                      <span className="text-small text-ink-2">{S.kbset.minutes}</span>
+                      {kb.data.last_inference_at && (
+                        <span className="text-fine text-ink-2">
+                          {S.kbset.lastInference(
+                            new Date(kb.data.last_inference_at).toLocaleString(),
+                          )}
+                        </span>
+                      )}
+                    </div>
                   )}
+                  {/* 类型消解自动跑：抽完排一轮，只自动改子树内精化的那一档，跨轴的仍留给人 */}
+                  <Checkbox
+                    checked={autoResolve}
+                    onChange={(e) => setAutoResolve(e.target.checked)}
+                    label={S.kbset.autoResolveTypes}
+                    hint={S.kbset.autoResolveTypesNote}
+                  />
+                  {/* 治理（0025）：agent 按先进先出过等人的重复对，先读台账里人的先例再裁。
+                      说明里要讲清三件事：读的是这个库的人的决定、合并要有先例撑着、
+                      关掉队列就停 */}
+                  <Checkbox
+                    checked={governance}
+                    onChange={(e) => setGovernance(e.target.checked)}
+                    label={S.kbset.governance}
+                    hint={S.kbset.governanceNote}
+                  />
                 </div>
-              )}
-              {/* 失败的任务（#216）：有才露出来。「再跑一遍」把这个库里全部 failed 放回队列 */}
-              {failedJobs.data && failedJobs.data.failed > 0 && (
-                <div className="flex items-center gap-2">
-                  <span className="text-small text-ink-2">
-                    {S.kbset.failedJobs(failedJobs.data.failed)}
-                  </span>
-                  <Button variant="secondary" size="sm"
-                    disabled={requeue.isPending}
-                    onClick={() => requeue.mutate()}
-                  >
-                    {S.kbset.requeue}
-                  </Button>
-                </div>
-              )}
+              </SettingsCard>
+
               {/* 语料语言。**不是界面语言**——类描述逐字进抽取提示词，
                   读者是正在读这些文档的模型，所以它跟文档走不跟读者走 */}
-              <div className="pt-1">
-                <span className="block text-body text-ink">
-                  {S.kbset.ontologyLang}
-                </span>
-                <span className="mt-1 block text-small leading-relaxed text-ink-3">
-                  {S.kbset.ontologyLangNote}
-                </span>
+              <SettingsCard
+                title={S.kbset.ontologyLang}
+                hint={S.kbset.ontologyLangNote}
+                action={
+                  <>
+                    {saveLang.isSuccess && !langDirty && (
+                      <span className="text-small text-ink-2">{S.kbset.saved}</span>
+                    )}
+                    <Button variant="secondary" size="sm"
+                      disabled={!langDirty || saveLang.isPending}
+                      onClick={() => saveLang.mutate({ ontology_lang: ontoLang })}
+                    >
+                      {S.kbset.save}
+                    </Button>
+                  </>
+                }
+              >
                 <Segmented
                   size="sm"
-                  className="mt-2 w-fit"
+                  className="w-fit"
                   value={ontoLang}
                   onChange={setOntoLang}
                   options={(["en", "zh"] as const).map((l) => ({
@@ -342,20 +422,24 @@ export function KbSettings() {
                     label: LANG_NAMES[l],
                   }))}
                 />
-              </div>
-              <div className="flex items-center gap-3">
-                <Button variant="primary" size="sm"
-                  disabled={!name.trim() || save.isPending}
-                  onClick={() => save.mutate()}
-                >
-                  {S.kbset.save}
-                </Button>
-                {save.isSuccess && (
-                  <span className="text-small text-ink-2">
-                    {S.kbset.saved}
-                  </span>
-                )}
-              </div>
+              </SettingsCard>
+
+              {/* 失败的任务（#216）：有才露出来。这张卡没有"保存"——它不是设置，
+                  是一个动作：把这个库里全部 failed 放回队列 */}
+              {failedJobs.data && failedJobs.data.failed > 0 && (
+                <SettingsCard
+                  title={S.kbset.cardJobs}
+                  note={S.kbset.failedJobs(failedJobs.data.failed)}
+                  action={
+                    <Button variant="secondary" size="sm"
+                      disabled={requeue.isPending}
+                      onClick={() => requeue.mutate()}
+                    >
+                      {S.kbset.requeue}
+                    </Button>
+                  }
+                />
+              )}
             </div>
           )}
 
@@ -366,12 +450,12 @@ export function KbSettings() {
           {section === "activity" && <KbActivity kbId={kbId} />}
 
           {section === "danger" && (
-            <div className="glass rounded-xl px-6 py-4 flex items-center justify-between gap-4">
+            <div className="glass rounded-panel px-6 py-4 flex items-center justify-between gap-4">
               <div className="min-w-0">
                 <div className="text-body font-medium text-ink">
                   {S.kbset.deleteRowTitle}
                 </div>
-                <div className="mt-1 text-small text-ink-3">
+                <div className="mt-1 text-small text-ink-2">
                   {S.kbset.deleteRowHint}
                 </div>
               </div>
@@ -448,27 +532,27 @@ function KbActivity({ kbId }: { kbId: string }) {
   };
 
   return (
-    <div className="glass rounded-xl p-4">
-      <p className="text-small text-ink-3 mb-3">{S.kbset.activityHint}</p>
-      <div className="mb-3 flex flex-wrap items-center gap-2">
-        <NativeSelect size="sm"
+    <div className="space-y-3">
+      {/* 筛这份台账的控件在卡外面（DESIGN.md 6）：它们不是台账的内容，
+          而且筛空了的时候那张卡要能变成空态，不能把改筛选的唯一办法一起带走 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Dropdown
+          size="sm"
+          className="w-48"
           value={action}
-          onChange={(e) => reset(() => setAction(e.target.value))}
-        >
-          <option value="">{S.kbset.auditAllActions}</option>
-          {actions.map((a) => (
-            <option key={a} value={a}>
-              {a}
-            </option>
-          ))}
-        </NativeSelect>
+          onChange={(v) => reset(() => setAction(v))}
+          options={[
+            { value: "", label: S.kbset.auditAllActions },
+            ...actions.map((a) => ({ value: a, label: a })),
+          ]}
+        />
         <Input size="sm" className="u-num"
           type="date"
           value={since}
           title={S.kbset.auditSince}
           onChange={(e) => reset(() => setSince(e.target.value))}
         />
-        <span className="text-small text-ink-3">→</span>
+        <span className="text-small text-ink-2">→</span>
         <Input size="sm" className="u-num"
           type="date"
           value={until}
@@ -488,22 +572,23 @@ function KbActivity({ kbId }: { kbId: string }) {
             {S.kbset.auditClear}
           </Button>
         )}
-        <span className="ml-auto u-num text-fine text-ink-3">
+        <span className="ml-auto u-num text-fine text-ink-2">
           {S.kbset.auditTotal(total)}
         </span>
       </div>
+      <SettingsCard title={S.kbset.activity} hint={S.kbset.activityHint}>
       {audit.isPending ? (
-        <p className="text-small text-ink-3">{S.nav.loading}</p>
+        <p className="text-small text-ink-2">{S.nav.loading}</p>
       ) : events.length === 0 ? (
-        <p className="text-small text-ink-3">{S.kbset.activityEmpty}</p>
+        <p className="text-small text-ink-2">{S.kbset.activityEmpty}</p>
       ) : (
-        <div className="space-y-1">
+        <div className="divide-y divide-line">
           {events.map((e) => (
             <div
               key={e.id}
-              className="flex items-baseline gap-3 py-2 text-body"
+              className="flex items-baseline gap-3 py-2 text-body first:pt-0"
             >
-              <span className="u-num shrink-0 text-fine text-ink-3">
+              <span className="u-num shrink-0 text-fine text-ink-2">
                 {localDateTime(e.created_at)}
               </span>
               <span className="min-w-0 truncate">
@@ -515,7 +600,7 @@ function KbActivity({ kbId }: { kbId: string }) {
                         ? S.kbset.adjudicator
                         : S.kbset.engine)}
                 </span>{" "}
-                <span className="text-ink-3">
+                <span className="text-ink-2">
                   {S.kbset.auditActions[e.action] ?? e.action}
                 </span>
                 {auditDetailName(e) && (
@@ -530,6 +615,7 @@ function KbActivity({ kbId }: { kbId: string }) {
         </div>
       )}
       <Pager total={total} pageSize={AUDIT_PAGE} page={page} onPage={setPage} />
+      </SettingsCard>
     </div>
   );
 }
@@ -541,6 +627,7 @@ function KbMembers({ kbId, isOpen }: { kbId: string; isOpen: boolean }) {
     queryFn: () => api.kbMembers(kbId),
   });
   const orgUsers = useQuery({ queryKey: ["orgUsers"], queryFn: api.orgUsers });
+  const [adding, setAdding] = useState(false);
   const [addUserId, setAddUserId] = useState("");
   // open 库连 viewer 这个选项都没有，默认值得跟着走
   const [addRole, setAddRole] = useState(isOpen ? "editor" : "viewer");
@@ -576,64 +663,97 @@ function KbMembers({ kbId, isOpen }: { kbId: string; isOpen: boolean }) {
   if (members.isError) return null;
 
   return (
-    <div className="glass rounded-xl p-4">
-      <p className="text-small text-ink-3 mb-3">
-        {isOpen ? S.kbset.membersHintOpen : S.kbset.membersHintRestricted}
-      </p>
-
-      {members.data && listed.length === 0 && (
-        <p className="text-small text-ink-3 mb-3">
+    <>
+    {/* 一张卡：上面是名单，底栏是一个「加人」按钮——与部署那边的用户管理
+        同一副排法。**加人是偶尔一次的动作**，一个常驻的选人器摆在名单底下，
+        读起来像还没填好的第 N 个成员，而且它和名单本身抢同一块地方 */}
+    <SettingsCard
+      title={S.kbset.members}
+      hint={isOpen ? S.kbset.membersHintOpen : S.kbset.membersHintRestricted}
+      action={
+        <Button variant="secondary" size="sm" onClick={() => setAdding(true)}>
+          {S.kbset.addMemberTitle}
+        </Button>
+      }
+    >
+      {members.data && listed.length === 0 ? (
+        <p className="text-small text-ink-2">
           {isOpen ? S.kbset.noWriters : S.kbset.noMembers}
         </p>
+      ) : (
+        /* 一人一行，行与行之间一条线：名字与邮箱是同一个人的两件事，
+           挨着读；能改的（角色）和会拆掉的（移除）都在右边 */
+        <div className="divide-y divide-line">
+          {listed.map((m) => (
+            <div key={m.user_id} className="flex items-center gap-3 py-3 first:pt-0">
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-body text-ink">{m.display_name}</div>
+                <div className="truncate text-small text-ink-2">{m.email}</div>
+              </div>
+              <Dropdown
+                size="sm"
+                className="w-24"
+                value={m.role}
+                onChange={(role) => setMember.mutate({ userId: m.user_id, role })}
+                options={rolesFor(isOpen)}
+              />
+              <LinkButton tone="danger" onClick={() => remove.mutate(m.user_id)}>
+                {S.kbset.remove}
+              </LinkButton>
+            </div>
+          ))}
+        </div>
       )}
-      {listed.map((m) => (
-        <div key={m.user_id} className="flex items-center gap-3 py-2">
-          <div className="min-w-0 flex-1">
-            <span className="text-body text-ink">{m.display_name}</span>
-            <span className="ml-2 text-small text-ink-3">{m.email}</span>
-          </div>
+    </SettingsCard>
+
+    {/* 把一个已有账号加进这个库。**picker 在弹窗里也仍然常驻**：没人可加时
+        它自己会说（SearchSelect 有 noMatches 空态），控件消失读作"坏了" */}
+    <Dialog
+      open={adding}
+      onOpenChange={setAdding}
+      title={S.kbset.addMemberTitle}
+      closeLabel={S.ui.close}
+      footer={
+        <>
+          <Button variant="secondary" size="sm" onClick={() => setAdding(false)}>
+            {S.members.cancel}
+          </Button>
+          <Button variant="primary" size="sm"
+            disabled={!addUserId || setMember.isPending}
+            onClick={() => {
+              setMember.mutate({ userId: addUserId, role: addRole });
+              setAdding(false);
+            }}
+          >
+            {S.members.add}
+          </Button>
+        </>
+      }
+    >
+      <div className="grid grid-cols-2 gap-3">
+        <Field label={S.members.userLabel} className="mb-0">
+          <SearchSelect
+            className="w-full"
+            value={addUserId}
+            onChange={setAddUserId}
+            placeholder={S.kbset.addMember}
+            options={addable.map((u) => ({
+              value: u.id,
+              label: u.display_name,
+              hint: u.email,
+            }))}
+          />
+        </Field>
+        <Field label={S.members.roleLabel} className="mb-0">
           <Dropdown
-            size="sm"
-            className="w-24"
-            value={m.role}
-            onChange={(role) => setMember.mutate({ userId: m.user_id, role })}
+            className="w-full"
+            value={addRole}
+            onChange={setAddRole}
             options={rolesFor(isOpen)}
           />
-          <LinkButton tone="danger" onClick={() => remove.mutate(m.user_id)}>
-            {S.kbset.remove}
-          </LinkButton>
-        </div>
-      ))}
-
-      {/* **picker 常驻**，不按"有没有人可加"来显示或隐藏。
-          一个时有时无的控件比一个空着的控件更让人困惑——不见了的第一反应是
-          功能坏了，而不是"没人可加"。空列表由 SearchSelect 自己说
-          （它有 noMatches 空态），这里不必再加一句话 */}
-      <div className="mt-3 flex gap-2 items-center border-t border-line pt-3">
-        <SearchSelect
-          className="flex-1"
-          value={addUserId}
-          onChange={setAddUserId}
-          placeholder={S.kbset.addMember}
-          options={addable.map((u) => ({
-            value: u.id,
-            label: u.display_name,
-            hint: u.email,
-          }))}
-        />
-        <Dropdown
-          className="w-24"
-          value={addRole}
-          onChange={setAddRole}
-          options={rolesFor(isOpen)}
-        />
-        <Button variant="primary" size="sm"
-          disabled={!addUserId || setMember.isPending}
-          onClick={() => setMember.mutate({ userId: addUserId, role: addRole })}
-        >
-          {S.members.add}
-        </Button>
+        </Field>
       </div>
-    </div>
+    </Dialog>
+    </>
   );
 }

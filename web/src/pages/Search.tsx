@@ -9,6 +9,7 @@ import {
   Input,
   Pager,
   pageSlice,
+  ROW_HOVER,
 } from "../ui";
 import { NextStep, nextStep, useReadiness } from "./NextStep";
 
@@ -79,24 +80,25 @@ export function Search() {
           </div>
         )}
 
-        {results.isFetching && <p className="text-body text-ink-3">{S.search.searching}</p>}
+        {results.isFetching && <p className="text-body text-ink-2">{S.search.searching}</p>}
         {results.isError && (
           <p className="text-body text-danger">{(results.error as Error).message}</p>
         )}
         {results.data && results.data.results.length === 0 && (
-          <p className="text-body text-ink-3">{S.search.noResults}</p>
+          <p className="text-body text-ink-2">{S.search.noResults}</p>
         )}
 
-        <div className="space-y-3">
+        {/* 一个面板装多行（DESIGN.md 6）：悬停归行，槽不响应指针 */}
+        <div className="glass rounded-panel divide-y divide-line">
           {pageSlice(results.data?.results ?? [], page, RESULT_PAGE).rows.map((r) => (
             <Link
               key={r.id}
               to="/kb/$kbId/doc/$docId"
               params={{ kbId, docId: r.document_id }}
               search={{ chunk: r.id }}
-              className="block glass rounded-xl p-4 glass-hover"
+              className={`block p-4 ${ROW_HOVER}`}
             >
-              <div className="mb-2 text-small text-ink-3">
+              <div className="mb-2 text-small text-ink-2">
                 {S.search.chunkOf(r.filename, r.seq + 1)}
               </div>
               <p className="text-body text-ink-2 leading-relaxed line-clamp-4 whitespace-pre-wrap">

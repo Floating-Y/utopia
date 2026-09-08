@@ -30,7 +30,11 @@ import { EdgeCurvedArrowProgram } from "@sigma/edge-curve";
 import { NodeSquareShellProgram } from "./squareShellProgram";
 import {
   drawHoverCard,
-  drawPillLabel,
+  CANVAS_FONT,
+  CANVAS_LABEL_SIZE,
+  CANVAS_TEXT,
+  CANVAS_TEXT_2,
+  drawNodeLabel,
   drawWorldGrid,
   mix,
   MUTED_SHELL,
@@ -676,19 +680,26 @@ export function OntologySchemaGraph({
       },
       enableEdgeEvents: true,
       minEdgeThickness: MIN_EDGE_THICKNESS,
-      labelFont: '"Geist", "Inter", "Noto Sans SC", sans-serif',
-      labelSize: 11,
-      labelColor: { color: "#e5e5e5" },
-      labelRenderedSizeThreshold: 6,
-      labelDensity: 0.7,
-      labelGridCellSize: 140,
+      labelFont: CANVAS_FONT,
+      labelSize: CANVAS_LABEL_SIZE,
+      labelColor: { color: CANVAS_TEXT },
+      /* 标签按距离出没——离得远只看形状，走近了才认名字。**试过不按距离**
+         （阈值归零、只按拥挤程度筛）：缩远之后一百多个名字铺开互相压字，
+         读不出也点不准。
+         阈值 5、每 130px 见方留 0.8 个：只比原先松半档。**放宽到 3 / 1.2 试过
+         一轮，一屏上百个名字铺开，太吵**——这里要的是「远处认得出几个地标」，
+         不是「每个点都报名字」。放大时 sigma 自己按 1/ratio² 放开这个上限
+         （见 `getLabelsToDisplay`），越走近露得越全，不封顶 */
+      labelRenderedSizeThreshold: 5,
+      labelDensity: 0.8,
+      labelGridCellSize: 130,
       minCameraRatio: 0.05,
       maxCameraRatio: 6,
-      edgeLabelSize: 10,
+      edgeLabelSize: CANVAS_LABEL_SIZE,
       // 与 /graph 的边标签同一个灰；只有关系边挂标签，有字的就是关系边
-      edgeLabelColor: { color: "#a3a3a3" },
-      edgeLabelFont: '"Geist", "Inter", sans-serif',
-      defaultDrawNodeLabel: drawPillLabel,
+      edgeLabelColor: { color: CANVAS_TEXT_2 },
+      edgeLabelFont: CANVAS_FONT,
+      defaultDrawNodeLabel: drawNodeLabel,
       defaultDrawNodeHover: drawHoverCard,
       nodeReducer: (node, attrs) => {
         const res = { ...attrs };
@@ -720,6 +731,8 @@ export function OntologySchemaGraph({
             res.size = Math.max(base * 1.02, 9.2);
             res.ringColor = mix(ownColor, "#ffffff", RING_SELECT_MIX);
             res.forceLabel = true;
+            // 选中的那一个补一块底（同 /graph）
+            res.labelSlab = true;
             res.zIndex = 3;
             return res;
           }
@@ -916,7 +929,7 @@ export function OntologySchemaGraph({
     <div className="h-full relative">
       {/* 顶部悬浮条：图例 + 取景 + 未限定关系入口。没有搜索框——找东西走左栏 */}
       <div className="absolute top-3 left-3 right-3 z-10 flex items-start gap-2 pointer-events-none">
-        <div className="pointer-events-auto flex flex-wrap gap-2 pt-1">
+        <div className="pointer-events-auto flex flex-wrap gap-2">
           {/* 静态图例：三种边各自的说法，不是可切换的过滤器——本体的边远比
               实例图少，藏一种边省下的空间不值得多一层交互 */}
           {(
@@ -928,7 +941,7 @@ export function OntologySchemaGraph({
           ).map(([label, color]) => (
             <span
               key={label}
-              className="glass rounded-full px-3 py-1 text-fine flex items-center gap-2 text-ink-2"
+              className="glass rounded-cell px-3 py-1 text-fine flex items-center gap-2 text-ink-2"
             >
               <span className="h-0.5 w-3 rounded-full" style={{ background: color }} />
               {label}
@@ -945,7 +958,7 @@ export function OntologySchemaGraph({
                   : S.ontology.schemaScopeInUseHint
               }
             >
-              <span className="glass rounded-full px-3 py-1 text-fine flex items-center text-ink-2">
+              <span className="glass rounded-cell px-3 py-1 text-fine flex items-center text-ink-2">
                 {S.ontology.schemaMoreClasses(scope.hidden)}
               </span>
             </Tooltip>
@@ -966,13 +979,13 @@ export function OntologySchemaGraph({
               {unscopedPop.open && (
                 <div
                   ref={unscopedPop.panelRef}
-                  className="u-menu-glass absolute left-0 top-0 z-50 w-64 overflow-hidden rounded-xl p-2 shadow-2xl"
+                  className="u-menu-glass absolute left-0 top-0 z-50 w-64 overflow-hidden rounded-overlay p-2 shadow-2xl"
                 >
                   <Pill className="mb-2 w-full" onClick={() => unscopedPop.close()}>
                     {S.ontology.schemaUnscoped(schema.unscoped.length)}
-                    <X size={11} className="ml-auto text-ink-3" />
+                    <X size={11} className="ml-auto text-ink-2" />
                   </Pill>
-                  <p className="px-2 pb-2 text-fine leading-relaxed text-ink-3">
+                  <p className="px-2 pb-2 text-fine leading-relaxed text-ink-2">
                     {S.ontology.schemaUnscopedHint}
                   </p>
                   <div className="flex max-h-64 flex-col overflow-y-auto">
@@ -1027,7 +1040,7 @@ export function OntologySchemaGraph({
 
       {empty && (
         <div className="absolute inset-0 grid place-items-center pointer-events-none">
-          <div className="text-center text-body text-ink-3 max-w-xs">
+          <div className="text-center text-body text-ink-2 max-w-xs">
             {S.ontology.schemaEmpty}
           </div>
         </div>

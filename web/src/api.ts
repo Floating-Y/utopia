@@ -467,6 +467,10 @@ export interface ReviewCounts {
   agent: number;
   /** agent 的全部记录（Agent 队列翻页用） */
   agent_rows: number;
+  /** 这个库的 govern 任务此刻在跑 */
+  agent_running: boolean;
+  /** 还没轮到 agent 看的对 */
+  agent_queue: number;
 }
 
 /** 类型消解的一条建议：一个待精化的实体、送去检索的画像、以及候选类。
@@ -787,7 +791,7 @@ export interface AgentWindow {
 /** 审核台总览（#377）：等着办的、办过的、库的成色。与左栏计数同一套口径 */
 export interface ReviewSummary {
   /** agent 在这个库里做过什么（0025） */
-  agent: { open: number; last_7d: AgentWindow; last_30d: AgentWindow };
+  agent: { running: boolean; queue: number; open: number; last_7d: AgentWindow; last_30d: AgentWindow };
   waiting: Record<
     "pending" | "duplicates" | "conflicts" | "unconfirmed" | "lowconf" | "violations" | "defects",
     QueueWait
@@ -903,6 +907,11 @@ export interface EntityHistoryEvent {
     | "corrected"
     | "rejected"
     | "merged"
+    /** 别人并进了它：事实搬到它名下 */
+    | "merged_in"
+    /** 它并进了别人：这个 id 从此不再单独存在 */
+    | "merged_away"
+    | "merge_reverted"
     | "retyped"
     | "retype_reverted";
   direction: "out" | "in" | null;
@@ -1279,6 +1288,12 @@ export const api = {
   revokeToken: (tokenId: string) =>
     request<{ ok: boolean }>(`/api/v1/me/tokens/${tokenId}`, { method: "DELETE" }),
   workspaces: () => request<Workspace[]>("/api/v1/workspaces"),
+  /** 这个工作区，以及**我在里面是什么角色**。建库要 Admin+（见 api/kbs.rs
+   *  的 create），而 `GET /workspaces` 那份列表不带角色 */
+  workspaceRole: (workspaceId: string) =>
+    request<{ workspace: Workspace; role: string }>(
+      `/api/v1/workspaces/${workspaceId}`,
+    ),
 
   kbs: (workspaceId: string) =>
     request<Kb[]>(`/api/v1/workspaces/${workspaceId}/kbs`),
@@ -1427,6 +1442,13 @@ export const api = {
     request<{ ok: boolean }>(`/api/v1/admin/data-sources/${id}`, {
       method: "DELETE",
     }),
+  /** 存之前先试一次：**不落库**。回来的是 ok，连不上时还有一句原因——
+   *  密码错、库名拼错、端口不通是三件不同的事 */
+  adminTestConnString: (conn_string: string) =>
+    request<{ ok: boolean; engine?: string; error?: string }>(
+      "/api/v1/admin/data-sources/test",
+      { method: "POST", body: JSON.stringify({ conn_string }) },
+    ),
   adminTestDataSource: (id: string) =>
     request<{ ok: boolean }>(`/api/v1/admin/data-sources/${id}/test`, {
       method: "POST",
