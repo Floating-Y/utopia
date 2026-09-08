@@ -994,7 +994,20 @@ export const zh: Strings = {
       "一条规则读一个实体自己的属性，得出一个类或一个值。判据由你写下——模型不会提议。" +
       "规则得出的结论是派生的：它不会盖掉断言，它带着让它成立的那几条读数，读数变了它自己退场。",
     rulesEmpty: "还没有规则。",
+    rulesNoMatch: "没有规则匹配。",
+    ruleSearch: "搜索规则、属性、取值",
     ruleNew: "新建规则",
+    ruleNeedsAttribute:
+      "规则判的是属性的值，而这个本体还没有属性。先打开一个类，在「属性」里加一个。",
+    ruleNeedsClass: "先建一个类——规则得出的就是一个类。",
+    ruleColRule: "规则",
+    ruleColDerived: "推出",
+    ruleColStatus: "状态",
+    ruleAnd: "并且",
+    ruleWhere: "满足",
+    ruleDropCondition: "删掉这个条件",
+    ruleOperandPlaceholder: (kind: string) =>
+      kind === "set" ? "气测异常, 效应后气测异常" : kind === "range" ? "8 - 12" : "12.0",
     ruleName: "名称",
     ruleNamePlaceholder: "含气井",
     ruleDescription: "它是什么意思（选填）",

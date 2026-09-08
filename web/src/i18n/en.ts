@@ -1113,7 +1113,29 @@ export const en = {
       "You write the criteria — the model never proposes one. " +
       "What a rule concludes is derived: it never replaces an asserted fact, it carries the readings that made it true, and it retires by itself when they change.",
     rulesEmpty: "No rules yet.",
+    rulesNoMatch: "No rule matches that.",
+    /** 搜的是整条规则，不只是名字——判据里的谓词和值也在里面 */
+    ruleSearch: "Search rules, attributes, values",
     ruleNew: "New rule",
+    /* 按不下去时必须说清为什么。**一条规则判的是属性的值**，没有属性就无从写起——
+       而一个灰着的按钮不解释，读者只会以为坏了 */
+    ruleNeedsAttribute:
+      "A rule tests an attribute's value, and this ontology has none yet. Open a class and add one under Attributes.",
+    ruleNeedsClass: "Add a class first — a rule concludes one.",
+    ruleColRule: "Rule",
+    ruleColDerived: "Derived",
+    ruleColStatus: "Status",
+    /* 条件之间是合取。**写「并且」而不是一个点号**——符号读不出「全都要成立」，
+       而那正是规则最容易被误读的地方 */
+    ruleAnd: "and",
+    ruleWhere: "where",
+    ruleDropCondition: "Remove this condition",
+    ruleOperandPlaceholder: (kind: string): string =>
+      kind === "set"
+        ? "gas anomaly, post-effect gas anomaly"
+        : kind === "range"
+          ? "8 - 12"
+          : "12.0",
     ruleName: "Name",
     ruleNamePlaceholder: "Gas-bearing well",
     ruleDescription: "What it means (optional)",
