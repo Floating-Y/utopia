@@ -32,6 +32,7 @@ import {
 // 这个文件只管把实例与事实投影成一张图、说清楚每个节点是什么颜色
 import {
   attachDrag,
+  deferToHoverLayer,
   hoveredNode,
   mutedNode,
   neighborNode,
@@ -843,15 +844,23 @@ export function Graph() {
           res.hidden = true;
           return res;
         }
-        if (hoverRef.current === node) return hoveredNode(res, attrs, base);
         const hov = hoverRef.current;
         // 选中实体可能不在当前画布（侧栏跳转/邻域重载间隙）——不在则跳过聚焦压暗逻辑
         const sel =
           selectedRef.current && g.hasNode(selectedRef.current)
             ? selectedRef.current
             : null;
+        /* **选中压过指到**。这两句从前是反的：指针一落到自己刚选中的那个节点上，
+           它就改画 hover 那一副，选中的记号（反色底牌、加粗的名字）当场消失——
+           而人把指针移过去，往往正因为那是他选的那一个。
+           指到别的节点仍然照常出 hover */
+        if (sel === node) {
+          const picked = selectedNode(res, attrs, base);
+          // 选中的这一个同时被指着：名字改由高亮层画，标签层让开
+          return hov === node ? deferToHoverLayer(picked) : picked;
+        }
+        if (hov === node) return hoveredNode(res, attrs, base);
         if (sel) {
-          if (node === sel) return selectedNode(res, attrs, base);
           // 邻居收到 0.76：上千个节点，得给选中的那一条路让地方
           if (g.areNeighbors(sel, node)) neighborNode(res, base, 0.76);
           else return mutedNode(res, base);

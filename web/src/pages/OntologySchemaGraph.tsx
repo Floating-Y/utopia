@@ -42,6 +42,7 @@ import {
 import {
   attachDrag,
   focusNode,
+  deferToHoverLayer,
   hoveredNode,
   mutedNode,
   neighborNode,
@@ -89,6 +90,16 @@ const EDGE_DISJOINT_FOCUS = "rgba(255,157,175,0.9)";
    文库里抽取完成的徽章都用它，所以「这条边上的类不是抽取来的，是规则算出来的」
    不必再学一遍。弧线：规则的结论多半正是主类的子类，那对类之间已经有一条继承
    边，直线会与它重叠 */
+/* 图例上的色块不用画布上那几个带 alpha 的值。**画布靠亮度区分继承与关系**
+   （继承亮而细、关系灰而粗，两种线常常压在一起，只能这么分），可图例是四个
+   并排的小方块，同样两毫米高、一个 95% 白一个 60% 白，读出来不是"两种边"，
+   是"这排线粗细不匀"——用户第一眼就是这么说的。
+   这里一律实色，同一强度，区别交给颜色本身；取的是各自的**常态**色而不是
+   聚焦色，因为常态才是画面上多数时候的样子 */
+const LEGEND_SUBCLASS = "#ebebeb";
+const LEGEND_RELATION = "#8c8c8c";
+const LEGEND_DISJOINT = "#ff9daf";
+const LEGEND_RULE = "#c4a5ff";
 const EDGE_RULE = "rgba(196,165,255,0.5)";
 const EDGE_RULE_FOCUS = "rgba(196,165,255,0.95)";
 const EDGE_DIM = "rgba(48,48,48,0.4)";
@@ -125,9 +136,15 @@ const RELATION_EDGE_SIZE = 2;
  *  二十几条弧扇开就是那团毛球，而且哪条也点不中；一条边写着「23 relations」
  *  说的是同一件事。点它选中 domain 那个类，面板的属性页把这些关系一条条列出来 */
 const BUNDLE_ABOVE = 3;
-/** sigma 边渲染的最小厚度（像素），默认 1.7——同一个理由，全局兜底,
- *  免得缩小到某个层级时任何边都变得难点 */
-const MIN_EDGE_THICKNESS = 3;
+/** sigma 边渲染的最小厚度（像素），默认 1.7——同一个理由，全局兜底，
+ *  免得缩小到某个层级时任何边都变得难点。
+ *
+ *  **从 3 降到 2**（#497）：3 把这张图上刻意分出来的粗细一起压平了——继承边
+ *  写的是 0.9、关系边是 2，下限一兜，两种都按 3 画，于是「继承细而亮、关系
+ *  粗而灰」这条区分在画面上根本不存在，整张图只剩一个重量。而且模式图成了
+ *  图谱页的一档之后，两档之间切换看得见这一跳：同一块画布，边不该换重量。
+ *  2 与关系边自己的尺寸对齐，继承边重新细得下去，也仍然点得中 */
+const MIN_EDGE_THICKNESS = 2;
 /** 节点大小按层级深度走：根最大，每往下一层小一档，到底不再缩。区间与
  *  /graph 的节点（5–13）同一档，两张图并排看是同一个引擎画的。以前按连接数
  *  走，结果 Thing 和它的每个子类都顶到同一个上限，层级在图上读不出来 */
@@ -144,6 +161,15 @@ const SELF_LOOP_BASE_CURVATURE = 1;
 /** 类数不超过这个数就全画——几十个类的手工本体，藏起一部分只会让人找不到
  *  自己刚建的类。超过它（导入的包动辄几百上千）才按「库用到了什么」取景 */
 const FULL_VIEW_MAX_CLASSES = 60;
+
+/** 画多少个类的可选档位，与实例图的 `NODE_BUDGETS` 同构（那边是 150/300/600/1000）。
+ *
+ *  **「在用的类」还不够**。一个装了 schema.org 的库里，121 个类有实例，其中
+ *  一百多个只有一两个——把它们全摆上去，Person（172 个）与某个只出现过一次的
+ *  ImageObject 一样大一样显眼，读者看到的是一团毛球而不是这个库的形状。
+ *  默认 30 已经盖到"有五个以上实例"那一档，长尾折进「+N classes」里，
+ *  想看具体哪个走搜索——它会把那个类连着祖先补进画布。 */
+export const SCHEMA_BUDGETS: number[] = [30, 60, 120, 240];
 
 export interface SchemaScope {
   /** 画到画布上的类；null 表示全画 */
@@ -162,6 +188,7 @@ export interface SchemaScope {
 export function schemaScope(
   entityTypes: EntityTypeView[],
   revealed: ReadonlySet<string>,
+  budget: number = SCHEMA_BUDGETS[0],
 ): SchemaScope {
   if (entityTypes.length <= FULL_VIEW_MAX_CLASSES) {
     return { drawn: null, basis: "all", hidden: 0 };
@@ -175,7 +202,13 @@ export function schemaScope(
     drawn.add(id);
     for (const parentId of t.parents) addWithAncestors(parentId);
   };
-  for (const t of entityTypes) if (t.usage > 0) addWithAncestors(t.id);
+  /* 用得最多的那几个，按档位取；**祖先不占额度**——它们是为了让继承链完整，
+     不是自己要出场。所以画出来的数会比档位多一点，"+N classes" 报的是实数 */
+  const inUse = entityTypes
+    .filter((t) => t.usage > 0)
+    .sort((a, b) => b.usage - a.usage || a.label.localeCompare(b.label))
+    .slice(0, budget);
+  for (const t of inUse) addWithAncestors(t.id);
   const basis: SchemaScope["basis"] = drawn.size > 0 ? "in-use" : "top";
   if (basis === "top") {
     // 根：没有一个父类指向真实存在的类（坏引用与自指都不算父类，
@@ -466,22 +499,30 @@ function layoutSchemaGraph(
   });
   const incremental = placed * 2 >= graph.order;
   if (!incremental) {
-    circular.assign(graph, { scale: 260 });
+    // 起始圆的半径也与实例图同一个数（Graph.tsx 里是 300）：两张图同一个
+    // 引擎、同一组力、同一个起点，剩下的差别才都是数据本身带来的
+    circular.assign(graph, { scale: 300 });
   } else if (seedFreshNodes(graph, known) === 0) {
     return; // 没有新节点：旧坐标就是终局，不再跑力
   }
   if (graph.size === 0) return; // 只有孤立节点：摆好就是终局，没有力可跑
+  /* 与实例图同一组力（Graph.tsx 里那组是拿真实的图调出来的）。
+     从前这里是 gravity 0.55 / 200 步：往中心拉的力高了六成，而 FA2 是渐进
+     展开的，固定步数一停就停在还没舒展开的那一刻——两件事叠起来，同一个
+     引擎画出来的两张图，一张舒展一张抱团 */
   const settings = {
     ...forceAtlas2.inferSettings(graph),
-    gravity: 0.55,
-    scalingRatio: 28,
+    gravity: 0.35,
+    scalingRatio: 22,
     outboundAttractionDistribution: true,
   };
   const fixed = incremental
     ? [...pinned].filter((id) => graph.hasNode(id))
     : [];
   for (const id of fixed) graph.setNodeAttribute(id, "fixed", true);
-  forceAtlas2.assign(graph, { iterations: incremental ? 80 : 200, settings });
+  // 步数也加够：200 步在几百个类上还没散开。同步跑 600 步在这个规模上
+  // 是几十毫秒的事，换 worker 的复杂度不值得
+  forceAtlas2.assign(graph, { iterations: incremental ? 150 : 600, settings });
   for (const id of fixed) graph.removeNodeAttribute(id, "fixed");
 }
 
@@ -561,7 +602,7 @@ export function OntologySchemaGraph({
     [relationTypes],
   );
 
-  // 取景：大本体只画库用到的类，左栏点到的类补进来（见 schemaScope）
+  // 取景：大本体只画用得最多的那几个类，左栏点到的类补进来（见 schemaScope）
   const [revealed, setRevealed] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -685,11 +726,19 @@ export function OntologySchemaGraph({
         const base = attrs.size as number;
         const sel = selectedRef.current;
         const hov = hoverRef.current;
+        const selClass =
+          sel?.kind === "class" && g.hasNode(sel.id) ? sel.id : null;
+        /* **选中压过指到**，与实例图同一条：指针落到自己选中的那个类上，读到的
+           还该是选中那一副（反色底牌 + 加粗的名字）。指到别的类照常出 hover */
+        if (selClass === node) {
+          const picked = selectedNode(res, attrs, base);
+          // 选中的这一个同时被指着：名字改由高亮层画，标签层让开
+          return hov === node ? deferToHoverLayer(picked) : picked;
+        }
         if (hov === node) return hoveredNode(res, attrs, base);
-        if (sel?.kind === "class" && g.hasNode(sel.id)) {
-          if (node === sel.id) return selectedNode(res, attrs, base);
+        if (selClass) {
           // 邻居不收小：几十个类的图，收了显得瘫（实例图那边收到 0.76）
-          if (g.areNeighbors(sel.id, node)) return neighborNode(res, base);
+          if (g.areNeighbors(selClass, node)) return neighborNode(res, base);
           return mutedNode(res, base);
         }
         if (sel?.kind === "relation") {
@@ -827,6 +876,12 @@ export function OntologySchemaGraph({
     renderGrid();
 
     sigmaRef.current = sigma;
+    if (import.meta.env.DEV) {
+      // 调试句柄（仅 dev）：与 /graph 的 __g/__sigma 同一套，
+      // 两张图的疏密、reducer 输出可以在无头环境里直接对比
+      (window as unknown as Record<string, unknown>).__sg = g;
+      (window as unknown as Record<string, unknown>).__ssigma = sigma;
+    }
     // 左栏点中时还没画出来的那个类，现在在了：对焦。节点的框内坐标要
     // 等 sigma 处理完一轮才有，挂在第一次渲染之后
     const pending = pendingFocusRef.current;
@@ -851,8 +906,8 @@ export function OntologySchemaGraph({
 
   return (
     <div className="h-full relative">
-      {/* 顶部悬浮条：图例 + 取景 + 未限定关系入口。没有搜索框——找东西走左栏 */}
-      <div className="absolute top-3 left-3 right-3 z-10 flex items-start gap-2 pointer-events-none">
+      {/* 图例 + 取景 + 未限定关系入口。没有搜索框——找东西走左栏 */}
+      <div className="absolute left-3 right-3 top-3 z-10 flex items-start gap-2 pointer-events-none">
         <div className="pointer-events-auto flex flex-wrap gap-2">
           {/* 静态图例：几种边各自的说法，不是可切换的过滤器——本体的边远比
               实例图少，藏一种边省下的空间不值得多一层交互。
@@ -860,17 +915,22 @@ export function OntologySchemaGraph({
               不存在的东西的图例 */}
           {(
             [
-              [S.ontology.schemaLegendInheritance, EDGE_SUBCLASS_FOCUS],
-              [S.ontology.schemaLegendRelation, EDGE_RELATION_FOCUS],
-              [S.ontology.schemaLegendDisjoint, EDGE_DISJOINT_FOCUS],
+              [S.ontology.schemaLegendInheritance, LEGEND_SUBCLASS],
+              [S.ontology.schemaLegendRelation, LEGEND_RELATION],
+              [S.ontology.schemaLegendDisjoint, LEGEND_DISJOINT],
               ...(rules.length
-                ? ([[S.ontology.schemaLegendRule, EDGE_RULE_FOCUS]] as const)
+                ? ([[S.ontology.schemaLegendRule, LEGEND_RULE]] as const)
                 : []),
             ] as const
           ).map(([label, color]) => (
             <span
               key={label}
-              className="glass rounded-cell px-3 py-1 text-fine flex items-center gap-2 text-ink-2"
+              /* **就用药丸那一个类**。与旁边那枚可点的 Pill 同高、同内距、
+                 同圆角——规矩上 4 给 chip、6 给控件，可这一排的盒子高度内距
+                 字号全一样，只有"能不能点"不同；一样大的盒子摆一排却两种圆角，
+                 读出来是没对齐，不是有含义。`is-static` 收掉悬停时的提亮：
+                 不可点的东西给反馈是在骗手 */
+              className="u-pill is-static gap-2"
             >
               <span className="h-0.5 w-3 rounded-full" style={{ background: color }} />
               {label}
@@ -887,7 +947,7 @@ export function OntologySchemaGraph({
                   : S.ontology.schemaScopeInUseHint
               }
             >
-              <span className="glass rounded-cell px-3 py-1 text-fine flex items-center text-ink-2">
+              <span className="u-pill is-static">
                 {S.ontology.schemaMoreClasses(scope.hidden)}
               </span>
             </Tooltip>
