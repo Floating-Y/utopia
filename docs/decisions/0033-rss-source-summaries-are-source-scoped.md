@@ -1,4 +1,4 @@
-# 0026 · RSS summaries are scoped to the source being listed
+# 0033 · RSS summaries are scoped to the source being listed
 
 - **Status**: query implemented for #417; nested public contract pending
 - **Written**: 2026-09-06 (conventions in the [README](README.md))
