@@ -533,6 +533,84 @@ async fn source_list_exposes_scoped_rss_summary() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The lateral aggregate must count only the listed source's own observations.
+///
+/// One RSS source per base is exactly the fixture that cannot catch the outer alias
+/// binding back to the inner `sources s`: the source filter turns trivially true and
+/// every source's entries are counted, yet a single source still reports its own
+/// number. So: two RSS sources in one base and a third in another, each with a
+/// different count, so a leak between any two of them shows up as a wrong number.
+#[tokio::test]
+async fn source_list_counts_only_the_listed_source() -> anyhow::Result<()> {
+    let Some(url) = utopia_store::test_db::url() else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&url).await?;
+    let (org_id, kb_id, first_id, workspace_id) = seed_source(&pool).await?;
+    let rss_config = serde_json::json!({
+        "feed_url": "https://example.com/feed",
+        "content_mode": "full_new_items"
+    });
+    let second_id = insert_source(&pool, kb_id, "rss", "rss-second", rss_config.clone()).await?;
+    let other_kb_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO knowledge_bases (id, workspace_id, name) VALUES ($1, $2, $3)")
+        .bind(other_kb_id)
+        .bind(workspace_id)
+        .bind("rss-full-content-other-base")
+        .execute(&pool)
+        .await?;
+    let other_id = insert_source(&pool, other_kb_id, "rss", "rss-other-base", rss_config).await?;
+
+    for (source_id, keys) in [
+        (first_id, vec!["first-1"]),
+        (second_id, vec!["second-1", "second-2"]),
+        (other_id, vec!["other-1", "other-2", "other-3"]),
+    ] {
+        let mut tx = pool.begin().await?;
+        utopia_store::rss_full_content::initialize_source(&mut tx, source_id).await?;
+        tx.commit().await?;
+        utopia_store::rss_full_content::record_baseline(&pool, source_id, 1, &[]).await?;
+        let entries: Vec<_> = keys.into_iter().map(entry).collect();
+        utopia_store::rss_full_content::discover(&pool, source_id, 1, &entries).await?;
+    }
+
+    fn pending_of(listed: &[utopia_core::models::SourceView], id: Uuid) -> anyhow::Result<i64> {
+        listed
+            .iter()
+            .find(|source| source.id == id)
+            .map(|source| source.rss_full_content_pending_count)
+            .ok_or_else(|| anyhow::anyhow!("source {id} is missing from its base's list"))
+    }
+
+    let listed = utopia_store::sources::list(&pool, kb_id).await?;
+    assert_eq!(listed.len(), 2, "the first base lists its own two sources");
+    assert_eq!(
+        pending_of(&listed, first_id)?,
+        1,
+        "the first source counts only its own observation"
+    );
+    assert_eq!(
+        pending_of(&listed, second_id)?,
+        2,
+        "a second source in the same base does not inherit the first's rows"
+    );
+    for source in &listed {
+        assert_eq!(source.rss_full_content_complete_count, 0);
+        assert_eq!(source.rss_full_content_terminal_count, 0);
+    }
+
+    let listed = utopia_store::sources::list(&pool, other_kb_id).await?;
+    assert_eq!(listed.len(), 1, "the other base lists only its own source");
+    assert_eq!(
+        pending_of(&listed, other_id)?,
+        3,
+        "a source in another base sees none of the first base's rows"
+    );
+
+    cleanup(&pool, org_id).await?;
+    Ok(())
+}
+
 fn entry(key: impl Into<String>) -> utopia_store::rss_full_content::NewEntry {
     utopia_store::rss_full_content::NewEntry {
         external_key: key.into(),
