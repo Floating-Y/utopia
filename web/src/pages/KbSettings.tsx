@@ -8,6 +8,8 @@ import { useParams, useNavigate } from "@tanstack/react-router";
 import {
   History as HistoryIcon,
   Lock,
+  Plus,
+  Search,
   Settings2,
   TriangleAlert,
   Users,
@@ -24,7 +26,6 @@ import {
   LinkButton,
   Loading,
   localDateTime,
-  NativeSelect,
   Pager,
   RAIL_CLS,
   type RowTone,
@@ -33,6 +34,14 @@ import {
   Segmented,
   SettingsCard,
   PageHeader,
+  Dialog,
+  Field,
+  Table,
+  TBody,
+  Td,
+  Th,
+  THead,
+  Tr,
 } from "../ui";
 
 const KB_ROLES = [
@@ -179,8 +188,8 @@ export function KbSettings() {
     { key: "general", label: S.kbset.general, Icon: Settings2 },
     { key: "members", label: S.kbset.members, Icon: Users },
     { key: "activity", label: S.kbset.activity, Icon: HistoryIcon },
-    // 默认库不可删除：danger 节整个不出现。入口用警示色：这一条只是去往危险区，
-    // 真正删库的那个按钮才是危险色
+    // 默认库不可删除：danger 节整个不出现。入口只把图标染成警示色，文字与别的
+    // 节一样：这一条只是去往危险区，真正删库的那个按钮才是危险色
     ...(isDefault
       ? []
       : [
@@ -202,8 +211,7 @@ export function KbSettings() {
             key={key}
             density="nav"
             active={section === key}
-            tone={tone}
-            icon={<Icon size={14} />}
+            icon={<Icon size={14} className={tone === "warn" ? "text-warn" : undefined} />}
             onClick={() => setSection(key)}
           >
             {label}
@@ -535,17 +543,16 @@ function KbActivity({ kbId }: { kbId: string }) {
       {/* 筛这份台账的控件在卡外面（DESIGN.md 6）：它们不是台账的内容，
           而且筛空了的时候那张卡要能变成空态，不能把改筛选的唯一办法一起带走 */}
       <div className="flex flex-wrap items-center gap-2">
-        <NativeSelect size="sm"
+        <Dropdown
+          size="sm"
+          className="w-48"
           value={action}
-          onChange={(e) => reset(() => setAction(e.target.value))}
-        >
-          <option value="">{S.kbset.auditAllActions}</option>
-          {actions.map((a) => (
-            <option key={a} value={a}>
-              {a}
-            </option>
-          ))}
-        </NativeSelect>
+          onChange={(v) => reset(() => setAction(v))}
+          options={[
+            { value: "", label: S.kbset.auditAllActions },
+            ...actions.map((a) => ({ value: a, label: a })),
+          ]}
+        />
         <Input size="sm" className="u-num"
           type="date"
           value={since}
@@ -627,6 +634,10 @@ function KbMembers({ kbId, isOpen }: { kbId: string; isOpen: boolean }) {
     queryFn: () => api.kbMembers(kbId),
   });
   const orgUsers = useQuery({ queryKey: ["orgUsers"], queryFn: api.orgUsers });
+  const [adding, setAdding] = useState(false);
+  const [filter, setFilter] = useState("");
+  const [role, setRole] = useState("all");
+  const [editingRole, setEditingRole] = useState<string | null>(null);
   const [addUserId, setAddUserId] = useState("");
   // open 库连 viewer 这个选项都没有，默认值得跟着走
   const [addRole, setAddRole] = useState(isOpen ? "editor" : "viewer");
@@ -658,78 +669,158 @@ function KbMembers({ kbId, isOpen }: { kbId: string; isOpen: boolean }) {
   );
   const memberIds = new Set(listed.map((m) => m.user_id));
   const addable = orgUsers.data?.filter((u) => !memberIds.has(u.id)) ?? [];
+  const q = filter.trim().toLowerCase();
+  const shown = listed
+    .filter((m) => role === "all" || m.role === role)
+    .filter(
+      (m) =>
+        !q ||
+        m.display_name.toLowerCase().includes(q) ||
+        m.email.toLowerCase().includes(q),
+    );
 
   if (members.isError) return null;
 
   return (
-    /* 一张卡：上面是名单，底栏是"加一个人"。加人是这张卡的动作，所以它在底栏，
-       与设置卡的保存同一个位置——而不是名单末尾多出来的一行（那样它读起来
-       像还没填好的第 N 个成员） */
-    <SettingsCard
-      title={S.kbset.members}
-      hint={isOpen ? S.kbset.membersHintOpen : S.kbset.membersHintRestricted}
-      note={
-        /* **picker 常驻**，不按"有没有人可加"来显示或隐藏。
-           一个时有时无的控件比一个空着的控件更让人困惑——不见了的第一反应是
-           功能坏了，而不是"没人可加"。空列表由 SearchSelect 自己说
-           （它有 noMatches 空态），这里不必再加一句话 */
-        <SearchSelect
-          className="w-full max-w-sm"
-          value={addUserId}
-          onChange={setAddUserId}
-          placeholder={S.kbset.addMember}
-          options={addable.map((u) => ({
-            value: u.id,
-            label: u.display_name,
-            hint: u.email,
-          }))}
+    <div className="space-y-3">
+      <p className="text-body text-ink-2">
+        {isOpen ? S.kbset.membersHintOpen : S.kbset.membersHintRestricted}
+      </p>
+
+      {/* 筛名单的东西与加人的按钮都在表格**外面**（DESIGN.md 6）：它们不是名单
+          的内容，而且筛空了的时候那张表要能变成空态，不能把改筛选和加人的
+          唯一入口一起带走。这一排与部署那边的用户管理一模一样 */}
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          icon={<Search size={13} />}
+          className="w-64"
+          placeholder={S.settings.searchUsers}
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
         />
-      }
-      action={
+        <Dropdown
+          className="w-32"
+          value={role}
+          onChange={setRole}
+          options={[
+            { value: "all", label: S.members.filterAllRoles },
+            ...rolesFor(isOpen),
+          ]}
+        />
+        <div className="ml-auto">
+          <Button variant="primary" size="sm" onClick={() => setAdding(true)}>
+            <Plus size={12} />
+            {S.kbset.addMemberTitle}
+          </Button>
+        </div>
+      </div>
+
+      {/* 一张表，每一列宽度定死：角色和动作都在自己那一列，不随名字长短漂移 */}
+      <div className="glass overflow-hidden rounded-panel">
+        <Table>
+          <THead>
+            <Tr>
+              <Th>{S.members.userLabel}</Th>
+              <Th>{S.members.roleLabel}</Th>
+              <Th />
+            </Tr>
+          </THead>
+          <TBody>
+            {shown.map((m) => (
+              <Tr key={m.user_id}>
+                <Td>
+                  <div className="truncate text-body text-ink">{m.display_name}</div>
+                  <div className="truncate text-small text-ink-2">{m.email}</div>
+                </Td>
+                <Td>
+                  {/* 静态文字，点一下才变成下拉：一列下拉框会把一张只读的名单
+                      看成一张待填的表，而改角色是偶尔为之 */}
+                  {editingRole === m.user_id ? (
+                    <Dropdown
+                      size="sm"
+                      className="w-24"
+                      value={m.role}
+                      onChange={(r) => {
+                        setEditingRole(null);
+                        if (r !== m.role) setMember.mutate({ userId: m.user_id, role: r });
+                      }}
+                      options={rolesFor(isOpen)}
+                    />
+                  ) : (
+                    <LinkButton onClick={() => setEditingRole(m.user_id)}>
+                      {S.kbset.roles[m.role as keyof typeof S.kbset.roles] ?? m.role}
+                    </LinkButton>
+                  )}
+                </Td>
+                <Td className="whitespace-nowrap text-right">
+                  <LinkButton tone="danger" onClick={() => remove.mutate(m.user_id)}>
+                    {S.kbset.remove}
+                  </LinkButton>
+                </Td>
+              </Tr>
+            ))}
+          </TBody>
+        </Table>
+        {/* 一个人都没有，与「筛没了」是两回事：前者该去加人，后者该改筛选 */}
+        {shown.length === 0 && (
+          <p className="px-4 py-6 text-body text-ink-2">
+            {listed.length === 0
+              ? isOpen
+                ? S.kbset.noWriters
+                : S.kbset.noMembers
+              : S.ui.noMatches}
+          </p>
+        )}
+      </div>
+
+    {/* 把一个已有账号加进这个库。**picker 在弹窗里也仍然常驻**：没人可加时
+        它自己会说（SearchSelect 有 noMatches 空态），控件消失读作"坏了" */}
+    <Dialog
+      open={adding}
+      onOpenChange={setAdding}
+      title={S.kbset.addMemberTitle}
+      closeLabel={S.ui.close}
+      footer={
         <>
-          <Dropdown
-            className="w-24"
-            value={addRole}
-            onChange={setAddRole}
-            options={rolesFor(isOpen)}
-          />
+          <Button variant="secondary" size="sm" onClick={() => setAdding(false)}>
+            {S.members.cancel}
+          </Button>
           <Button variant="primary" size="sm"
             disabled={!addUserId || setMember.isPending}
-            onClick={() => setMember.mutate({ userId: addUserId, role: addRole })}
+            onClick={() => {
+              setMember.mutate({ userId: addUserId, role: addRole });
+              setAdding(false);
+            }}
           >
             {S.members.add}
           </Button>
         </>
       }
     >
-      {members.data && listed.length === 0 ? (
-        <p className="text-small text-ink-2">
-          {isOpen ? S.kbset.noWriters : S.kbset.noMembers}
-        </p>
-      ) : (
-        /* 一人一行，行与行之间一条线：名字与邮箱是同一个人的两件事，
-           挨着读；能改的（角色）和会拆掉的（移除）都在右边 */
-        <div className="divide-y divide-line">
-          {listed.map((m) => (
-            <div key={m.user_id} className="flex items-center gap-3 py-3 first:pt-0">
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-body text-ink">{m.display_name}</div>
-                <div className="truncate text-small text-ink-2">{m.email}</div>
-              </div>
-              <Dropdown
-                size="sm"
-                className="w-24"
-                value={m.role}
-                onChange={(role) => setMember.mutate({ userId: m.user_id, role })}
-                options={rolesFor(isOpen)}
-              />
-              <LinkButton tone="danger" onClick={() => remove.mutate(m.user_id)}>
-                {S.kbset.remove}
-              </LinkButton>
-            </div>
-          ))}
-        </div>
-      )}
-    </SettingsCard>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label={S.members.userLabel} className="mb-0">
+          <SearchSelect
+            className="w-full"
+            value={addUserId}
+            onChange={setAddUserId}
+            placeholder={S.kbset.addMember}
+            options={addable.map((u) => ({
+              value: u.id,
+              label: u.display_name,
+              hint: u.email,
+            }))}
+          />
+        </Field>
+        <Field label={S.members.roleLabel} className="mb-0">
+          <Dropdown
+            className="w-full"
+            value={addRole}
+            onChange={setAddRole}
+            options={rolesFor(isOpen)}
+          />
+        </Field>
+      </div>
+    </Dialog>
+    </div>
   );
 }

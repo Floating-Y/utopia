@@ -24,31 +24,37 @@ import Graphology from "graphology";
 import { circular } from "graphology-layout";
 import forceAtlas2 from "graphology-layout-forceatlas2";
 import Sigma from "sigma";
-import { createNodeBorderProgram } from "@sigma/node-border";
 import { EdgeArrowProgram, EdgeLineProgram } from "sigma/rendering";
-import { EdgeCurvedArrowProgram } from "@sigma/edge-curve";
-import { NodeSquareShellProgram } from "./squareShellProgram";
+import EdgeCurveProgram, { EdgeCurvedArrowProgram } from "@sigma/edge-curve";
 import {
-  drawHoverCard,
-  CANVAS_FONT,
-  CANVAS_LABEL_SIZE,
-  CANVAS_TEXT,
-  CANVAS_TEXT_2,
-  drawPillLabel,
   drawWorldGrid,
   mix,
-  MUTED_SHELL,
   NODE_BORDER_BASE,
   NODE_CORE_BASE,
   NODE_CORE_MIX,
   NODE_SHELL_BASE,
   NODE_TINT_MIX,
-  RING_HOVER_MIX,
   RING_SELECT_MIX,
   TRANSPARENT,
 } from "./graphVisuals";
+// 画布那台机器是两页共用的（#496）：构造选项、状态表、相机、拖拽都在那边，
+// 这个文件只管把本体投影成一张图、说清楚每个节点是什么颜色
+import {
+  attachDrag,
+  focusNode,
+  deferToHoverLayer,
+  hoveredNode,
+  mutedNode,
+  neighborNode,
+  nodeInView,
+  NODE_TYPE_SHELL,
+  NODE_TYPE_SQUARE,
+  ownColorOf,
+  selectedNode,
+  sigmaOptions,
+} from "./graphCanvas";
 import { Maximize2, X, ZoomIn, ZoomOut } from "lucide-react";
-import type { EntityTypeView, RelationTypeView } from "../api";
+import type { BusinessRule, EntityTypeView, RelationTypeView } from "../api";
 import { S } from "../i18n";
 import {
   Pill,
@@ -80,12 +86,29 @@ const EDGE_RELATION = "rgba(128,128,128,0.3)";
 const EDGE_RELATION_FOCUS = "rgba(255,255,255,0.6)";
 const EDGE_DISJOINT = "rgba(255,157,175,0.45)"; // --u-danger
 const EDGE_DISJOINT_FOCUS = "rgba(255,157,175,0.9)";
+/* 业务规则：紫（--u-violet）。**推出来的东西全站都是这个色**——图谱页的派生边、
+   文库里抽取完成的徽章都用它，所以「这条边上的类不是抽取来的，是规则算出来的」
+   不必再学一遍。弧线：规则的结论多半正是主类的子类，那对类之间已经有一条继承
+   边，直线会与它重叠 */
+/* 图例上的色块不用画布上那几个带 alpha 的值。**画布靠亮度区分继承与关系**
+   （继承亮而细、关系灰而粗，两种线常常压在一起，只能这么分），可图例是四个
+   并排的小方块，同样两毫米高、一个 95% 白一个 60% 白，读出来不是"两种边"，
+   是"这排线粗细不匀"——用户第一眼就是这么说的。
+   这里一律实色，同一强度，区别交给颜色本身；取的是各自的**常态**色而不是
+   聚焦色，因为常态才是画面上多数时候的样子 */
+const LEGEND_SUBCLASS = "#ebebeb";
+const LEGEND_RELATION = "#8c8c8c";
+const LEGEND_DISJOINT = "#ff9daf";
+const LEGEND_RULE = "#c4a5ff";
+const EDGE_RULE = "rgba(196,165,255,0.5)";
+const EDGE_RULE_FOCUS = "rgba(196,165,255,0.95)";
 const EDGE_DIM = "rgba(48,48,48,0.4)";
 
 /** 三种边各自的语义——驱动颜色/暗淡/可点选，与「用哪个 sigma 程序画」分开管 */
 const SUBCLASS_KIND = "subclass";
 const RELATION_KIND = "relation";
 const DISJOINT_KIND = "disjoint";
+const RULE_KIND = "rule";
 
 /** sigma 的渲染派发键。**故意与上面的语义分开**：关系边有直的也有弯的
  *  （只有一条就是直的，平行才弯），但两种都是「relation 语义」；早先把
@@ -94,6 +117,7 @@ const DISJOINT_KIND = "disjoint";
 const EDGE_TYPE_ARROW = "arrow"; // 直线 + 箭头（EdgeArrowProgram）
 const EDGE_TYPE_CURVED_ARROW = "curvedArrow"; // 弧线 + 箭头（EdgeCurvedArrowProgram）
 const EDGE_TYPE_LINE = "line"; // 直线，无箭头（EdgeLineProgram）——互斥专用
+const EDGE_TYPE_CURVED_LINE = "curvedLine"; // 弧线，无箭头（EdgeCurveProgram）——互斥与别的边共用一对时
 
 /** 结构边细、关系边粗一档——「语义关系比结构性信息更显眼」不能只靠颜色说,
  *  粗细上也要有一档差。这个粗细同时也是点选判定的命中带宽——sigma 的边拾取
@@ -102,15 +126,25 @@ const EDGE_TYPE_LINE = "line"; // 直线，无箭头（EdgeLineProgram）——�
  *  调粗关系边，视觉突出与「点得中」是同一个改动 */
 const SUBCLASS_EDGE_SIZE = 0.9;
 const DISJOINT_EDGE_SIZE = 0.8;
+/** 与关系边同粗（2）。**粗细就是点选的命中带宽**——sigma 用渲染出来的几何体
+ *  做拾取，细线在真实鼠标操作下几乎点不中（关系边当初调粗就是为这个）。
+ *  实测 1.6 时反复点不中那条弧 */
+const RULE_EDGE_SIZE = 2;
 const RELATION_EDGE_SIZE = 2;
 /** 同一对类、同一个方向上超过这么多条关系，就并成一条带计数的边。schema.org
  *  里 Person→Organization 有二十几条（worksFor、memberOf、affiliation……），
  *  二十几条弧扇开就是那团毛球，而且哪条也点不中；一条边写着「23 relations」
  *  说的是同一件事。点它选中 domain 那个类，面板的属性页把这些关系一条条列出来 */
 const BUNDLE_ABOVE = 3;
-/** sigma 边渲染的最小厚度（像素），默认 1.7——同一个理由，全局兜底,
- *  免得缩小到某个层级时任何边都变得难点 */
-const MIN_EDGE_THICKNESS = 3;
+/** sigma 边渲染的最小厚度（像素），默认 1.7——同一个理由，全局兜底，
+ *  免得缩小到某个层级时任何边都变得难点。
+ *
+ *  **从 3 降到 2**（#497）：3 把这张图上刻意分出来的粗细一起压平了——继承边
+ *  写的是 0.9、关系边是 2，下限一兜，两种都按 3 画，于是「继承细而亮、关系
+ *  粗而灰」这条区分在画面上根本不存在，整张图只剩一个重量。而且模式图成了
+ *  图谱页的一档之后，两档之间切换看得见这一跳：同一块画布，边不该换重量。
+ *  2 与关系边自己的尺寸对齐，继承边重新细得下去，也仍然点得中 */
+const MIN_EDGE_THICKNESS = 2;
 /** 节点大小按层级深度走：根最大，每往下一层小一档，到底不再缩。区间与
  *  /graph 的节点（5–13）同一档，两张图并排看是同一个引擎画的。以前按连接数
  *  走，结果 Thing 和它的每个子类都顶到同一个上限，层级在图上读不出来 */
@@ -127,6 +161,15 @@ const SELF_LOOP_BASE_CURVATURE = 1;
 /** 类数不超过这个数就全画——几十个类的手工本体，藏起一部分只会让人找不到
  *  自己刚建的类。超过它（导入的包动辄几百上千）才按「库用到了什么」取景 */
 const FULL_VIEW_MAX_CLASSES = 60;
+
+/** 画多少个类的可选档位，与实例图的 `NODE_BUDGETS` 同构（那边是 150/300/600/1000）。
+ *
+ *  **「在用的类」还不够**。一个装了 schema.org 的库里，121 个类有实例，其中
+ *  一百多个只有一两个——把它们全摆上去，Person（172 个）与某个只出现过一次的
+ *  ImageObject 一样大一样显眼，读者看到的是一团毛球而不是这个库的形状。
+ *  默认 30 已经盖到"有五个以上实例"那一档，长尾折进「+N classes」里，
+ *  想看具体哪个走搜索——它会把那个类连着祖先补进画布。 */
+export const SCHEMA_BUDGETS: number[] = [30, 60, 120, 240];
 
 export interface SchemaScope {
   /** 画到画布上的类；null 表示全画 */
@@ -145,6 +188,7 @@ export interface SchemaScope {
 export function schemaScope(
   entityTypes: EntityTypeView[],
   revealed: ReadonlySet<string>,
+  budget: number = SCHEMA_BUDGETS[0],
 ): SchemaScope {
   if (entityTypes.length <= FULL_VIEW_MAX_CLASSES) {
     return { drawn: null, basis: "all", hidden: 0 };
@@ -158,7 +202,13 @@ export function schemaScope(
     drawn.add(id);
     for (const parentId of t.parents) addWithAncestors(parentId);
   };
-  for (const t of entityTypes) if (t.usage > 0) addWithAncestors(t.id);
+  /* 用得最多的那几个，按档位取；**祖先不占额度**——它们是为了让继承链完整，
+     不是自己要出场。所以画出来的数会比档位多一点，"+N classes" 报的是实数 */
+  const inUse = entityTypes
+    .filter((t) => t.usage > 0)
+    .sort((a, b) => b.usage - a.usage || a.label.localeCompare(b.label))
+    .slice(0, budget);
+  for (const t of inUse) addWithAncestors(t.id);
   const basis: SchemaScope["basis"] = drawn.size > 0 ? "in-use" : "top";
   if (basis === "top") {
     // 根：没有一个父类指向真实存在的类（坏引用与自指都不算父类，
@@ -220,6 +270,9 @@ export function buildSchemaGraph(
   relationTypes: RelationTypeView[],
   /** 取景（见 schemaScope）：只有这些类进画布；null 全画 */
   drawn: ReadonlySet<string> | null = null,
+  /** 业务规则：**一条得出类的规则就是两个类之间的一条边**——主类 → 结论类，
+   *  条件写在规则里。得出属性值的那种没有目标节点，不画（它在规则表里） */
+  rules: BusinessRule[] = [],
 ): SchemaGraphResult {
   const graph = new Graphology({ multi: true });
   const byId = new Map(entityTypes.map((t) => [t.id, t]));
@@ -241,7 +294,7 @@ export function buildSchemaGraph(
       ringColor: TRANSPARENT,
       typeColor: t.color,
       typeLabel: t.key,
-      type: t.shape === "square" ? "square" : "circle",
+      type: t.shape === "square" ? NODE_TYPE_SQUARE : NODE_TYPE_SHELL,
       key: t.key,
     });
   }
@@ -315,6 +368,24 @@ export function buildSchemaGraph(
     }
   }
 
+  /* 规则边。**关掉的规则也画**，只是暗一档——「这条推理现在停着」本身是
+     读图的人要知道的事；从图上消失会让人以为从来没有过这条规则 */
+  for (const r of rules) {
+    if (r.conclusion !== "typing" || !r.conclude_type_id) continue;
+    if (!graph.hasNode(r.subject_type_id) || !graph.hasNode(r.conclude_type_id))
+      continue;
+    if (r.subject_type_id === r.conclude_type_id) continue;
+    graph.addEdgeWithKey(`rule:${r.id}`, r.subject_type_id, r.conclude_type_id, {
+      kind: RULE_KIND,
+      ruleId: r.id,
+      type: EDGE_TYPE_CURVED_ARROW,
+      curvature: 0.35,
+      label: r.name,
+      size: RULE_EDGE_SIZE,
+      enabled: r.enabled,
+    });
+  }
+
   // 先按有向类对归堆再画：少的各画各的，多的并成一条带计数的边（见 BUNDLE_ABOVE）。
   // relationIds 两种边都带——选中一条关系时，含着它的那条边要亮
   for (const { d, rg, rels } of pairs.values()) {
@@ -339,37 +410,45 @@ export function buildSchemaGraph(
     });
   }
 
-  layOutParallelRelations(graph);
+  layOutParallelEdges(graph);
   return { graph, unscoped };
 }
 
-/** 同一对类之间的多条关系边（works_at / founded / owns 都连着 Person↔Organization）
- *  各自扇到一条独立的弧上，不叠成一条谁也点不中的线。算法与 Graph.tsx 的
- *  layOutParallelEdges 同一个思路（按无向对分组，围绕直线对称铺开），
- *  但这里的边不需要先合并逆关系——本体里 inverse_of 只在关系检查器里说明，
- *  不折进画布，所以少了那一整步。
+/** 同一对类之间的多条边各自扇到一条独立的弧上，不叠成一条谁也点不中的线。
+ *  **不分种类**：继承、互斥、关系三种边都可能落在同一对类上（Unit 既是
+ *  Organization 的子类又与它互斥；一条关系的主宾恰好是父子），只给关系边扇开
+ *  的话，剩下两种照旧叠在直线上，标签也叠在一起。算法与 Graph.tsx 的
+ *  layOutParallelEdges 同一个思路（按无向对分组，围绕直线对称铺开）；这里的边
+ *  不需要先合并逆关系——本体里 inverse_of 只在关系检查器里说明，不折进画布。
  *
- *  顺带决定每条关系边的渲染类型：**独苗走直线**（EDGE_TYPE_ARROW），
- *  只有真的平行/自环时才切到弧线程序——弧线程序在零弯曲度下也能画，
- *  但没必要为大多数只有一条的关系边多背一层曲线计算 */
-function layOutParallelRelations(graph: Graphology): void {
+ *  顺带决定每条边的渲染程序：**独苗走直线**，只有真的平行/自环时才切到弧线
+ *  程序；有箭头的（继承、关系）用带箭头的弧，互斥用不带箭头的弧 */
+function layOutParallelEdges(graph: Graphology): void {
   const groups = new Map<string, string[]>();
-  graph.forEachEdge((edge, attrs, source, target) => {
-    if (attrs.kind !== RELATION_KIND) return;
+  graph.forEachEdge((edge, _attrs, source, target) => {
     const key =
       source === target ? `loop:${source}` : [source, target].sort().join("|");
     const list = groups.get(key);
     if (list) list.push(edge);
     else groups.set(key, [edge]);
   });
+  const typeFor = (kind: string, curved: boolean) =>
+    kind === DISJOINT_KIND
+      ? curved
+        ? EDGE_TYPE_CURVED_LINE
+        : EDGE_TYPE_LINE
+      : curved
+        ? EDGE_TYPE_CURVED_ARROW
+        : EDGE_TYPE_ARROW;
   for (const edges of groups.values()) {
     const n = edges.length;
     edges.forEach((edge, i) => {
       const [source, target] = graph.extremities(edge);
+      const kind = graph.getEdgeAttribute(edge, "kind") as string;
       if (source === target) {
         graph.mergeEdgeAttributes(edge, {
           curvature: SELF_LOOP_BASE_CURVATURE + i * RELATION_CURVATURE_STEP,
-          type: EDGE_TYPE_CURVED_ARROW,
+          type: typeFor(kind, true),
         });
         return;
       }
@@ -380,7 +459,7 @@ function layOutParallelRelations(graph: Graphology): void {
       const curvature = offset === 0 ? 0 : sign * offset * RELATION_CURVATURE_STEP;
       graph.mergeEdgeAttributes(edge, {
         curvature,
-        type: curvature === 0 ? EDGE_TYPE_ARROW : EDGE_TYPE_CURVED_ARROW,
+        type: typeFor(kind, curvature !== 0),
       });
     });
   }
@@ -420,22 +499,30 @@ function layoutSchemaGraph(
   });
   const incremental = placed * 2 >= graph.order;
   if (!incremental) {
-    circular.assign(graph, { scale: 260 });
+    // 起始圆的半径也与实例图同一个数（Graph.tsx 里是 300）：两张图同一个
+    // 引擎、同一组力、同一个起点，剩下的差别才都是数据本身带来的
+    circular.assign(graph, { scale: 300 });
   } else if (seedFreshNodes(graph, known) === 0) {
     return; // 没有新节点：旧坐标就是终局，不再跑力
   }
   if (graph.size === 0) return; // 只有孤立节点：摆好就是终局，没有力可跑
+  /* 与实例图同一组力（Graph.tsx 里那组是拿真实的图调出来的）。
+     从前这里是 gravity 0.55 / 200 步：往中心拉的力高了六成，而 FA2 是渐进
+     展开的，固定步数一停就停在还没舒展开的那一刻——两件事叠起来，同一个
+     引擎画出来的两张图，一张舒展一张抱团 */
   const settings = {
     ...forceAtlas2.inferSettings(graph),
-    gravity: 0.55,
-    scalingRatio: 28,
+    gravity: 0.35,
+    scalingRatio: 22,
     outboundAttractionDistribution: true,
   };
   const fixed = incremental
     ? [...pinned].filter((id) => graph.hasNode(id))
     : [];
   for (const id of fixed) graph.setNodeAttribute(id, "fixed", true);
-  forceAtlas2.assign(graph, { iterations: incremental ? 80 : 200, settings });
+  // 步数也加够：200 步在几百个类上还没散开。同步跑 600 步在这个规模上
+  // 是几十毫秒的事，换 worker 的复杂度不值得
+  forceAtlas2.assign(graph, { iterations: incremental ? 150 : 600, settings });
   for (const id of fixed) graph.removeNodeAttribute(id, "fixed");
 }
 
@@ -476,60 +563,23 @@ function seedFreshNodes(
   return total;
 }
 
-/** 相机推过去时最多放大到这个比例；已经比它更近就保持——从左栏挨个点类
- *  看下去时，画面不该每点一下就重新缩放 */
-const FOCUS_MAX_RATIO = 0.5;
-/** 视口四边留的边距：贴着边的节点也算看不见（右侧还有停靠的面板压着） */
-const IN_VIEW_MARGIN = 48;
-
-function nodePosition(sigma: Sigma, id: string): Point {
-  const graph = sigma.getGraph();
-  return {
-    x: graph.getNodeAttribute(id, "x") as number,
-    y: graph.getNodeAttribute(id, "y") as number,
-  };
-}
-
-/** 节点此刻是否在视口里（按上一次渲染的相机算） */
-function nodeInView(sigma: Sigma, id: string): boolean {
-  const { x, y } = sigma.graphToViewport(nodePosition(sigma, id));
-  const { width, height } = sigma.getDimensions();
-  return (
-    x >= IN_VIEW_MARGIN &&
-    x <= width - IN_VIEW_MARGIN &&
-    y >= IN_VIEW_MARGIN &&
-    y <= height - IN_VIEW_MARGIN
-  );
-}
-
-/** 相机推到一个节点上。sigma 的相机坐标是归一化到 [0,1] 的「框内」坐标，
- *  不是图坐标——直接喂图坐标（x 动辄几百）相机会飞出画面几万像素，画布
- *  一片空白。sigma 没有公开的图→框内换算，绕一趟视口：graphToViewport 用的
- *  是上一次渲染的矩阵，与 viewportToFramedGraph 用同一台相机，一来一回把
- *  相机抵消掉，剩下的就是框内坐标 */
-function focusNode(sigma: Sigma, id: string): void {
-  if (!sigma.getGraph().hasNode(id)) return;
-  const framed = sigma.viewportToFramedGraph(
-    sigma.graphToViewport(nodePosition(sigma, id)),
-  );
-  const ratio = Math.min(sigma.getCamera().ratio, FOCUS_MAX_RATIO);
-  sigma
-    .getCamera()
-    .animate({ x: framed.x, y: framed.y, ratio }, { duration: 300 });
-}
 
 export type SchemaSelection =
   | { kind: "class"; id: string }
   | { kind: "relation"; id: string }
+  | { kind: "rule"; id: string }
   | null;
 
 export function OntologySchemaGraph({
   entityTypes,
   relationTypes,
+  rules = [],
   selected,
   onSelect,
 }: {
   entityTypes: EntityTypeView[];
+  /** 业务规则：画成主类 → 结论类的一条紫弧，点它打开规则那一页 */
+  rules?: BusinessRule[];
   /** 全量关系（含 attribute）：图只画 kind === "relation"，attribute 在这里
    *  单纯被忽略——它们的宾语是字面值，不是类，不进类图，也不用在这个文件里
    *  另外筛出来，展示 attribute 是 Ontology.tsx 停靠面板的事 */
@@ -552,7 +602,7 @@ export function OntologySchemaGraph({
     [relationTypes],
   );
 
-  // 取景：大本体只画库用到的类，左栏点到的类补进来（见 schemaScope）
+  // 取景：大本体只画用得最多的那几个类，左栏点到的类补进来（见 schemaScope）
   const [revealed, setRevealed] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -577,8 +627,8 @@ export function OntologySchemaGraph({
   // 本体没变就不重建图——依赖数组只看 entityTypes/relationTypes 的引用与
   // 取景，选中/悬停都是别的状态，不会触发这里
   const schema = useMemo(
-    () => buildSchemaGraph(entityTypes, objectRelations, scope.drawn),
-    [entityTypes, objectRelations, scope.drawn],
+    () => buildSchemaGraph(entityTypes, objectRelations, scope.drawn, rules),
+    [entityTypes, objectRelations, scope.drawn, rules],
   );
 
   /** 把一个类带到眼前：还在取景之外就先揭开、重建之后再对焦；画着但在视口
@@ -658,93 +708,50 @@ export function OntologySchemaGraph({
 
     sigmaRef.current?.kill();
     const sigma = new Sigma(g, containerRef.current, {
-      allowInvalidContainer: true,
-      defaultNodeType: "circle",
-      nodeProgramClasses: {
-        // 与 /graph 同一套「状态环 → 描边 → 深色壳 → 微彩核心」四层解剖
-        circle: createNodeBorderProgram({
-          borders: [
-            { size: { value: 0.1 }, color: { attribute: "ringColor" } },
-            { size: { value: 0.07 }, color: { attribute: "borderColor" } },
-            { size: { value: 0.3 }, color: { attribute: "shellColor" } },
-            { size: { fill: true }, color: { attribute: "color" } },
-          ],
-        }),
-        square: NodeSquareShellProgram,
-      },
-      defaultEdgeType: EDGE_TYPE_ARROW,
-      edgeProgramClasses: {
-        [EDGE_TYPE_ARROW]: EdgeArrowProgram,
-        [EDGE_TYPE_LINE]: EdgeLineProgram,
-        [EDGE_TYPE_CURVED_ARROW]: EdgeCurvedArrowProgram,
-      },
-      enableEdgeEvents: true,
-      minEdgeThickness: MIN_EDGE_THICKNESS,
-      labelFont: CANVAS_FONT,
-      labelSize: CANVAS_LABEL_SIZE,
-      labelColor: { color: CANVAS_TEXT },
-      labelRenderedSizeThreshold: 6,
-      labelDensity: 0.7,
-      labelGridCellSize: 140,
-      minCameraRatio: 0.05,
-      maxCameraRatio: 6,
-      edgeLabelSize: CANVAS_LABEL_SIZE,
-      // 与 /graph 的边标签同一个灰；只有关系边挂标签，有字的就是关系边
-      edgeLabelColor: { color: CANVAS_TEXT_2 },
-      edgeLabelFont: CANVAS_FONT,
-      defaultDrawNodeLabel: drawPillLabel,
-      defaultDrawNodeHover: drawHoverCard,
+      ...sigmaOptions({
+        defaultEdgeType: EDGE_TYPE_ARROW,
+        edgeProgramClasses: {
+          [EDGE_TYPE_ARROW]: EdgeArrowProgram,
+          [EDGE_TYPE_LINE]: EdgeLineProgram,
+          [EDGE_TYPE_CURVED_ARROW]: EdgeCurvedArrowProgram,
+          [EDGE_TYPE_CURVED_LINE]: EdgeCurveProgram,
+        },
+        minEdgeThickness: MIN_EDGE_THICKNESS,
+        // 几十上百个类，缩到 0.05 就看得见全貌；实例图动辄上千，那边缩得更远
+        minCameraRatio: 0.05,
+        maxCameraRatio: 6,
+      }),
       nodeReducer: (node, attrs) => {
         const res = { ...attrs };
         const base = attrs.size as number;
         const sel = selectedRef.current;
         const hov = hoverRef.current;
-        // 环取节点自己的类型色，不取已经混过壳色的 color——见 graphVisuals
-        // 里 RING_*_MIX 的说明
-        const ownColor = (attrs.typeColor as string) ?? NODE_CORE_BASE;
-        const muteNode = () => {
-          res.size = base * 0.55;
-          res.color = mix(MUTED_SHELL, NODE_CORE_BASE, 0.3);
-          res.shellColor = MUTED_SHELL;
-          res.borderColor = TRANSPARENT;
-          res.ringColor = TRANSPARENT;
-          res.label = "";
-          res.zIndex = 0;
-        };
-        if (hov === node) {
-          res.size = Math.max(base * 1.08, 10.4);
-          res.ringColor = mix(ownColor, "#ffffff", RING_HOVER_MIX);
-          // 悬浮卡接管标签展示；label 本身保留（悬浮卡靠它渲染标题）
-          res.hideBaseLabel = true;
-          res.zIndex = 4;
-          return res;
+        const selClass =
+          sel?.kind === "class" && g.hasNode(sel.id) ? sel.id : null;
+        /* **选中压过指到**，与实例图同一条：指针落到自己选中的那个类上，读到的
+           还该是选中那一副（反色底牌 + 加粗的名字）。指到别的类照常出 hover */
+        if (selClass === node) {
+          const picked = selectedNode(res, attrs, base);
+          // 选中的这一个同时被指着：名字改由高亮层画，标签层让开
+          return hov === node ? deferToHoverLayer(picked) : picked;
         }
-        if (sel?.kind === "class" && g.hasNode(sel.id)) {
-          if (node === sel.id) {
-            res.size = Math.max(base * 1.02, 9.2);
-            res.ringColor = mix(ownColor, "#ffffff", RING_SELECT_MIX);
-            res.forceLabel = true;
-            res.zIndex = 3;
-            return res;
-          }
-          if (g.areNeighbors(sel.id, node)) {
-            res.zIndex = 2;
-            return res;
-          }
-          muteNode();
-          return res;
+        if (hov === node) return hoveredNode(res, attrs, base);
+        if (selClass) {
+          // 邻居不收小：几十个类的图，收了显得瘫（实例图那边收到 0.76）
+          if (g.areNeighbors(selClass, node)) return neighborNode(res, base);
+          return mutedNode(res, base);
         }
         if (sel?.kind === "relation") {
           const rel = relationById.get(sel.id);
           if (rel) {
+            // 选中一条关系，亮的是它的两端——类之间没有「邻居」可言，
+            // 这条关系的 domain 与 range 就是它连着的
             const endpoints = new Set([...rel.domains, ...rel.ranges]);
             if (endpoints.has(node)) {
-              res.ringColor = mix(ownColor, "#ffffff", RING_SELECT_MIX);
-              res.zIndex = 2;
-              return res;
+              res.ringColor = mix(ownColorOf(attrs), "#ffffff", RING_SELECT_MIX);
+              return neighborNode(res, base);
             }
-            muteNode();
-            return res;
+            return mutedNode(res, base);
           }
         }
         return res;
@@ -758,18 +765,26 @@ export function OntologySchemaGraph({
             ? EDGE_SUBCLASS
             : kind === DISJOINT_KIND
               ? EDGE_DISJOINT
-              : EDGE_RELATION;
+              : kind === RULE_KIND
+                ? EDGE_RULE
+                : EDGE_RELATION;
         const focus =
           kind === SUBCLASS_KIND
             ? EDGE_SUBCLASS_FOCUS
             : kind === DISJOINT_KIND
               ? EDGE_DISJOINT_FOCUS
-              : EDGE_RELATION_FOCUS;
+              : kind === RULE_KIND
+                ? EDGE_RULE_FOCUS
+                : EDGE_RELATION_FOCUS;
         res.color = base;
+        // 关掉的规则：画着，但压到暗一档——「这条推理停着」要看得见，
+        // 从图上消失会让人以为从来没有过它
+        if (kind === RULE_KIND && attrs.enabled === false) res.color = EDGE_DIM;
         // 结构性的边（继承/互斥）不挂标签；关系边挂——但一大张图上,全部常显
         // 会变成一堵读不动的字墙，交给 renderEdgeLabels 按缩放开关（见下方
         // updateEdgeLabels）,选中的那条在检查器里说得明明白白，不用画布保证
-        if (kind !== RELATION_KIND) res.label = "";
+        // 规则边挂名字：那是它唯一说得出自己是谁的地方（条件在规则表里）
+        if (kind !== RELATION_KIND && kind !== RULE_KIND) res.label = "";
 
         const [s, t] = g.extremities(edge);
         const hov = hoverRef.current;
@@ -781,7 +796,9 @@ export function OntologySchemaGraph({
             ? sel.id === s || sel.id === t
             : sel?.kind === "relation"
               ? (relIds?.includes(sel.id) ?? false)
-              : false;
+              : sel?.kind === "rule"
+                ? attrs.ruleId === sel.id
+                : false;
 
         if (selHit || hoverHit || hoverEdgeHit) {
           res.color = focus;
@@ -801,6 +818,11 @@ export function OntologySchemaGraph({
 
     sigma.on("clickNode", ({ node }) => onSelect({ kind: "class", id: node }));
     sigma.on("clickEdge", ({ edge }) => {
+      const ruleId = g.getEdgeAttribute(edge, "ruleId") as string | undefined;
+      if (ruleId) {
+        onSelect({ kind: "rule", id: ruleId });
+        return;
+      }
       const ids = g.getEdgeAttribute(edge, "relationIds") as string[] | undefined;
       if (!ids?.length) return;
       // 单独一条：选中它；并起来的一捆：选中 domain 那个类，属性页里一条条看
@@ -827,55 +849,15 @@ export function OntologySchemaGraph({
 
     // 拖节点。**没有活的力模拟要喂**——与 /graph 不同，这里的布局是一次性
     // 算完就定住的，拖完往哪放就在哪，不会被力模拟拽回去，这正是「手动摆
-    // 布局求清楚」要的效果。按下只记候选：位移超过阈值才升格成拖拽，
-    // 否则一次纯点击也会被当成拖了 0 像素的拖拽,鼠标松手时机跟点选打架
-    let dragCandidate: string | null = null;
-    let downPoint: { x: number; y: number } | null = null;
-    let dragged: string | null = null;
-    sigma.on("downNode", (e) => {
-      dragCandidate = e.node;
-      downPoint = { x: e.event.x, y: e.event.y };
-    });
-    sigma.getMouseCaptor().on("mousemovebody", (e) => {
-      if (!dragCandidate) return;
-      if (!dragged) {
-        if (!downPoint || Math.hypot(e.x - downPoint.x, e.y - downPoint.y) < 4)
-          return;
-        dragged = dragCandidate;
-        if (containerRef.current) containerRef.current.style.cursor = "grabbing";
-        // 冻住此刻的包围盒：拖着拖着节点飞出画面边缘时，相机不该跟着自动
-        // 缩放去「适应」新的包围盒——那样一拖节点全图就跟着抖
-        if (!sigma.getCustomBBox()) sigma.setCustomBBox(sigma.getBBox());
-      }
-      const pos = sigma.viewportToGraph(e);
-      g.setNodeAttribute(dragged, "x", pos.x);
-      g.setNodeAttribute(dragged, "y", pos.y);
+    // 布局求清楚」要的效果。阈值、包围盒冻结、光标那一套在 attachDrag 里
+    attachDrag(sigma, {
+      container: () => containerRef.current,
+      hovering: () => !!hoverRef.current,
       // 边拖边记：万一中途出岔子（组件卸载、切换本体）也不丢这一手
-      draggedPositionsRef.current.set(dragged, pos);
-      positionsRef.current.set(dragged, pos);
-      e.preventSigmaDefault();
-      e.original.preventDefault();
-      e.original.stopPropagation();
-    });
-    const endDrag = () => {
-      dragCandidate = null;
-      downPoint = null;
-      if (!dragged) return;
-      dragged = null;
-      if (containerRef.current)
-        containerRef.current.style.cursor = hoverRef.current ? "grab" : "";
-      // 拖完把冻结的包围盒解开——「归位」要看得见刚挪过去的新位置，
-      // 不能还按拖拽开始前的旧范围来适应
-      sigma.setCustomBBox(null);
-    };
-    sigma.getMouseCaptor().on("mouseup", endDrag);
-    // 悬停在节点上方给个「可以抓」的提示——发现得靠猜的交互等于没有
-    sigma.on("enterNode", () => {
-      if (containerRef.current && !dragged)
-        containerRef.current.style.cursor = "grab";
-    });
-    sigma.on("leaveNode", () => {
-      if (containerRef.current && !dragged) containerRef.current.style.cursor = "";
+      onMove: (node, pos) => {
+        draggedPositionsRef.current.set(node, pos);
+        positionsRef.current.set(node, pos);
+      },
     });
 
     // 关系标签只在放大后出现——本体大起来（导入包常有几十上百个类）时,
@@ -894,6 +876,12 @@ export function OntologySchemaGraph({
     renderGrid();
 
     sigmaRef.current = sigma;
+    if (import.meta.env.DEV) {
+      // 调试句柄（仅 dev）：与 /graph 的 __g/__sigma 同一套，
+      // 两张图的疏密、reducer 输出可以在无头环境里直接对比
+      (window as unknown as Record<string, unknown>).__sg = g;
+      (window as unknown as Record<string, unknown>).__ssigma = sigma;
+    }
     // 左栏点中时还没画出来的那个类，现在在了：对焦。节点的框内坐标要
     // 等 sigma 处理完一轮才有，挂在第一次渲染之后
     const pending = pendingFocusRef.current;
@@ -918,21 +906,31 @@ export function OntologySchemaGraph({
 
   return (
     <div className="h-full relative">
-      {/* 顶部悬浮条：图例 + 取景 + 未限定关系入口。没有搜索框——找东西走左栏 */}
-      <div className="absolute top-3 left-3 right-3 z-10 flex items-start gap-2 pointer-events-none">
+      {/* 图例 + 取景 + 未限定关系入口。没有搜索框——找东西走左栏 */}
+      <div className="absolute left-3 right-3 top-3 z-10 flex items-start gap-2 pointer-events-none">
         <div className="pointer-events-auto flex flex-wrap gap-2">
-          {/* 静态图例：三种边各自的说法，不是可切换的过滤器——本体的边远比
-              实例图少，藏一种边省下的空间不值得多一层交互 */}
+          {/* 静态图例：几种边各自的说法，不是可切换的过滤器——本体的边远比
+              实例图少，藏一种边省下的空间不值得多一层交互。
+              规则那一条只在真有规则时出现：没有规则的库不该看到一个解释
+              不存在的东西的图例 */}
           {(
             [
-              [S.ontology.schemaLegendInheritance, EDGE_SUBCLASS_FOCUS],
-              [S.ontology.schemaLegendRelation, EDGE_RELATION_FOCUS],
-              [S.ontology.schemaLegendDisjoint, EDGE_DISJOINT_FOCUS],
+              [S.ontology.schemaLegendInheritance, LEGEND_SUBCLASS],
+              [S.ontology.schemaLegendRelation, LEGEND_RELATION],
+              [S.ontology.schemaLegendDisjoint, LEGEND_DISJOINT],
+              ...(rules.length
+                ? ([[S.ontology.schemaLegendRule, LEGEND_RULE]] as const)
+                : []),
             ] as const
           ).map(([label, color]) => (
             <span
               key={label}
-              className="glass rounded-cell px-3 py-1 text-fine flex items-center gap-2 text-ink-2"
+              /* **就用药丸那一个类**。与旁边那枚可点的 Pill 同高、同内距、
+                 同圆角——规矩上 4 给 chip、6 给控件，可这一排的盒子高度内距
+                 字号全一样，只有"能不能点"不同；一样大的盒子摆一排却两种圆角，
+                 读出来是没对齐，不是有含义。`is-static` 收掉悬停时的提亮：
+                 不可点的东西给反馈是在骗手 */
+              className="u-pill is-static gap-2"
             >
               <span className="h-0.5 w-3 rounded-full" style={{ background: color }} />
               {label}
@@ -949,7 +947,7 @@ export function OntologySchemaGraph({
                   : S.ontology.schemaScopeInUseHint
               }
             >
-              <span className="glass rounded-cell px-3 py-1 text-fine flex items-center text-ink-2">
+              <span className="u-pill is-static">
                 {S.ontology.schemaMoreClasses(scope.hidden)}
               </span>
             </Tooltip>

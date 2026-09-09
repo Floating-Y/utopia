@@ -31,6 +31,11 @@ export const HOVER_MUTE = 0.78;
 export const PILL_BG = "rgba(12,12,12,0.9)";
 export const PILL_BORDER = "rgba(255,255,255,0.14)"; // --u-line-strong
 export const PILL_TEXT = "#ededed"; // --u-text
+/* 裸字的光晕：与画布同色（--u-ground）的一圈描边，只为把从字底下穿过的
+   连线压住。不是阴影——阴影会在一片细线里糊成一团脏 */
+export const LABEL_HALO = "rgba(10,10,10,0.92)";
+/** 浮层的面，抄 `.u-pop`（tooltip / toast 用的那一档近实底） */
+export const POP_BG = "rgba(16,16,16,0.98)";
 
 /* 画布上的字与界面同一套刻度。**canvas 读不到 CSS 变量**，所以这里镜像一份
    `styles.css` 的值——它是源头，改那边记得回来改这里。
@@ -40,8 +45,13 @@ export const PILL_TEXT = "#ededed"; // --u-text
 export const CANVAS_FONT = '"Geist", "Inter", "Noto Sans SC", sans-serif';
 export const CANVAS_TEXT = "#ededed"; // --u-text
 export const CANVAS_TEXT_2 = "#a8a8a8"; // --u-text-2
-export const CANVAS_LABEL_SIZE = 12; // --text-fine
+/* 画在节点与连线之间的字比界面的底再小一档（11）。**画布不是界面**：
+   这些字压在一片线和点上，与它们比邻的是 5–13px 的节点，不是页面上的正文；
+   12 在这里显得比它标注的东西还重。浮在画布之上的悬浮卡不算——那是 tooltip，
+   走界面的刻度（见 CANVAS_TITLE_SIZE / CANVAS_META_SIZE） */
+export const CANVAS_LABEL_SIZE = 11;
 export const CANVAS_TITLE_SIZE = 14; // --text-body
+export const CANVAS_META_SIZE = 12; // --text-fine
 
 export function hexToRgb(hex: string): [number, number, number] {
   const m = /^#?([0-9a-f]{6})$/i.exec(hex);
@@ -58,113 +68,118 @@ export function mix(c1: string, c2: string, t: number): string {
   return `rgb(${f(r1, r2)},${f(g1, g2)},${f(b1, b2)})`;
 }
 
-/* 胶囊标签：深色圆角底 + 柔和文字（学 Semantica 的浮签风格） */
+/** rgb / rgba / #hex 都收，按 t 从 from 渐到 to，**alpha 也一起渐**。
+ *
+ * 与 `mix` 分工：那个只吃 hex、只管把类型色按比例调进壳色（节点的配方）；
+ * 这个要处理边的 `rgba(...)` 与淡入淡出，两边都得能解析、alpha 不能丢 */
+function parseRgba(c: string): [number, number, number, number] {
+  if (c.startsWith("#")) {
+    const [r, g, b] = hexToRgb(c);
+    return [r, g, b, 1];
+  }
+  const m = c.match(
+    /rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+))?/,
+  );
+  if (!m) return [128, 128, 128, 1];
+  return [+m[1], +m[2], +m[3], m[4] !== undefined ? +m[4] : 1];
+}
+
+export function lerpColor(from: string, to: string, t: number): string {
+  const a = parseRgba(from);
+  const b = parseRgba(to);
+  const f = (i: number) => a[i] + (b[i] - a[i]) * t;
+  return `rgba(${Math.round(f(0))},${Math.round(f(1))},${Math.round(f(2))},${f(3).toFixed(3)})`;
+}
+
+/* 节点标签：**平时是一行裸字，指到或选中的那一个才补一块底**。
+   从前它一直是个胶囊（深底 + 一圈 14% 的白描边），而在界面的语汇里那副样子
+   说的是「状态」——Ready、3 dropped、System admin。节点的名字不是状态，它就是
+   这个东西本身，却穿着状态的衣服，还比周围任何一个 chip 都亮。
+   现在画布安静下来，注意力在哪儿哪儿才实——这与「悬停压暗其余、选中只留一条
+   路」是同一条逻辑。 */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function drawPillLabel(
+export function drawNodeLabel(
   ctx: CanvasRenderingContext2D,
   data: any,
   _settings: any,
 ): void {
   if (!data.label) return;
-  // hover 时悬浮卡（drawHoverCard）接管展示，底层 pill 隐去，避免双层标签
+  /* 正被指着的那一个不在这一层画。sigma 每帧走两趟：`renderLabels` 铺标签层，
+     `renderHighlightedNodes` 把 hoveredNode 交给 drawHoverCard 铺在上面的高亮层，
+     **而前者并不排除后者**。两趟都画，同一块底牌就在两张叠着的画布上各来一遍：
+     填色是实色时看不出来，投影看得出来——`shadowBlur` 叠两次，那圈黑深了一倍；
+     未选中时底是 `rgba(12,12,12,0.9)`，叠完接近 0.99，比令牌定的实。
+     让开的是这一层，因为高亮层画在上面 */
   if (data.hideBaseLabel) return;
-  /* 与界面上的 chip 同一副身材：字号 fine、内距 8/2、圆角 cell（4）。
-     从前字号跟着节点大小在 10–11 之间浮动——同一张图里两个节点的名字不一样大，
-     而它们是同一种东西 */
   const size = CANVAS_LABEL_SIZE;
-  ctx.font = `500 ${size}px ${CANVAS_FONT}`;
+  /* 选中的那一个名字**加粗一档**：500 → 600，与界面里其余的强调同一档，
+     不另起一个字重。反色的底牌要看向它才读得出来，字重在余光里就分得清——
+     一屏名字里只有一个更重的。
+     **得在量宽之前设好**：底牌是按 `measureText` 撑开的，先量后改字重，
+     粗出来的字会顶到底牌外面去 */
+  ctx.font = `${data.labelBold ? 600 : 500} ${size}px ${CANVAS_FONT}`;
   ctx.textBaseline = "middle";
   const padX = 8;
   const padY = 3;
-  const w = ctx.measureText(data.label).width + padX * 2;
-  const h = size + padY * 2;
-  const x = data.x + Math.max(data.size * 0.7, 12);
-  const y = data.y - Math.max(data.size * 0.9, 10) - h;
+  const w = ctx.measureText(data.label).width;
+  /* 名字默认挂在节点的右上方。**贴着画布边的那些翻过来**：放大之后节点常常
+     靠在视口边缘，名字照原样画就整条落在画布外——看着就是"放大之后字没了"。
+     够不着就翻到左边 / 下边：节点在屏幕上，名字就在屏幕上 */
+  const dx = Math.max(data.size * 0.7, 12);
+  const dy = Math.max(data.size * 0.9, 10) + size / 2 + padY;
+  const dpr = window.devicePixelRatio || 1;
+  const vw = ctx.canvas.width / dpr;
+  const x = data.x + dx + w + padX > vw ? data.x - dx - w : data.x + dx;
+  const y = data.y - dy - size / 2 < 0 ? data.y + dy : data.y - dy;
   ctx.save();
-  ctx.shadowColor = "rgba(0,0,0,0.6)";
-  ctx.shadowBlur = 12;
-  ctx.beginPath();
-  ctx.roundRect(x, y, w, h, 4);
-  ctx.fillStyle = PILL_BG;
-  ctx.fill();
-  ctx.shadowBlur = 0;
-  ctx.strokeStyle = PILL_BORDER;
-  ctx.lineWidth = 1;
-  ctx.stroke();
-  ctx.fillStyle = PILL_TEXT;
-  ctx.fillText(data.label, x + padX, y + h / 2);
+  if (data.labelSlab) {
+    /* 一块底，圆角 cell（4）、无描边——底已经把它托起来了。
+       **两档**：指到的是深底浅字，选中的反过来，浅底深字。同一副形状、同一个
+       位置，只有明暗调个个儿——"指着"与"选中"是同一件事的两个程度，从前一个是
+       浮起来的两行卡片、一个是这块底牌，看着像两种不同的东西 */
+    const h = size + padY * 2;
+    ctx.shadowColor = "rgba(0,0,0,0.6)";
+    ctx.shadowBlur = 12;
+    ctx.beginPath();
+    ctx.roundRect(x - padX, y - h / 2, w + padX * 2, h, 4);
+    ctx.fillStyle = data.labelInvert ? PILL_TEXT : PILL_BG;
+    ctx.fill();
+    ctx.shadowBlur = 0;
+  } else {
+    /* 裸字：先描一圈画布色再填字（canvas 版的 paint-order: stroke fill），
+       连线从字底下穿过时不至于糊在一起 */
+    ctx.lineWidth = 3.5;
+    ctx.lineJoin = "round";
+    ctx.strokeStyle = LABEL_HALO;
+    ctx.strokeText(data.label, x, y);
+  }
+  ctx.fillStyle = data.labelInvert ? LABEL_HALO : PILL_TEXT;
+  ctx.fillText(data.label, x, y);
   ctx.restore();
 }
 
-/* Hover 悬浮卡（Semantica hoverCard 规格）：径向柔光 + 名称 + 类型行 */
+/* 指到一个节点时画什么。**就是那块标签底牌**（`drawNodeLabel`），不是另一张卡。
+   从前这里是一张浮起来的两行卡片——名字一行、类型一行，位置在节点右上方——
+   于是"指着"和"选中"这两个相邻的状态长成了两种完全不同的东西：一个浮层，
+   一个贴着节点的底牌。类型那一行的信息在右边面板里说得更清楚，代价是每划过
+   一个节点画面上就多一张卡。
+   保留这个函数名是因为 sigma 的 `defaultDrawNodeHover` 认它 */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function drawHoverCard(
   ctx: CanvasRenderingContext2D,
   data: any,
-  _settings: any,
+  settings: any,
 ): void {
-  if (!data.label) return;
-  ctx.save();
-
-  // 柔光: 半径 max(size*4.8, 16), 类型色 alpha 0.18 → 0
-  const glowR = Math.max(data.size * 4.8, 16);
-  const [r, g, b] = hexToRgb((data.typeColor as string) ?? "#888888");
-  const grad = ctx.createRadialGradient(
-    data.x,
-    data.y,
-    0,
-    data.x,
-    data.y,
-    glowR,
+  // 这一层不认 `hideBaseLabel`：那道闸门说的正是"这一个交给高亮层画"，
+  // 高亮层自己再让开就没人画了
+  drawNodeLabel(
+    ctx,
+    data.hideBaseLabel ? { ...data, hideBaseLabel: false } : data,
+    settings,
   );
-  grad.addColorStop(0, `rgba(${r},${g},${b},0.18)`);
-  grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
-  ctx.fillStyle = grad;
-  ctx.beginPath();
-  ctx.arc(data.x, data.y, glowR, 0, Math.PI * 2);
-  ctx.fill();
-
-  /* 卡片：标题 body/500、类型行 fine。**类型不再大写**——界面里没有一处
-     大写拉字距的小标题（表格列头除外），画布也不该自成一套 */
-  const titleSize = CANVAS_TITLE_SIZE;
-  const metaSize = CANVAS_LABEL_SIZE;
-  const padX = 10;
-  const padY = 7;
-  const metaGap = 5;
-  const meta = String(data.typeLabel ?? "");
-  ctx.textBaseline = "top";
-  ctx.font = `500 ${titleSize}px ${CANVAS_FONT}`;
-  const titleW = ctx.measureText(data.label).width;
-  ctx.font = `400 ${metaSize}px ${CANVAS_FONT}`;
-  const metaW = ctx.measureText(meta).width;
-  const w = Math.max(titleW, metaW) + padX * 2;
-  const h = padY * 2 + titleSize + metaGap + metaSize;
-  const x = data.x + Math.max(data.size * 0.9, 16);
-  const y = data.y - Math.max(data.size * 1.1, 16) - h;
-
-  ctx.shadowColor = "rgba(0,0,0,0.62)";
-  ctx.shadowBlur = 15;
-  ctx.beginPath();
-  ctx.roundRect(x, y, w, h, 8); // --radius-panel
-  ctx.fillStyle = "rgba(12,12,12,0.94)";
-  ctx.fill();
-  ctx.shadowBlur = 0;
-  ctx.strokeStyle = "rgba(255,255,255,0.16)";
-  ctx.lineWidth = 1;
-  ctx.stroke();
-
-  ctx.fillStyle = CANVAS_TEXT;
-  ctx.font = `500 ${titleSize}px ${CANVAS_FONT}`;
-  ctx.fillText(data.label, x + padX, y + padY);
-  ctx.fillStyle = CANVAS_TEXT_2;
-  ctx.font = `400 ${metaSize}px ${CANVAS_FONT}`;
-  ctx.fillText(meta, x + padX, y + padY + titleSize + metaGap);
-  ctx.restore();
 }
 
-/* 世界坐标网格：随相机平移/缩放（Figma/tldraw 式无限画布惯例）。
-   4 倍细分 LOD：每层 alpha 随其屏幕间距连续淡入（13px 进场 → 52px 满亮 5.5%），
-   粗层与细层线重合处自然叠亮，形成"大小格"层次；无任何跳变。 */
+/* 世界坐标网格：随相机缩放分级淡入淡出 */
 const GRID_BASE_WORLD = 24; // 基准世界格距（匹配 ~300 尺度的布局）
 const GRID_FADE_IN_PX = 13;
 const GRID_FULL_PX = 52;

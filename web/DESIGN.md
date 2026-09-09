@@ -34,7 +34,7 @@ Glass is a surface treatment, not a colour: `glass` for a panel in peripheral vi
 
 Hover, focus, active, disabled and motion are defined once, in `web/src/ui/`, and a page never writes `hover:`, `focus:`, `transition` or `duration-`. Every control shows a visible focus ring for keyboard users (`--u-ring`); every disabled control is `opacity-40` with `cursor-not-allowed`; every hover settles in `--u-fast` (120 ms) and leaves in `--u-base` (260 ms). A page that needs a control that does not exist adds it to `ui/`, with all five states, and then uses it.
 
-Concretely, a page renders no raw `<button>`, `<input>`, `<textarea>` or `<select>`; it renders `Button`, `IconButton`, `Input`, `Textarea`, `NativeSelect`, `Dropdown`, `SearchSelect`. Confirmation is `DangerConfirm` or `Dialog`, never `window.confirm`. A hint on hover is `Tooltip`, not a bare `title=` on a span (a `title` on a button that already has a visible label is fine).
+Concretely, a page renders no raw `<button>`, `<input>`, `<textarea>` or `<select>`; it renders `Button`, `IconButton`, `Input`, `Textarea`, `Dropdown`, `SearchSelect`. There is no native `<select>` anywhere: its popup is drawn by the operating system and cannot be themed, so one page would show two kinds of dropdown. A small bounded enum is a `Dropdown`; a list of hundreds — the classes of an ontology, the people in a deployment — is a `SearchSelect`. Confirmation is `DangerConfirm` or `Dialog`, never `window.confirm`. A hint on hover is `Tooltip`, not a bare `title=` on a span (a `title` on a button that already has a visible label is fine).
 
 ## 6. A panel is a slot for content
 
@@ -51,6 +51,8 @@ The other thing a panel may be is **the reach of one action**: a settings card (
 Settings and other read-a-column-of-fields pages are centred and width-limited (`mx-auto max-w-4xl`), not stretched to the window.
 
 Exempt: the floating panels on Graph and Ontology. Those are `glass-strong` surfaces over a canvas, and their job is to hold the canvas down so they can be read — a different problem from this one.
+
+A floating panel **shows**; it does not edit. A class, a property, an entity, a fact's interval are read there, and every change — creating, editing, deleting, connecting — opens a `FormDialog`: one title, one form, Cancel and Save at the bottom right, Delete on its own at the bottom left. The pencil beside the panel's close key is the way in. A form inside the panel put half-edited fields next to the definition being read and Save beside Delete; a dialog gives the change its own frame, its own Esc, and leaves the panel to say what the thing is. The dedicated dialogs live in `pages/ontologyDialogs.tsx` and `pages/graphDialogs.tsx`.
 
 ## How this is enforced
 

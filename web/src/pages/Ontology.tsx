@@ -1,19 +1,24 @@
 // 本体编辑器：master-detail 双栏（与 Library 的 SourcesRail 同构）。
 // 左栏 = filter + Classes/Properties 两小节 + 底部 Unmatched 入口；
-// 右侧 = 选中项的表单 / 未匹配信号面板 / 概览。
+// 右侧 = 选中项的详情面板（只展示；建、改、删、连都在弹窗里，见 ontologyDialogs）
+// / 未匹配信号面板 / 概览。
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
 import {
   ArrowLeft,
+  ArrowLeftRight,
   ArrowRight,
   ChevronRight,
   Inbox,
-  Scale,
+  Link2,
   Network,
+  Pencil,
   Plus,
+  Scale,
   Search,
   Split,
+  Table as TableIcon,
   Upload,
   Wand2,
   X,
@@ -22,6 +27,7 @@ import {
   api,
   type EntityTypeView,
   type ImportPlan,
+  type OntologyImportView,
   type OntologyMiss,
   type PlannedItem,
   type OntologyProposals,
@@ -30,84 +36,129 @@ import {
   type RelationTypeView,
   type UniquenessCandidate,
 } from "../api";
+import { OntologyTables, treeParent } from "./ontologyTables";
 import { S } from "../i18n";
 import { useKb } from "../kb";
 import { toast } from "../toast";
 import { OntologySchemaGraph, type SchemaSelection } from "./OntologySchemaGraph";
 import { RulesPanel } from "./RulesPanel";
 import {
+  AttributeDialog,
+  ClassDialog,
+  ConnectDialog,
+  PropertyDialog,
+} from "./ontologyDialogs";
+import {
   Button,
-  Checkbox,
   Chip,
-  ColorPicker,
-  colorForKey,
   DangerConfirm,
   Disclosure,
-  Dropdown,
   IconButton,
   Input,
   Loading,
-  MultiSearchSelect,
   Pager,
   RailItem,
   Row,
   ROW_TRAILING,
   rowClass,
   Segmented,
-  Textarea,
   RAIL_CLS,
-  SearchSelect,
   cn,
   pageSlice,
-  GroupLabel,
   PageHeader,
+  Dialog,
+  LinkButton,
+  Table,
+  TBody,
+  Td,
+  Th,
+  THead,
+  Tr,
+  localDateTime,
 } from "../ui";
 
 /** 左栏行高（py-2 + 13px 文字 + space-y 间隙）与底部预留（新建行 + 分页器） */
 const RAIL_ROW_H = 34;
 const RAIL_RESERVED = 80;
+/** 上次看的是表还是图。**per 浏览器不 per 库**：这是读法的习惯，
+ *  换个知识库不会换读法 */
+const VIEW_KEY = "utopia.ontology.view";
 /** 兜底页行数（首帧未量到高度时用） */
 const RAIL_PAGE = 14;
 /** 过滤模式两节混排时每节的行数 */
-const RAIL_PAGE_MIXED = 6;
 
 /** 右侧详情区当前展示什么。
  *
- *  class / relation / new-class / new-relation / schema / null 这一组共享
- *  同一块工作区：模式图常驻做背景，表单（如果有）停靠在右侧——左栏点一个
- *  类名、画布上点一个节点、模式图自己的搜索框选中一个关系，三条路径落到
- *  的是同一个 `sel`，因此也落到同一份表单，不必再各画一遍。
+ *  class / relation / schema / null 这一组共享同一块工作区：模式图常驻做
+ *  背景，详情面板停靠在右侧——左栏点一个类名、画布上点一个节点、模式图
+ *  自己的搜索框选中一个关系，三条路径落到的是同一个 `sel`，因此也落到同一
+ *  块面板，不必再各画一遍。面板只展示；改动在 `Edit` 的弹窗里。
  *  import / refine / misses 仍是独立的整页视图：那三个不是「关于某个类
  *  或关系」的事，跟模式图没有共同的背景可言。 */
 type Sel =
   | { kind: "class"; id: string }
   | { kind: "relation"; id: string }
-  | { kind: "new-class"; parentId: string | null }
-  // 从模式图上一个类发起「新建关系」时带上它的 id，表单里 domain 预填成它
-  | { kind: "new-relation"; initialDomain?: string | null }
   | { kind: "misses" }
   | { kind: "uniqueness" }
-  // 类型消解：把「大致对」的类换成更具体的那个
-  | { kind: "rules" }
+  // 业务规则那一页。**focusId 是从模式图上点一条规则边过来的**——那一行高亮，
+  // 不必在一页规则里再找一遍
+  | { kind: "rules"; focusId?: string }
   | { kind: "refine" }
   | { kind: "import" }
   // 模式图无选中：看整张图,不停靠表单
   | { kind: "schema" }
   | null;
 
-/** 这次选中会不会在模式图右侧停靠一张表单 */
-const onPanel = (s: Sel) =>
-  s?.kind === "class" ||
-  s?.kind === "relation" ||
-  s?.kind === "new-class" ||
-  s?.kind === "new-relation";
+/** 这次选中会不会在模式图右侧停靠一块面板 */
+const onPanel = (s: Sel) => s?.kind === "class" || s?.kind === "relation";
+
+/** 打开着的编辑弹窗。面板只展示；建、改、删、连都在弹窗里发生 */
+type Edit =
+  | { kind: "class"; existing: EntityTypeView | null; parentId: string | null }
+  | {
+      kind: "property";
+      existing: RelationTypeView | null;
+      // 从一个类出发新建关系时带上它的 id，domain 预填成它
+      initialDomain: string | null;
+    }
+  | { kind: "attribute"; typeId: string; existing: RelationTypeView | null }
+  | { kind: "connect"; cls: EntityTypeView }
+  | null;
 
 export function Ontology() {
   const { kb } = useKb();
   const queryClient = useQueryClient();
   const navigate = useNavigate();
   const [sel, setSel] = useState<Sel>(null);
+  const [edit, setEdit] = useState<Edit>(null);
   const [railTab, setRailTab] = useState<"classes" | "properties">("classes");
+  /* 主区看图还是看表（#498）。**默认图**，而且**记住上次那一版**——这是
+     "我习惯怎么读这一页"，不是"这个链接指向什么"，所以进 localStorage 不进
+     URL（与知识库切换器同一条判断，见 KbScope）。隐私模式下读写都会抛，
+     catch 掉回落到默认，别让整页挂掉 */
+  const [view, setView] = useState<"table" | "diagram">(() => {
+    try {
+      return localStorage.getItem(VIEW_KEY) === "table" ? "table" : "diagram";
+    } catch {
+      return "diagram";
+    }
+  });
+  const switchView = (v: "table" | "diagram") => {
+    setView(v);
+    try {
+      localStorage.setItem(VIEW_KEY, v);
+    } catch {
+      // 存不下就只在这一次会话里记着
+    }
+    if (!onPanel(sel)) setSel({ kind: "schema" });
+  };
+  /** Import / Rules / Refine / Overlaps / Unmatched 那几页把主区整个接管了 */
+  const inWorkflow =
+    sel?.kind === "import" ||
+    sel?.kind === "refine" ||
+    sel?.kind === "uniqueness" ||
+    sel?.kind === "rules" ||
+    sel?.kind === "misses";
   // 模式图详情面板停在哪一段。**跨选中保留**：在实例上挨个类看下去，
   // 是一种真实的读法，每换一个类就被弹回定义页会打断它
   const [panelTab, setPanelTab] = useState<
@@ -160,6 +211,13 @@ export function Ontology() {
     enabled: !!kb,
   });
   const overlaps = uniqueness.data?.candidates ?? [];
+  /* 业务规则：模式图要把它们画成边，规则页要列出来——同一个 query key
+     取一次，两处共用缓存 */
+  const rules = useQuery({
+    queryKey: ["rules", kb?.id],
+    queryFn: () => api.rules(kb!.id),
+    enabled: !!kb,
+  });
 
   const refresh = () =>
     queryClient.invalidateQueries({ queryKey: ["ontology", kb?.id] });
@@ -214,8 +272,6 @@ export function Ontology() {
         (r) => r.kind === "attribute" && r.domains.includes(selectedClass.id),
       )
     : [];
-  // 新建的类还没有关系也没有实例，只剩定义这一段
-  const classTab = selectedClass ? panelTab : "definition";
 
   return (
     <div className="h-full flex">
@@ -223,42 +279,71 @@ export function Ontology() {
       <aside className={`${RAIL_CLS} flex flex-col`}>
         {/* 与图谱页的搜索框同一副身材、同一个角落（左上各 12px、中号、232 宽）：
             两个标签页切来切去，框留在原地 */}
-        <div className="px-2 pt-3 pb-1">
-          <Input
-            icon={<Search size={12} />}
-            placeholder={S.ontology.filter}
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-          />
-        </div>
-        {/* 模式图：本体结构的主视图,不是 Import/Refine/Unmatched 那种管理性操作——
-            放在筛选框正下方、列表上方,与那三个钉在底部的按钮拉开位置,
-            视觉上就说明了「这是浏览本体的另一种方式」而不是「这是一项维护动作」 */}
-        <div className="px-2 pb-1">
+        {/* 图 / 表：这一页的两种画法。**排在筛选框上面**——它定的是这一页
+            是什么，筛选框是在里面找东西；而且表格那一档筛选框是收起的，
+            切换键排在下面的话位置会跟着跳。
+
+            **一个键，写的是要去的那一版**：两档并排的话，得先读出哪一档亮着
+            才知道自己在看什么，而主区摆的是表还是图一眼就看得出。
+
+            **Import / Rules / Refine / Overlaps / Unmatched 接管主区时，它是
+            回去的路**——那时候写的是你原本在看的那一版，点了就回去。从前这条路
+            是「Schema diagram」那一行，换成切换键之后断过一阵：进了 Import
+            再没有任何一处能回到图或表。
+
+            **自成一组**：与底下钉住那一组同一个做法，外层一条线加 py-2 隔开，
+            行本身不画框——它跟筛选框不是同一类东西，只隔 4px 会读成一串 */}
+        {/* 上面一行是**动作**（换到另一版），下面一行是**位置**（现在看的是哪一版）。
+            一行里塞两件事，就成了「这个键写的到底是我在哪儿、还是我要去哪儿」；
+            分成两行之后，位置那一行还兼着从 Import / Rules 那几页回来的路——
+            它们把主区整个接管，从前没有任何一处能回到图或表。
+            **自成一组**：与底下钉住那一组同一个做法，外层一条线加 py-2 隔开 */}
+        <div className="u-rail-list shrink-0 border-b border-line px-2 py-2">
           <Row
             density="nav"
-            active={sel?.kind === "schema"}
-            icon={<Network size={14} />}
+            icon={<ArrowLeftRight size={14} />}
+            onClick={() => switchView(view === "diagram" ? "table" : "diagram")}
+          >
+            {view === "diagram"
+              ? S.ontology.switchToTable
+              : S.ontology.switchToGraph}
+          </Row>
+          <Row
+            density="nav"
+            active={!inWorkflow}
+            icon={
+              view === "diagram" ? <Network size={14} /> : <TableIcon size={14} />
+            }
             onClick={() => setSel({ kind: "schema" })}
           >
-            {S.ontology.schemaDiagram}
+            {view === "diagram" ? S.ontology.viewDiagram : S.ontology.viewTable}
           </Row>
         </div>
-        {/* 分段切换：与登录页模式切换/日程选择器同一语汇（bg-surface-2 容器 + 激活反白）；
-            过滤时列表例外：两节混排同时给出命中 */}
-        {/* 撑满的东西不能再带外边距：w-full 是按父容器算的，mx-3 只会把它往右
-            推出侧栏 12px。缩进交给外层 */}
-        <div className="px-2 pb-1">
-          <Segmented
-            fill
-            value={railTab}
-            onChange={setRailTab}
-            options={[
-              { value: "classes", label: S.ontology.tabClasses },
-              { value: "properties", label: S.ontology.tabProperties },
-            ]}
-          />
-        </div>
+        {/* 筛选框、两档、清单**只属于图那一档**——表格自己就是清单，而且比这一列
+            强（有列、能排序、带计数）。换档时它们**折起来**而不是瞬间消失：
+            左栏是一直在的，一整段凭空没掉会让人以为跳到了别的页 */}
+        <div
+          className={cn("u-rail-fold", view === "table" && "is-folded")}
+        >
+          <div className="px-2 pt-3 pb-1">
+            <Input
+              icon={<Search size={12} />}
+              placeholder={S.ontology.filter}
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+            />
+          </div>
+          <div className="px-2 pb-1">
+            <Segmented
+              fill
+              value={railTab}
+              onChange={setRailTab}
+              options={[
+                { value: "classes", label: S.ontology.tabClasses },
+                { value: "properties", label: S.ontology.tabProperties },
+              ]}
+            />
+          </div>
         <div
           ref={listRef}
           className="flex-1 min-h-0 overflow-hidden px-2 pb-2 flex flex-col"
@@ -269,9 +354,11 @@ export function Ontology() {
               className="mb-1"
               icon={<Plus size={14} />}
               onClick={() =>
-                railTab === "classes"
-                  ? setSel({ kind: "new-class", parentId: null })
-                  : setSel({ kind: "new-relation" })
+                setEdit(
+                  railTab === "classes"
+                    ? { kind: "class", existing: null, parentId: null }
+                    : { kind: "property", existing: null, initialDomain: null },
+                )
               }
             >
               {railTab === "classes"
@@ -279,28 +366,11 @@ export function Ontology() {
                 : S.ontology.newProperty}
             </Row>
           )}
-          {filter.trim() ? (
-            <>
-              <GroupLabel className="px-2 pt-2 pb-1">{S.ontology.tabClasses}</GroupLabel>
-              <ClassTree
-                types={entity_types}
-                filter={filter}
-                collapsed={collapsed}
-                onToggle={() => {}}
-                selectedId={selectedClass?.id ?? null}
-                onSelect={(id) => setSel({ kind: "class", id })}
-                pageSize={RAIL_PAGE_MIXED}
-              />
-              <GroupLabel className="px-2 pt-3 pb-1">{S.ontology.tabProperties}</GroupLabel>
-              <PropertyList
-                relations={relations}
-                filter={filter}
-                selectedId={selectedProp?.id ?? null}
-                onSelect={(id) => setSel({ kind: "relation", id })}
-                pageSize={RAIL_PAGE_MIXED}
-              />
-            </>
-          ) : railTab === "classes" ? (
+          {/* **筛选也认这两档**。从前一有筛选词就两节混排、类与关系一起给，
+              理由是"搜的时候未必知道要找的是哪一种"；代价是标签明明停在
+              Classes 上却不算数，而它就在上面两厘米处。一个选中却被无视的
+              控件，比多点一下糟。想找关系就切过去，那一下是明的 */}
+          {railTab === "classes" ? (
             <ClassTree
               types={entity_types}
               filter={filter}
@@ -324,6 +394,7 @@ export function Ontology() {
               pageSize={railRows}
             />
           )}
+        </div>
         </div>
         {/* 底部常驻：关于本体的几个入口——从外部拿一份本体、业务规则、类型消解，
             以及数据顶回来的两种信号。一条分隔线说明它们是钉住的，行本身与上面
@@ -418,6 +489,7 @@ export function Ontology() {
               <div>
                 <RulesPanel
                   kbId={kb.id}
+                  focusId={sel.kind === "rules" ? sel.focusId : undefined}
                   classes={entity_types}
                   attributes={relation_types.filter((r) => r.kind === "attribute")}
                   onError={onError}
@@ -438,9 +510,29 @@ export function Ontology() {
         </div>
       ) : (
         <div className="flex-1 min-w-0 relative">
-          <OntologySchemaGraph
+          {view === "table" ? (
+            <OntologyTables
+              entityTypes={entity_types}
+              relationTypes={relation_types}
+              onOpenClass={(t) => setSel({ kind: "class", id: t.id })}
+              onOpenProperty={(r) => setSel({ kind: "relation", id: r.id })}
+              onOpenAttribute={(a) =>
+                setEdit({
+                  kind: "attribute",
+                  typeId: a.domains[0] ?? "",
+                  existing: a,
+                })
+              }
+              onSeeInstances={(t) => {
+                setPanelTab("instances");
+                setSel({ kind: "class", id: t.id });
+              }}
+            />
+          ) : (
+            <OntologySchemaGraph
             entityTypes={entity_types}
             relationTypes={relation_types}
+            rules={rules.data?.rules ?? []}
             selected={
               sel?.kind === "class" || sel?.kind === "relation"
                 ? ({ kind: sel.kind, id: sel.id } as SchemaSelection)
@@ -448,170 +540,222 @@ export function Ontology() {
             }
             // 点空白处取消选中走的也是 closePanel：不然点画布关掉的面板没有
             // 退场动画，而点画布正是最常用的那种关法
-            onSelect={(next) => (next ? setSel(next) : closePanel())}
-          />
-          {(panelSel?.kind === "new-class" || selectedClass) && (
+            // 点一条规则边：切到业务规则那一页，并把那一行点亮
+            onSelect={(next) =>
+              next
+                ? setSel(
+                    next.kind === "rule"
+                      ? { kind: "rules", focusId: next.id }
+                      : next,
+                  )
+                : closePanel()
+            }
+            />
+          )}
+          {selectedClass && (
             <DockedPanel
               onClose={closePanel}
               exiting={!onPanel(sel)}
+              actions={
+                <IconButton
+                  size="sm"
+                  label={S.ontology.editClass}
+                  onClick={() =>
+                    setEdit({
+                      kind: "class",
+                      existing: selectedClass,
+                      parentId: selectedClass.primary_parent ?? null,
+                    })
+                  }
+                >
+                  <Pencil size={13} />
+                </IconButton>
+              }
               header={
                 <PanelHeader
-                  color={selectedClass?.color}
-                  square={selectedClass?.shape === "square"}
-                  title={selectedClass?.label ?? S.ontology.newClass}
-                  sub={
-                    selectedClass
-                      ? `${selectedClass.key} · ${S.ontology.usage(selectedClass.usage)}`
-                      : undefined
-                  }
-                  builtin={selectedClass?.builtin}
+                  color={selectedClass.color}
+                  square={selectedClass.shape === "square"}
+                  title={selectedClass.label}
+                  sub={`${selectedClass.key} · ${S.ontology.usage(selectedClass.usage)}`}
+                  builtin={selectedClass.builtin}
                 />
               }
               tabs={
-                selectedClass && (
-                  <Segmented
-                    fill
-                    size="sm"
-                    value={classTab}
-                    onChange={setPanelTab}
-                    options={[
-                      {
-                        value: "definition",
-                        label: S.ontology.schemaTabDefinition,
-                      },
-                      {
-                        value: "relations",
-                        label: S.ontology.schemaTabRelations,
-                      },
-                      {
-                        value: "attributes",
-                        label: S.ontology.schemaTabAttributes,
-                      },
-                      {
-                        value: "instances",
-                        label: S.ontology.schemaTabInstances,
-                      },
-                    ]}
-                  />
-                )
+                <Segmented
+                  fill
+                  size="sm"
+                  value={panelTab}
+                  onChange={setPanelTab}
+                  options={[
+                    {
+                      value: "definition",
+                      label: S.ontology.schemaTabDefinition,
+                    },
+                    {
+                      value: "relations",
+                      label: S.ontology.schemaTabRelations,
+                    },
+                    {
+                      value: "attributes",
+                      label: S.ontology.schemaTabAttributes,
+                    },
+                    {
+                      value: "instances",
+                      label: S.ontology.schemaTabInstances,
+                    },
+                  ]}
+                />
               }
             >
-              {/* 三段用 hidden 藏，不卸载：表单里改了一半的字段、实例列表翻到的
-                  第几页，都该在切回来的时候还在 */}
-              <div className={classTab === "definition" ? "" : "hidden"}>
-                <ClassForm
-                  key={
-                    selectedClass?.id ??
-                    `new-${panelSel?.kind === "new-class" ? panelSel.parentId : "root"}`
-                  }
-                  kbId={kb.id}
-                  existing={selectedClass}
-                  parentId={
-                    panelSel?.kind === "new-class"
-                      ? panelSel.parentId
-                      : (selectedClass?.primary_parent ?? null)
-                  }
+              {/* 四段用 hidden 藏，不卸载：实例列表翻到的第几页，切回来的时候还在 */}
+              <div className={panelTab === "definition" ? "" : "hidden"}>
+                <ClassDefinition
+                  cls={selectedClass}
                   allTypes={entity_types}
-                  headless
-                  onNewSub={
-                    selectedClass
-                      ? () =>
-                          setSel({
-                            kind: "new-class",
-                            parentId: selectedClass.id,
-                          })
-                      : undefined
+                  onNewSub={() =>
+                    setEdit({ kind: "class", existing: null, parentId: selectedClass.id })
                   }
-                  onDone={(createdId) => {
-                    // 新建成功即选中它：立刻能看到、能继续编辑
-                    if (sel?.kind === "new-class")
-                      setSel(
-                        createdId
-                          ? { kind: "class", id: createdId }
-                          : { kind: "schema" },
-                      );
-                    afterOntologyChange();
-                  }}
-                  onError={onError}
                 />
               </div>
-              {selectedClass && (
-                <>
-                  <div className={classTab === "relations" ? "" : "hidden"}>
-                    <RelationshipsCard
-                      kbId={kb.id}
-                      cls={selectedClass}
-                      relations={relations}
-                      allTypes={entity_types}
-                      onChanged={afterOntologyChange}
-                      onError={onError}
-                      onSelect={(id) => setSel({ kind: "relation", id })}
-                      onAddNew={() =>
-                        setSel({
-                          kind: "new-relation",
-                          initialDomain: selectedClass.id,
-                        })
-                      }
-                    />
-                  </div>
-                  <div className={classTab === "attributes" ? "" : "hidden"}>
-                    <AttributesCard
-                      kbId={kb.id}
-                      type={selectedClass}
-                      attributes={classAttributes}
-                      onChanged={afterOntologyChange}
-                      onError={onError}
-                    />
-                  </div>
-                  <div className={classTab === "instances" ? "" : "hidden"}>
-                    <InstancesCard kbId={kb.id} type={selectedClass} />
-                  </div>
-                </>
-              )}
+              <div className={panelTab === "relations" ? "" : "hidden"}>
+                <RelationshipsCard
+                  cls={selectedClass}
+                  relations={relations}
+                  allTypes={entity_types}
+                  onSelect={(id) => setSel({ kind: "relation", id })}
+                  onConnect={() => setEdit({ kind: "connect", cls: selectedClass })}
+                  onAddNew={() =>
+                    setEdit({
+                      kind: "property",
+                      existing: null,
+                      initialDomain: selectedClass.id,
+                    })
+                  }
+                />
+              </div>
+              <div className={panelTab === "attributes" ? "" : "hidden"}>
+                <AttributesCard
+                  attributes={classAttributes}
+                  onEdit={(a) =>
+                    setEdit({ kind: "attribute", typeId: selectedClass.id, existing: a })
+                  }
+                  onNew={() =>
+                    setEdit({ kind: "attribute", typeId: selectedClass.id, existing: null })
+                  }
+                />
+              </div>
+              <div className={panelTab === "instances" ? "" : "hidden"}>
+                <InstancesCard kbId={kb.id} type={selectedClass} />
+              </div>
             </DockedPanel>
           )}
-          {(panelSel?.kind === "new-relation" || selectedProp) && (
+          {selectedProp && (
             <DockedPanel
               onClose={closePanel}
               exiting={!onPanel(sel)}
+              actions={
+                <IconButton
+                  size="sm"
+                  label={S.ontology.editProperty}
+                  onClick={() =>
+                    setEdit({ kind: "property", existing: selectedProp, initialDomain: null })
+                  }
+                >
+                  <Pencil size={13} />
+                </IconButton>
+              }
               header={
                 <PanelHeader
-                  title={selectedProp?.label ?? S.ontology.newProperty}
-                  sub={
-                    selectedProp
-                      ? S.ontology.usage(selectedProp.usage)
-                      : undefined
-                  }
-                  builtin={selectedProp?.builtin}
+                  title={selectedProp.label}
+                  sub={`${selectedProp.key} · ${S.ontology.usage(selectedProp.usage)}`}
+                  builtin={selectedProp.builtin}
                 />
               }
             >
-              <div>
-                <PropertyForm
-                  key={selectedProp?.id ?? "new"}
-                  kbId={kb.id}
-                  existing={selectedProp}
-                  allTypes={entity_types}
-                  allRelations={relations}
-                  initialDomain={
-                    panelSel?.kind === "new-relation" ? panelSel.initialDomain : null
-                  }
-                  headless
-                  onDone={(createdId) => {
-                    if (sel?.kind === "new-relation")
-                      setSel(
-                        createdId
-                          ? { kind: "relation", id: createdId }
-                          : { kind: "schema" },
-                      );
-                    afterOntologyChange();
-                  }}
-                  onError={onError}
-                />
-              </div>
+              <PropertyDefinition
+                rel={selectedProp}
+                allTypes={entity_types}
+                allRelations={relations}
+              />
             </DockedPanel>
           )}
         </div>
+      )}
+
+      {/* 编辑弹窗：面板只展示，建、改、删、连都在这里发生。建成的立刻选中——
+          能看到、能接着改；删掉的把面板收起来 */}
+      {edit?.kind === "class" && (
+        <ClassDialog
+          kbId={kb.id}
+          existing={edit.existing}
+          parentId={edit.parentId}
+          allTypes={entity_types}
+          onClose={() => setEdit(null)}
+          onSaved={(createdId) => {
+            setEdit(null);
+            if (createdId) setSel({ kind: "class", id: createdId });
+            afterOntologyChange();
+          }}
+          onDeleted={() => {
+            setEdit(null);
+            closePanel();
+            afterOntologyChange();
+          }}
+          onError={onError}
+        />
+      )}
+      {edit?.kind === "property" && (
+        <PropertyDialog
+          kbId={kb.id}
+          existing={edit.existing}
+          allTypes={entity_types}
+          allRelations={relations}
+          initialDomain={edit.initialDomain}
+          onClose={() => setEdit(null)}
+          onSaved={(createdId) => {
+            setEdit(null);
+            if (createdId) setSel({ kind: "relation", id: createdId });
+            afterOntologyChange();
+          }}
+          onDeleted={() => {
+            setEdit(null);
+            closePanel();
+            afterOntologyChange();
+          }}
+          onError={onError}
+        />
+      )}
+      {edit?.kind === "attribute" && (
+        <AttributeDialog
+          kbId={kb.id}
+          typeId={edit.typeId}
+          existing={edit.existing}
+          onClose={() => setEdit(null)}
+          onSaved={() => {
+            setEdit(null);
+            afterOntologyChange();
+          }}
+          onDeleted={() => {
+            setEdit(null);
+            afterOntologyChange();
+          }}
+          onError={onError}
+        />
+      )}
+      {edit?.kind === "connect" && (
+        <ConnectDialog
+          kbId={kb.id}
+          cls={edit.cls}
+          relations={relations}
+          onClose={() => setEdit(null)}
+          onConnected={(id) => {
+            setEdit(null);
+            afterOntologyChange();
+            // 连完直接跳到那条关系：域/值域改没改、改对了没有，一眼可见
+            setSel({ kind: "relation", id });
+          }}
+          onError={onError}
+        />
       )}
     </div>
   );
@@ -632,12 +776,15 @@ export function Ontology() {
 
 function DockedPanel({
   header,
+  actions,
   tabs,
   exiting,
   onClose,
   children,
 }: {
   header: React.ReactNode;
+  /** 关闭键左边的动作（编辑）：面板只展示，改动从这里开弹窗 */
+  actions?: React.ReactNode;
   /** 分段控件，跟着标题一起固定在顶上——它要能一直点得到 */
   tabs?: React.ReactNode;
   /** 正在退场：演动画，期间不再接受点击（u-dock-out 里带了 pointer-events） */
@@ -653,14 +800,12 @@ function DockedPanel({
     >
       <div className="shrink-0 flex items-start justify-between gap-2 px-4 py-4 border-b border-line">
         <div className="min-w-0">{header}</div>
-        <IconButton
-          size="sm"
-          label={S.ontology.schemaClosePanel}
-          className="-mr-1 -mt-1"
-          onClick={onClose}
-        >
-          <X size={15} />
-        </IconButton>
+        <div className="-mr-1 -mt-1 flex shrink-0 items-center gap-1">
+          {actions}
+          <IconButton size="sm" label={S.ontology.schemaClosePanel} onClick={onClose}>
+            <X size={15} />
+          </IconButton>
+        </div>
       </div>
       {tabs && <div className="shrink-0 px-4 pt-3 pb-1">{tabs}</div>}
       <div className="u-scroll flex-1 min-h-0 overflow-y-auto flex flex-col gap-3 px-4 py-3">
@@ -761,23 +906,20 @@ function InstancesCard({ kbId, type }: { kbId: string; type: EntityTypeView }) {
  *  走的是 PropertyForm 保存时同一个 updateRelationType，只是把「打开表单、
  *  找到多选框、加一个类」压缩成一步。 */
 function RelationshipsCard({
-  kbId,
   cls,
   relations,
   allTypes,
-  onChanged,
-  onError,
   onSelect,
+  onConnect,
   onAddNew,
 }: {
-  kbId: string;
   cls: EntityTypeView;
   /** kind === "relation" 的那些——attribute 的宾语是字面值，谈不上「连着」 */
   relations: RelationTypeView[];
   allTypes: EntityTypeView[];
-  onChanged: () => void;
-  onError: (e: unknown) => void;
   onSelect: (relationId: string) => void;
+  /** 用一个已有的关系连接这个类：开弹窗 */
+  onConnect: () => void;
   onAddNew: () => void;
 }) {
   const labelOf = (id: string) =>
@@ -786,53 +928,47 @@ function RelationshipsCard({
   const outgoing = relations.filter((r) => r.domains.includes(cls.id));
   const incoming = relations.filter((r) => r.ranges.includes(cls.id));
 
-  const [connectId, setConnectId] = useState("");
-  const [connectSide, setConnectSide] = useState<"domain" | "range">("domain");
-  useEffect(() => {
-    setConnectId("");
-  }, [cls.id]);
-
-  const connect = useMutation({
-    mutationFn: () => {
-      const rel = relations.find((r) => r.id === connectId);
-      if (!rel) return Promise.reject(new Error("relation not found"));
-      // 只加不减：已经连着的那一侧原样保留，另一侧才可能被追加。
-      // Set 去重——挑到已经连过的关系时这是个无害的空操作，不必先禁用按钮
-      const domains =
-        connectSide === "domain"
-          ? [...new Set([...rel.domains, cls.id])]
-          : rel.domains;
-      const ranges =
-        connectSide === "range"
-          ? [...new Set([...rel.ranges, cls.id])]
-          : rel.ranges;
-      return api.updateRelationType(kbId, rel.id, {
-        label: rel.label,
-        temporal: rel.temporal,
-        functional: rel.functional,
-        inverse_functional: rel.inverse_functional,
-        is_transitive: rel.is_transitive,
-        is_symmetric: rel.is_symmetric,
-        is_asymmetric: rel.is_asymmetric,
-        is_irreflexive: rel.is_irreflexive,
-        inverse_of: rel.inverse_of,
-        sub_property_of: rel.sub_property_of,
-        description: rel.description,
-        domains,
-        ranges,
-      });
-    },
-    onSuccess: () => {
-      const rel = relations.find((r) => r.id === connectId);
-      toast.success(S.ontology.schemaConnected(rel?.label ?? ""));
-      const id = connectId;
-      setConnectId("");
-      onChanged();
-      // 连完直接跳到那条关系：域/值域改没改、改对了没有，一眼可见
-      onSelect(id);
-    },
-    onError,
-  });
+  /** 一组可折叠（#455 的解剖：折叠柄、头、缩进的正文）。缺省展开——
+   *  折起来是为了在长列表里跳过一段，不是为了藏 */
+  const Group = ({
+    dir,
+    rows,
+  }: {
+    dir: "out" | "in";
+    rows: RelationTypeView[];
+  }) => {
+    const [open, setOpen] = useState(true);
+    return (
+      <div>
+        {/* 头是一行 Row：折叠柄占图标格（16 宽），正文缩进同样的 24，
+            于是下面每一行的方向箭头正好落在组标题的箭头底下 */}
+        <Row
+          className="-mx-2 mt-1"
+          icon={
+            <span className="flex w-4 justify-center">
+              <ChevronRight size={12} className={cn("u-turn", open && "rotate-90")} />
+            </span>
+          }
+          onClick={() => setOpen((v) => !v)}
+        >
+          <span className="flex items-center gap-2 text-small font-medium">
+            {dir === "out" ? <ArrowRight size={10} /> : <ArrowLeft size={10} />}
+            <span className="truncate">
+              {dir === "out" ? S.ontology.schemaOutgoing : S.ontology.schemaIncoming}
+            </span>
+            {rows.length > 1 && <span className="u-num">{rows.length}</span>}
+          </span>
+        </Row>
+        {open && (
+          <div className="pl-6">
+            {rows.map((r) => (
+              <RelationRow key={`${dir}:${r.id}`} r={r} dir={dir} />
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  };
 
   const RelationRow = ({ r, dir }: { r: RelationTypeView; dir: "out" | "in" }) => (
     // 悬停要有底色：这一行整条可点，只把文字提亮半级在深底上几乎看不出来。
@@ -868,349 +1004,62 @@ function RelationshipsCard({
         </p>
       ) : (
         <div className="mb-2">
-          {outgoing.length > 0 && (
-            <>
-              <GroupLabel
-                className="pb-1 pt-2"
-                icon={<ArrowRight size={10} />}
-                count={outgoing.length > 1 ? outgoing.length : undefined}
-              >
-                {S.ontology.schemaOutgoing}
-              </GroupLabel>
-              <div>
-                {outgoing.map((r) => (
-                  <RelationRow key={`out:${r.id}`} r={r} dir="out" />
-                ))}
-              </div>
-            </>
-          )}
-          {incoming.length > 0 && (
-            <>
-              <GroupLabel
-                className="pb-1 pt-2"
-                icon={<ArrowLeft size={10} />}
-                count={incoming.length > 1 ? incoming.length : undefined}
-              >
-                {S.ontology.schemaIncoming}
-              </GroupLabel>
-              <div>
-                {incoming.map((r) => (
-                  <RelationRow key={`in:${r.id}`} r={r} dir="in" />
-                ))}
-              </div>
-            </>
-          )}
+          {outgoing.length > 0 && <Group dir="out" rows={outgoing} />}
+          {incoming.length > 0 && <Group dir="in" rows={incoming} />}
         </div>
       )}
-      <div className="border-t border-line pt-3">
-        <p className="text-fine text-ink-2 mb-2">
-          {S.ontology.schemaConnectHint}
-        </p>
-        <div className="flex gap-2 mb-2">
-          <SearchSelect
-            value={connectId}
-            onChange={setConnectId}
-            options={relations.map((r) => ({
-              value: r.id,
-              label: r.label,
-              hint: r.key,
-            }))}
-            size="sm"
-            className="flex-1 min-w-0"
-            placeholder={S.ontology.schemaConnectPlaceholder}
-          />
-        </div>
-        <div className="flex items-center gap-2 mb-2">
-          <span className="text-small font-medium text-ink-2">
-            {S.ontology.schemaConnectAs}
-          </span>
-          <Segmented
-            size="sm"
-            value={connectSide}
-            onChange={setConnectSide}
-            options={[
-              { value: "domain", label: S.ontology.domainLabel },
-              { value: "range", label: S.ontology.rangeLabel },
-            ]}
-          />
-        </div>
-        <Button
-          size="sm"
-          variant="secondary"
-          disabled={!connectId || connect.isPending}
-          onClick={() => connect.mutate()}
-        >
-          {S.ontology.schemaConnect}
-        </Button>
-      </div>
-      <div className="mt-2 pt-2 border-t border-line">
-        <Button
-          variant="ghost"
-          size="sm"
-          icon={<Plus size={13} />}
-          className="-ml-2"
-          onClick={onAddNew}
-        >
-          {S.ontology.schemaAddRelationship}
-        </Button>
-      </div>
+      {/* 改动开弹窗：连一个已有的关系、或新建一条。面板这一段只展示。
+          两行与上面的关系行同一副身材 */}
+      <Row className="-mx-2 mt-2" icon={<Link2 size={14} />} onClick={onConnect}>
+        {S.ontology.connectOpen}
+      </Row>
+      <Row className="-mx-2" icon={<Plus size={14} />} onClick={onAddNew}>
+        {S.ontology.schemaAddRelationship}
+      </Row>
     </div>
   );
 }
 
-/* ---------- 属性卡片：选中类的字面值字段（行内增改删） ---------- */
+/* ---------- 属性卡片：选中类的字面值字段（改动开弹窗） ---------- */
 
-/** 导出给模式图复用：选中一个类时，检查器里嵌的就是这一张卡片本身，
- *  不是另一份只读摘要——编辑发生在同一处，不必跳回本体主视图 */
-export function AttributesCard({
-  kbId,
-  type,
+function AttributesCard({
   attributes,
-  onChanged,
-  onError,
+  onEdit,
+  onNew,
 }: {
-  kbId: string;
-  type: EntityTypeView;
   attributes: RelationTypeView[];
-  onChanged: () => void;
-  onError: (e: unknown) => void;
+  onEdit: (attribute: RelationTypeView) => void;
+  onNew: () => void;
 }) {
-  // 行内编辑：一次只展开一行（属性 id 或 "new"）
-  const [editing, setEditing] = useState<string | null>(null);
-  useEffect(() => setEditing(null), [type.id]);
-
   return (
     <div>
       <p className="mb-2 text-fine text-ink-2">
         {S.ontology.attributesHint}
       </p>
       <div className="divide-y divide-line">
-        {attributes.map((a) =>
-          editing === a.id ? (
-            <AttributeForm
-              key={a.id}
-              kbId={kbId}
-              typeId={type.id}
-              existing={a}
-              onDone={() => {
-                setEditing(null);
-                onChanged();
-              }}
-              onCancel={() => setEditing(null)}
-              onError={onError}
-            />
-          ) : (
-            <Row
-              key={a.id}
-              className="-mx-2"
-              trailing={<span className="u-num">{S.ontology.usage(a.usage)}</span>}
-              onClick={() => setEditing(a.id)}
-            >
-              <span className="flex items-center gap-2">
-                <span className="truncate">{a.label}</span>
-                <Chip tone="neutral">
-                  {S.ontology.datatypeNames[a.datatype ?? "text"]}
-                </Chip>
-                {a.unit && (
-                  <span className="shrink-0 text-small text-ink-2">{a.unit}</span>
-                )}
-                {a.functional && <Chip tone="info">1:1</Chip>}
-              </span>
-            </Row>
-          ),
-        )}
-      </div>
-      {editing === "new" ? (
-        <div className="pt-2">
-          <AttributeForm
-            kbId={kbId}
-            typeId={type.id}
-            existing={null}
-            onDone={() => {
-              setEditing(null);
-              onChanged();
-            }}
-            onCancel={() => setEditing(null)}
-            onError={onError}
-          />
-        </div>
-      ) : (
-        <Button
-          variant="ghost"
-          size="sm"
-          icon={<Plus size={13} />}
-          className="mt-2 -ml-2"
-          onClick={() => setEditing("new")}
-        >
-          {S.ontology.newAttribute}
-        </Button>
-      )}
-    </div>
-  );
-}
-
-function AttributeForm({
-  kbId,
-  typeId,
-  existing,
-  onDone,
-  onCancel,
-  onError,
-}: {
-  kbId: string;
-  typeId: string;
-  existing: RelationTypeView | null;
-  onDone: () => void;
-  onCancel: () => void;
-  onError: (e: unknown) => void;
-}) {
-  const [key, setKey] = useState(existing?.key ?? "");
-  const [label, setLabel] = useState(existing?.label ?? "");
-  const [datatype, setDatatype] = useState(existing?.datatype ?? "text");
-  const [unit, setUnit] = useState(existing?.unit ?? "");
-  // 单值 = functional：新值经时态引擎闭合旧值（属性历史的来源）。多数属性如此，默认开
-  const [single, setSingle] = useState(existing?.functional ?? true);
-  const [description, setDescription] = useState(existing?.description ?? "");
-
-  const save = useMutation({
-    mutationFn: async (): Promise<unknown> =>
-      existing
-        ? api.updateRelationType(kbId, existing.id, {
-            label,
-            temporal: existing.temporal,
-            functional: single,
-            inverse_functional: false,
-            description,
-            datatype,
-            unit,
-          })
-        : api.createRelationType(kbId, {
-            key,
-            label,
-            kind: "attribute",
-            domains: [typeId],
-            temporal: "state",
-            functional: single,
-            inverse_functional: false,
-            description,
-            datatype,
-            unit,
-          }),
-    onSuccess: () => {
-      toast.success(existing ? S.toast.saved : S.toast.created);
-      onDone();
-    },
-    onError,
-  });
-  const remove = useMutation({
-    mutationFn: () => api.deleteRelationType(kbId, existing!.id),
-    onSuccess: () => {
-      toast.success(S.toast.deleted);
-      onDone();
-    },
-    onError,
-  });
-
-  const lbl = "block text-small font-medium text-ink-2 mb-1";
-  return (
-    <div className="py-3 space-y-3">
-      {!existing && (
-        <div className="flex gap-2">
-          <div className="flex-1">
-            <label className={lbl}>{S.ontology.key}</label>
-            <Input
-              value={key}
-              onChange={(e) => setKey(e.target.value)}
-              className="w-full"
-              placeholder="salary"
-            />
-          </div>
-          <div className="flex-1">
-            <label className={lbl}>{S.ontology.label}</label>
-            <Input
-              value={label}
-              onChange={(e) => setLabel(e.target.value)}
-              className="w-full"
-            />
-          </div>
-        </div>
-      )}
-      {existing && (
-        <div>
-          <label className={lbl}>{S.ontology.label}</label>
-          <Input
-            value={label}
-            onChange={(e) => setLabel(e.target.value)}
-            className="w-full"
-          />
-        </div>
-      )}
-      <div className="flex gap-2">
-        <div className="flex-1">
-          <label className={lbl}>{S.ontology.attrDatatype}</label>
-          <Dropdown
-            value={datatype}
-            onChange={(v) => setDatatype(v as typeof datatype)}
-            className="w-full"
-            options={(["text", "number", "date", "bool"] as const).map((d) => ({
-              value: d,
-              label: S.ontology.datatypeNames[d],
-            }))}
-          />
-        </div>
-        <div className="flex-1">
-          <label className={lbl}>
-            {S.ontology.attrUnit}{" "}
-            <span className="text-ink-2">
-              ({S.ontology.attrUnitHint})
-            </span>
-          </label>
-          <Input
-            value={unit}
-            onChange={(e) => setUnit(e.target.value)}
-            className="w-full"
-          />
-        </div>
-      </div>
-      <Checkbox
-        checked={single}
-        onChange={(e) => setSingle(e.target.checked)}
-        label={S.ontology.attrSingle}
-      />
-      <div>
-        <label className={lbl}>{S.ontology.description}</label>
-        <Textarea
-          className="w-full min-h-24 resize-y"
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-        />
-      </div>
-      <div className="flex gap-2">
-        <Button variant="primary"
-          size="sm"
-          onClick={() => save.mutate()}
-          disabled={
-            save.isPending || !label.trim() || (!existing && !key.trim())
-          }
-        >
-          {S.ontology.save}
-        </Button>
-        <Button size="sm" variant="secondary" onClick={onCancel}>
-          {S.ontology.cancel}
-        </Button>
-        {existing && (
-          <Button
-            size="sm"
-            variant="secondary"
-            className="ml-auto"
-            disabled={existing.usage > 0}
-            title={existing.usage > 0 ? S.ontology.deleteBlocked : undefined}
-            onClick={() => remove.mutate()}
+        {attributes.map((a) => (
+          <Row
+            key={a.id}
+            className="-mx-2"
+            trailing={<span className="u-num">{S.ontology.usage(a.usage)}</span>}
+            onClick={() => onEdit(a)}
           >
-            {S.ontology.delete}
-          </Button>
-        )}
+            <span className="flex items-center gap-2">
+              <span className="truncate">{a.label}</span>
+              <Chip tone="neutral">
+                {S.ontology.datatypeNames[a.datatype ?? "text"]}
+              </Chip>
+              {a.unit && (
+                <span className="shrink-0 text-small text-ink-2">{a.unit}</span>
+              )}
+              {a.functional && <Chip tone="info">1:1</Chip>}
+            </span>
+          </Row>
+        ))}
       </div>
+      <Row className="-mx-2 mt-2" icon={<Plus size={14} />} onClick={onNew}>
+        {S.ontology.newAttribute}
+      </Row>
     </div>
   );
 }
@@ -1250,7 +1099,7 @@ function ClassTree({
     }
     const children = new Map<string | null, EntityTypeView[]>();
     for (const t of types) {
-      const p = t.primary_parent ?? null;
+      const p = treeParent(t);
       if (!children.has(p)) children.set(p, []);
       children.get(p)!.push(t);
     }
@@ -1373,652 +1222,120 @@ function PropertyList({
   );
 }
 
-/* ---------- 类表单 ---------- */
+/* ---------- 定义（只读）：面板展示，改动开弹窗 ---------- */
 
-/** 父类下拉的候选：树序 + 缩进（层级可见），排除自己与全部后代（防成环）。 */
-function parentOptions(
-  allTypes: EntityTypeView[],
-  selfId: string | undefined,
-): { value: string; label: string; indent: number }[] {
-  const excluded = new Set<string>();
-  if (selfId) {
-    excluded.add(selfId);
-    // 收后代：反复扫描直到收敛（类的数量级很小，O(n²) 无所谓）
-    let grew = true;
-    while (grew) {
-      grew = false;
-      for (const t of allTypes) {
-        if (t.parents.some((p) => excluded.has(p)) && !excluded.has(t.id)) {
-          excluded.add(t.id);
-          grew = true;
-        }
-      }
-    }
-  }
-  const children = new Map<string | null, EntityTypeView[]>();
-  for (const t of allTypes) {
-    const p = t.primary_parent ?? null;
-    if (!children.has(p)) children.set(p, []);
-    children.get(p)!.push(t);
-  }
-  const out: { value: string; label: string; indent: number }[] = [];
-  const walk = (parent: string | null, depth: number) => {
-    for (const t of children.get(parent) ?? []) {
-      if (excluded.has(t.id)) continue;
-      out.push({ value: t.id, label: t.label, indent: depth });
-      walk(t.id, depth + 1);
-    }
-  };
-  walk(null, 0);
-  return out;
-}
-
-/** 导出给模式图复用（见 AttributesCard 上的注释） */
-export function ClassForm({
-  kbId,
-  existing,
-  parentId,
-  allTypes,
-  onNewSub,
-  headless,
-  onDone,
-  onError,
-}: {
-  kbId: string;
-  existing: EntityTypeView | null;
-  parentId: string | null;
-  allTypes: EntityTypeView[];
-  /** 编辑已有类时提供：以当前类为父级新建子类 */
-  onNewSub?: () => void;
-  /** 停靠面板把标题画在自己的固定头里，表单就不再画第二遍 */
-  headless?: boolean;
-  /** 创建成功时携带新 id，编辑成功时为 undefined */
-  onDone: (createdId?: string) => void;
-  onError: (e: unknown) => void;
-}) {
-  const [key, setKey] = useState(existing?.key ?? "");
-  const [label, setLabel] = useState(existing?.label ?? "");
-  // 新建时颜色跟着 key 走（与后端 color_for_key 同一个规则），不是一个固定默认值。
-  // 用户当然可以改；但**不改的话，手动建的类和导入建的类配色体系一致**
-  const [color, setColor] = useState(
-    existing?.color ?? colorForKey(existing?.key ?? ""),
-  );
-  const [colorTouched, setColorTouched] = useState(Boolean(existing?.color));
-  const [shape, setShape] = useState<"circle" | "square">(
-    existing?.shape ?? "circle",
-  );
-  const [parents, setParents] = useState<string[]>(
-    existing?.parents ?? (parentId ? [parentId] : []),
-  );
-  const [description, setDescription] = useState(existing?.description ?? "");
-  // 互斥：声明「不可能同时是」。一致性检查据此报不可满足的类（0002）——
-  // 一个类继承了两个互斥的祖先，就永远不可能有实例，而它不报错，只是永远空着
-  const [disjoint, setDisjoint] = useState<string[]>(existing?.disjoint ?? []);
-
-  // 从左栏点"+ 子类"进来时预填那个父。多父下它是第一个，也就是主父
-  useEffect(() => setParents(parentId ? [parentId] : []), [parentId]);
-
-  const save = useMutation({
-    mutationFn: async (): Promise<unknown> =>
-      existing
-        ? api.updateEntityType(kbId, existing.id, {
-            label,
-            color,
-            shape,
-            parents,
-            disjoint,
-            description,
-          })
-        : api.createEntityType(kbId, {
-            key,
-            label,
-            color,
-            shape,
-            parents,
-            disjoint,
-            description,
-          }),
-    onSuccess: (res) => {
-      toast.success(existing ? S.toast.saved : S.toast.created);
-      onDone(existing ? undefined : (res as { id?: string })?.id);
-    },
-    onError,
-  });
-  const remove = useMutation({
-    mutationFn: () => api.deleteEntityType(kbId, existing!.id),
-    onSuccess: () => {
-      toast.success(S.toast.deleted);
-      onDone();
-    },
-    onError,
-  });
-
-  const lbl = "block text-small font-medium text-ink-2 mb-1";
+/** 一行「标签 / 值」；值空着就写占位，不留白 */
+function Def({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div className="space-y-3">
-      {!headless && (
-        <div className="flex items-center gap-2">
-          <span
-            className={`h-3 w-3 ${shape === "square" ? "scale-90" : "rounded-full"}`}
-            style={{ background: color }}
-          />
-          <span className="font-semibold text-ink">
-            {existing?.label ?? S.ontology.newClass}
-          </span>
-          {/* key 是纯技术标识：已存在时干脆不展示，只在创建时输入 */}
-          {existing?.builtin && <Chip tone="neutral">{S.ontology.builtin}</Chip>}
-          {existing && (
-            <span className="ml-auto text-small text-ink-2">
-              {S.ontology.usage(existing.usage)}
-            </span>
-          )}
-        </div>
-      )}
-      {!existing && (
-        <div>
-          <label className={lbl}>
-            {S.ontology.key}{" "}
-            <span className="text-ink-2">({S.ontology.keyHint})</span>
-          </label>
-          <Input
-            value={key}
-            onChange={(e) => {
-              setKey(e.target.value);
-              // 用户没自己挑过色，就让颜色跟着 key 走——与后端同一个规则
-              if (!colorTouched) setColor(colorForKey(e.target.value));
-            }}
-            className="w-full"
-            placeholder="contract"
-          />
-        </div>
-      )}
-      <div>
-        <label className={lbl}>{S.ontology.label}</label>
-        <Input
-          value={label}
-          onChange={(e) => setLabel(e.target.value)}
-          className="w-full"
-        />
-      </div>
-      <div>
-        <label className={lbl}>{S.ontology.shapeColor}</label>
-        <div className="flex items-center gap-2">
-          <ColorPicker value={color} onChange={(c: string) => { setColor(c); setColorTouched(true); }} shape={shape} />
-          {/* 形状：与图谱节点渲染一一对应（circle=四层圆 / square=四层方） */}
-          <Segmented
-            size="sm"
-            value={shape}
-            onChange={setShape}
-            options={(["circle", "square"] as const).map((sh) => ({
-              value: sh,
-              title: sh,
-              // 图标占一行正文的高（h-4 = text-fine 的行高）：Segmented 的高度由内容撑，
-              // 光秃秃的 12px 图标会让它比旁边 32 高的色井矮一截
-              label: (
-                <span className="flex h-4 items-center">
-                  <span
-                    className={`h-3 w-3 border-[1.5px] border-current ${
-                      sh === "circle" ? "rounded-full" : "scale-90"
-                    }`}
-                  />
-                </span>
-              ),
-            }))}
-          />
-        </div>
-      </div>
-      {/* 多父：subClassOf 可以有多条。左栏按树画，一个类只能出现一次——
-          所以第一个当主父。界面说明这条，不另加一个"选主父"的控件 */}
-      <div>
-        <label className={lbl}>{S.ontology.parent}</label>
-        <MultiSearchSelect
-          values={parents}
-          options={parentOptions(allTypes, existing?.id)}
-          onToggle={(id) =>
-            setParents((v) =>
-              v.includes(id) ? v.filter((x) => x !== id) : [...v, id],
-            )
-          }
-          placeholder={S.ontology.searchTypes}
-          emptyHint={S.ontology.noParent}
-        />
-        {parents.length > 1 && (
-          <p className="mt-1 text-fine text-ink-2">
-            {S.ontology.primaryParentHint}
-          </p>
-        )}
-      </div>
-      {/* 互斥：**声明「不可能同时是」**。紧挨着父类，因为两者是同一件事的
-          两面——父类说「也是」，互斥说「不可能同时是」，而一致性检查正是
-          在这两者打架时报出「这个类永远不可能有实例」 */}
-      <div>
-        <label className={lbl}>{S.ontology.disjoint}</label>
-        <p className="text-fine leading-relaxed text-ink-2 mb-2">
-          {S.ontology.disjointHint}
-        </p>
-        <MultiSearchSelect
-          values={disjoint}
-          options={parentOptions(allTypes, existing?.id)}
-          onToggle={(id) =>
-            setDisjoint((v) =>
-              v.includes(id) ? v.filter((x) => x !== id) : [...v, id],
-            )
-          }
-          placeholder={S.ontology.searchTypes}
-          emptyHint={S.ontology.noDisjoint}
-        />
-        {/* 跟自己的父类互斥 = 这个类永远不可能有实例。当场说，
-            比让人跑一遍一致性检查再发现要快 */}
-        {disjoint.some((d) => parents.includes(d)) && (
-          <p className="mt-2 text-fine text-danger">
-            {S.ontology.disjointWithParent}
-          </p>
-        )}
-      </div>
-      <div>
-        <label className={lbl}>{S.ontology.description}</label>
-        {/* 语义指引：整段注入抽取 prompt，直接影响抽取归类质量 */}
-        <Textarea
-          className="w-full min-h-36 resize-y"
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-        />
-        <p className="mt-1 text-fine text-ink-2">
-          {S.ontology.descriptionHint}
-        </p>
-      </div>
-      <div className="flex gap-2 pt-1">
-        <Button variant="primary"
-          size="sm"
-          onClick={() => save.mutate()}
-          disabled={save.isPending || !label.trim()}
-        >
-          {S.ontology.save}
-        </Button>
-        {onNewSub && (
-          <Button size="sm" variant="secondary" onClick={onNewSub}>
-            {S.ontology.newSubClass}
-          </Button>
-        )}
-        {existing && !existing.builtin && (
-          <Button
-            size="sm"
-            variant="secondary"
-            disabled={existing.usage > 0}
-            title={existing.usage > 0 ? S.ontology.deleteBlocked : undefined}
-            onClick={() => remove.mutate()}
-          >
-            {S.ontology.delete}
-          </Button>
-        )}
-      </div>
+    <div className="border-b border-line py-2 last:border-0">
+      <div className="text-small text-ink-2">{label}</div>
+      <div className="mt-1 break-words text-body text-ink">{children}</div>
     </div>
   );
 }
 
-/* ---------- 关系表单 ---------- */
+function Description({ text }: { text: string | null | undefined }) {
+  return text?.trim() ? (
+    <span className="whitespace-pre-wrap">{text}</span>
+  ) : (
+    <span className="text-ink-2">{S.ontology.noDescription}</span>
+  );
+}
 
-/** 导出给模式图复用（见 AttributesCard 上的注释） */
-export function PropertyForm({
-  kbId,
-  existing,
+function ClassDefinition({
+  cls,
+  allTypes,
+  onNewSub,
+}: {
+  cls: EntityTypeView;
+  allTypes: EntityTypeView[];
+  /** 以当前类为父级新建子类：开弹窗 */
+  onNewSub: () => void;
+}) {
+  const nameOf = (id: string) => allTypes.find((t) => t.id === id)?.label ?? id;
+  return (
+    <div>
+      <Def label={S.ontology.parent}>
+        {cls.parents.length > 0 ? cls.parents.map(nameOf).join(", ") : S.ontology.noParent}
+      </Def>
+      <Def label={S.ontology.disjoint}>
+        {cls.disjoint.length > 0 ? cls.disjoint.map(nameOf).join(", ") : S.ontology.noDisjoint}
+      </Def>
+      <Def label={S.ontology.description}>
+        <Description text={cls.description} />
+      </Def>
+      {/* 新增入口与列表里的行同一副身材（左栏的「New class」也是这样一行）：
+          图标落在文字的左缘上，不再用带内距的按钮去对 */}
+      <Row className="-mx-2 mt-2" icon={<Plus size={14} />} onClick={onNewSub}>
+        {S.ontology.newSubClass}
+      </Row>
+    </div>
+  );
+}
+
+function PropertyDefinition({
+  rel,
   allTypes,
   allRelations,
-  initialDomain,
-  headless,
-  onDone,
-  onError,
 }: {
-  kbId: string;
-  existing: RelationTypeView | null;
+  rel: RelationTypeView;
   allTypes: EntityTypeView[];
-  /** 本库的关系（不含属性）。逆与子属性的下拉从这里取——**属性不在其中**，
-   *  它的宾语是字面值，反过来无从谈起 */
   allRelations: RelationTypeView[];
-  /** 从模式图上一个类出发新建关系时，domain 预填成那个类——**只影响初始值**，
-   *  不是约束：下面照旧是个可编辑的 MultiSearchSelect，填错了随手改 */
-  initialDomain?: string | null;
-  /** 见 `ClassForm.headless` */
-  headless?: boolean;
-  onDone: (createdId?: string) => void;
-  onError: (e: unknown) => void;
 }) {
-  const [key, setKey] = useState(existing?.key ?? "");
-  const [label, setLabel] = useState(existing?.label ?? "");
-  const [temporal, setTemporal] = useState(existing?.temporal ?? "state");
-  const [functional, setFunctional] = useState(existing?.functional ?? false);
-  const [inverseFunctional, setInverseFunctional] = useState(
-    existing?.inverse_functional ?? false,
-  );
-  // 其余四条 OWL 公理。**推理机的判据全在这里**——从前只能靠导入 OWL 带进来，
-  // 在界面上手工建本体的人永远开不了那台机器（0002）
-  const [transitive, setTransitive] = useState(existing?.is_transitive ?? false);
-  const [symmetric, setSymmetric] = useState(existing?.is_symmetric ?? false);
-  const [asymmetric, setAsymmetric] = useState(existing?.is_asymmetric ?? false);
-  const [irreflexive, setIrreflexive] = useState(
-    existing?.is_irreflexive ?? false,
-  );
-  // 同一族的后两条，形状不同：指向另一个关系。空串 = 没声明
-  const [inverseOf, setInverseOf] = useState(existing?.inverse_of ?? "");
-  const [subPropertyOf, setSubPropertyOf] = useState(
-    existing?.sub_property_of ?? "",
-  );
-  const [description, setDescription] = useState(existing?.description ?? "");
-  const [domains, setDomains] = useState<string[]>(
-    existing?.domains ?? (initialDomain ? [initialDomain] : []),
-  );
-  const [ranges, setRanges] = useState<string[]>(existing?.ranges ?? []);
-  // 显示标签，不显示 key。**进提示词的 key 由服务端从库里取**，与界面显示什么无关；
-  // 而类树、属性列表也都显示标签，这里没有理由例外——中文库里用户该看到
-  // "发票记录" 而不是 invoice_record
-  const typeOpts = useMemo(
-    () => parentOptions(allTypes, undefined),
-    [allTypes],
-  );
-  // 两个下拉的选项：本库的其它关系。
-  //
-  // **自己不进列表**，两条都是。子属性指向自己数据库直接拒（那是个环）；
-  // 逆指向自己在语义上合法——但它等于 `symmetric`，而那个复选框就在上面，
-  // 在这里提供第二条路只会让人写出 R0 要报的东西。
-  //
-  // 唯一的例外是**当前值就是自己**：OWL 导入进来的可以长这样，从列表里漏掉
-  // 它就会让下拉显示空白，而空白一保存就把已声明的抹了
-  const linkOptions = (current: string) => [
-    { value: "", label: S.ontology.noLink },
-    // 当前值就是自己时把自己补回列表，否则下拉显示空白，
-    // 而空白一保存就把已声明的抹了
-    ...(existing && current === existing.id
-      ? [{ value: existing.id, label: existing.label, hint: existing.key }]
-      : []),
-    ...allRelations
-      .filter((r) => r.id !== existing?.id)
-      .map((r) => ({ value: r.id, label: r.label, hint: r.key })),
-  ];
-  /** 下拉里选中那条的显示名。找不到就回落到 id——宁可难看，不要空着 */
-  const nameOf = (id: string) =>
-    allRelations.find((r) => r.id === id)?.label ?? id;
-  const toggle = (
-    set: React.Dispatch<React.SetStateAction<string[]>>,
-    id: string,
-  ) => set((v) => (v.includes(id) ? v.filter((x) => x !== id) : [...v, id]));
-
-  const save = useMutation({
-    mutationFn: async (): Promise<unknown> =>
-      existing
-        ? api.updateRelationType(kbId, existing.id, {
-            label,
-            temporal,
-            functional,
-            inverse_functional: inverseFunctional,
-            is_transitive: transitive,
-            is_symmetric: symmetric,
-            is_asymmetric: asymmetric,
-            is_irreflexive: irreflexive,
-            // 空串要变成 null 再送——服务端收 `Option<Uuid>`，
-            // `""` 解不成 UUID，会是一个 422 而不是「清空」
-            inverse_of: inverseOf || null,
-            sub_property_of: subPropertyOf || null,
-            description,
-            domains,
-            ranges,
-          })
-        : api.createRelationType(kbId, {
-            key,
-            label,
-            temporal,
-            functional,
-            inverse_functional: inverseFunctional,
-            is_transitive: transitive,
-            is_symmetric: symmetric,
-            is_asymmetric: asymmetric,
-            is_irreflexive: irreflexive,
-            // 空串要变成 null 再送——服务端收 `Option<Uuid>`，
-            // `""` 解不成 UUID，会是一个 422 而不是「清空」
-            inverse_of: inverseOf || null,
-            sub_property_of: subPropertyOf || null,
-            description,
-            domains,
-            ranges,
-          }),
-    onSuccess: (res) => {
-      toast.success(existing ? S.toast.saved : S.toast.created);
-      onDone(existing ? undefined : (res as { id?: string })?.id);
-    },
-    onError,
-  });
-  const remove = useMutation({
-    mutationFn: () => api.deleteRelationType(kbId, existing!.id),
-    onSuccess: () => {
-      toast.success(S.toast.deleted);
-      onDone();
-    },
-    onError,
-  });
-
-  const lbl = "block text-small font-medium text-ink-2 mb-1";
+  const typeName = (id: string) => allTypes.find((t) => t.id === id)?.label ?? id;
+  const relName = (id: string) => allRelations.find((r) => r.id === id)?.label ?? id;
+  const temporal =
+    (
+      {
+        state: S.ontology.temporalState,
+        event: S.ontology.temporalEvent,
+        eternal: S.ontology.temporalEternal,
+      } as Record<string, string>
+    )[rel.temporal] ?? rel.temporal;
+  // 勾了的公理才列：没勾的不是信息
+  const axioms = (
+    [
+      [rel.functional, S.ontology.functional],
+      [rel.inverse_functional, S.ontology.inverseFunctional],
+      [rel.is_transitive, S.ontology.transitive],
+      [rel.is_symmetric, S.ontology.symmetric],
+      [rel.is_asymmetric, S.ontology.asymmetric],
+      [rel.is_irreflexive, S.ontology.irreflexive],
+    ] as const
+  )
+    .filter(([on]) => on)
+    .map(([, name]) => name);
   return (
-    <div className="space-y-3">
-      {!headless && (
-        <div className="flex items-center gap-2">
-          <span className="font-semibold text-ink">
-            {existing?.label ?? S.ontology.newProperty}
+    <div>
+      <Def label={S.ontology.domainLabel}>
+        {rel.domains.length > 0 ? rel.domains.map(typeName).join(", ") : S.ontology.anyType}
+      </Def>
+      <Def label={S.ontology.rangeLabel}>
+        {rel.ranges.length > 0 ? rel.ranges.map(typeName).join(", ") : S.ontology.anyType}
+      </Def>
+      <Def label={S.ontology.temporal}>{temporal}</Def>
+      <Def label={S.ontology.axioms}>
+        {axioms.length > 0 ? (
+          <span className="flex flex-wrap gap-1">
+            {axioms.map((a) => (
+              <Chip key={a} tone="info">
+                {a}
+              </Chip>
+            ))}
           </span>
-          {existing?.builtin && <Chip tone="neutral">{S.ontology.builtin}</Chip>}
-          {existing && (
-            <span className="ml-auto text-small text-ink-2">
-              {S.ontology.usage(existing.usage)}
-            </span>
-          )}
-        </div>
-      )}
-      {!existing && (
-        <div>
-          <label className={lbl}>
-            {S.ontology.key}{" "}
-            <span className="text-ink-2">({S.ontology.keyHint})</span>
-          </label>
-          <Input
-            value={key}
-            onChange={(e) => setKey(e.target.value)}
-            className="w-full"
-            placeholder="signed_with"
-          />
-        </div>
-      )}
-      <div>
-        <label className={lbl}>{S.ontology.label}</label>
-        <Input
-          value={label}
-          onChange={(e) => setLabel(e.target.value)}
-          className="w-full"
-        />
-      </div>
-      {/* 类型签名。界面显示标签，而进提示词的是 key —— 那一步在服务端，
-          与这里显示什么无关（docs/decisions/0004 定的是提示词里必须用 key） */}
-      <div>
-        <label className={lbl}>{S.ontology.signature}</label>
-        <p className="text-fine leading-relaxed text-ink-2 mb-2">
-          {S.ontology.signatureHint}
-        </p>
-        <div className="grid gap-2 sm:grid-cols-2">
-          <div className="min-w-0">
-            <div className="mb-1 text-small font-medium text-ink-2">
-              {S.ontology.domainLabel}
-            </div>
-            <MultiSearchSelect
-              values={domains}
-              options={typeOpts}
-              onToggle={(id) => toggle(setDomains, id)}
-              placeholder={S.ontology.searchTypes}
-              emptyHint={S.ontology.anyType}
-            />
-          </div>
-          <div className="min-w-0">
-            <div className="mb-1 text-small font-medium text-ink-2">
-              {S.ontology.rangeLabel}
-            </div>
-            <MultiSearchSelect
-              values={ranges}
-              options={typeOpts}
-              onToggle={(id) => toggle(setRanges, id)}
-              placeholder={S.ontology.searchTypes}
-              emptyHint={S.ontology.anyType}
-            />
-          </div>
-        </div>
-      </div>
-      <div>
-        <label className={lbl}>{S.ontology.temporal}</label>
-        <Dropdown
-          value={temporal}
-          onChange={setTemporal}
-          className="w-full"
-          options={[
-            { value: "state", label: S.ontology.temporalState },
-            { value: "event", label: S.ontology.temporalEvent },
-            { value: "eternal", label: S.ontology.temporalEternal },
-          ]}
-        />
-      </div>
-      {/* 六条公理并成一组。**它们本来就是同一族**——推理机（0002）拿它们当
-          判据，散在表单各处会让人以为前两条和后四条是两回事。
-          每一条底下写清「勾了会发生什么」：这些开关不是描述，是会改变系统行为的
-          声明——`functional` 让时态引擎自动闭合旧值，`transitive` 让推理机往图里
-          加边。看不出后果的开关，人只会照着直觉乱勾。 */}
-      <div>
-        <label className={lbl}>{S.ontology.axioms}</label>
-        <p className="text-fine leading-relaxed text-ink-2 mb-2">
-          {S.ontology.axiomsHint}
-        </p>
-        <div className="space-y-2">
-          {(
-            [
-              [functional, setFunctional, S.ontology.functional, S.ontology.functionalHint],
-              [
-                inverseFunctional,
-                setInverseFunctional,
-                S.ontology.inverseFunctional,
-                S.ontology.inverseFunctionalHint,
-              ],
-              [transitive, setTransitive, S.ontology.transitive, S.ontology.transitiveHint],
-              [symmetric, setSymmetric, S.ontology.symmetric, S.ontology.symmetricHint],
-              [asymmetric, setAsymmetric, S.ontology.asymmetric, S.ontology.asymmetricHint],
-              [
-                irreflexive,
-                setIrreflexive,
-                S.ontology.irreflexive,
-                S.ontology.irreflexiveHint,
-              ],
-            ] as const
-          ).map(([on, set, title, hint], i) => (
-            <Checkbox
-              key={i}
-              checked={on}
-              onChange={(e) => set(e.target.checked)}
-              label={title}
-              hint={hint}
-            />
-          ))}
-        </div>
-        {/* 对称与反对称同时勾是自相矛盾的（只对空关系成立）。本体自洽性检查
-            会报出来，但在这里当场说一句比让人跑一遍检查再发现要快 */}
-        {symmetric && asymmetric && (
-          <p className="mt-2 text-fine text-danger">
-            {S.ontology.axiomConflict}
-          </p>
+        ) : (
+          <span className="text-ink-2">{S.ontology.axiomsNone}</span>
         )}
-        {/* 同一组的后两条，只是形状不同：它们指向**另一个关系**，所以是下拉
-            不是复选框。放在这里而不是单开一节——推理机的四种规则源里，两条是
-            上面的勾，两条是下面的选，分开会让人以为它们是两回事（0002） */}
-        <div className="mt-3 space-y-3 border-t border-line pt-3">
-          {(
-            [
-              [
-                inverseOf,
-                setInverseOf,
-                S.ontology.inverseOf,
-                S.ontology.inverseOfHint,
-                linkOptions(inverseOf),
-              ],
-              [
-                subPropertyOf,
-                setSubPropertyOf,
-                S.ontology.subPropertyOf,
-                S.ontology.subPropertyOfHint,
-                linkOptions(subPropertyOf),
-              ],
-            ] as const
-          ).map(([value, set, title, hint, options], i) => (
-            <div key={i}>
-              <div className="text-body text-ink">{title}</div>
-              <p className="text-fine leading-relaxed text-ink-2 mb-1">
-                {hint}
-              </p>
-              <SearchSelect
-                value={value}
-                onChange={set}
-                options={options}
-                size="sm"
-                className="w-full"
-                placeholder={S.ontology.noLink}
-              />
-            </div>
-          ))}
-          {/* 选了之后当场把话说全。**这两条推出来的事实主宾未必同向**——
-              逆要对调，子属性不对调，只看名字分不出来，写出来就分得出 */}
-          {(inverseOf || subPropertyOf) && (
-            <div className="text-fine leading-relaxed text-ink-2 space-y-1">
-              {inverseOf && (
-                <div>
-                  {S.ontology.linkMeansInverse(
-                    label.trim() || key || "?",
-                    nameOf(inverseOf),
-                  )}
-                </div>
-              )}
-              {subPropertyOf && (
-                <div>
-                  {S.ontology.linkMeansSuper(
-                    label.trim() || key || "?",
-                    nameOf(subPropertyOf),
-                  )}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      </div>
-      <div>
-        <label className={lbl}>{S.ontology.description}</label>
-        <Textarea
-          className="w-full min-h-36 resize-y"
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-        />
-        <p className="mt-1 text-fine text-ink-2">
-          {S.ontology.descriptionHint}
-        </p>
-      </div>
-      <div className="flex gap-2 pt-1">
-        <Button variant="primary"
-          size="sm"
-          onClick={() => save.mutate()}
-          disabled={save.isPending || !label.trim()}
-        >
-          {S.ontology.save}
-        </Button>
-        {existing && !existing.builtin && (
-          <Button
-            size="sm"
-            variant="secondary"
-            disabled={existing.usage > 0}
-            title={existing.usage > 0 ? S.ontology.deleteBlocked : undefined}
-            onClick={() => remove.mutate()}
-          >
-            {S.ontology.delete}
-          </Button>
-        )}
-      </div>
+      </Def>
+      {rel.inverse_of && (
+        <Def label={S.ontology.inverseOf}>{relName(rel.inverse_of)}</Def>
+      )}
+      {rel.sub_property_of && (
+        <Def label={S.ontology.subPropertyOf}>{relName(rel.sub_property_of)}</Def>
+      )}
+      <Def label={S.ontology.description}>
+        <Description text={rel.description} />
+      </Def>
     </div>
   );
 }
@@ -3108,11 +2425,6 @@ function ImportPanel({
   const pick = useRef<HTMLInputElement>(null);
   const queryClient = useQueryClient();
 
-  const history = useQuery({
-    queryKey: ["ontology-imports", kbId],
-    queryFn: () => api.ontologyImports(kbId),
-  });
-
   const preview = useMutation({
     mutationFn: (f: File) => api.previewOntologyImport(kbId, f),
     onError: (e) => {
@@ -3315,36 +2627,217 @@ function ImportPanel({
         </div>
       )}
 
-      {/* 导入历史：谁在什么时候拿哪个文件动过本体。原文按 sha256 存着 */}
-      <div className="mt-6 border-t border-line pt-3">
-        <h4 className="text-small font-medium text-ink-2 mb-2">
-          {S.ontology.importHistory}
-        </h4>
-        {!history.data?.imports.length ? (
-          <p className="text-small text-ink-2">
-            {S.ontology.importNoHistory}
+      {/* 谁在什么时候拿哪个文件动过本体，以及那一次到底进来了什么 */}
+      <ImportHistory kbId={kbId} />
+    </div>
+  );
+}
+
+/** 导入历史：**服务端每次导入记下的是一整本账**——建了几个类、更新了几个、
+ *  几个键被占、逆属性连上了几条、属性跳过了几个、多少三元组、哪些 IRI 没投影
+ *  下来。从前这一段只印「文件名 · 大小 · 谁在哪天」，其余全落在地上：
+ *  导完之后想知道「到底进来了什么」，界面上没有一个地方说得出。
+ *
+ *  所以这里是一张表（每行一次导入的账），细账在行末的详情里——那些数只有
+ *  出问题时才有人读，不该占着表宽。 */
+function ImportHistory({ kbId }: { kbId: string }) {
+  const [detail, setDetail] = useState<OntologyImportView | null>(null);
+  const history = useQuery({
+    queryKey: ["ontology-imports", kbId],
+    queryFn: () => api.ontologyImports(kbId),
+  });
+  const rows = history.data?.imports ?? [];
+
+  return (
+    <div className="mt-6">
+      <h4 className="mb-2 text-small font-medium text-ink-2">
+        {S.ontology.importHistory}
+      </h4>
+      {/* 还在取的时候不能说「还没有导入过」——那句话是假的，而且它跟真的
+          没导入过长得一模一样，读的人分不出自己看到的是哪一种 */}
+      {history.isLoading ? (
+        <p className="text-small text-ink-2">{S.nav.loading}</p>
+      ) : !rows.length ? (
+        <p className="text-small text-ink-2">{S.ontology.importNoHistory}</p>
+      ) : (
+        <div className="glass overflow-hidden rounded-panel">
+          <Table>
+            <THead>
+              <Tr>
+                <Th>{S.ontology.importColFile}</Th>
+                <Th>{S.ontology.importColFormat}</Th>
+                <Th>{S.ontology.importColSize}</Th>
+                <Th>{S.ontology.importClasses}</Th>
+                <Th>{S.ontology.importRelations}</Th>
+                <Th>{S.ontology.importAttributes}</Th>
+                <Th>{S.ontology.importColTriples}</Th>
+                <Th>{S.ontology.importColWhen}</Th>
+                <Th />
+              </Tr>
+            </THead>
+            <TBody>
+              {rows.map((im) => {
+                const s = im.summary ?? {};
+                return (
+                  <Tr key={im.id}>
+                    {/* 一格一件事，一行一条导入。**格式与大小各占一列**，不是
+                        叠在文件名底下——叠着把每一行都撑成两行高，而右边还空着
+                        半张表。文件名不用等宽：等宽是给键、id、代码和 URL 的
+                        （DESIGN.md 1），一个文件名在一列 Geist 里只显得突兀 */}
+                    <Td>
+                      <div className="max-w-64 truncate text-small text-ink" title={im.filename}>
+                        {im.filename}
+                      </div>
+                    </Td>
+                    <Td className="text-small text-ink-2">{im.format}</Td>
+                    <Td className="u-num whitespace-nowrap text-small text-ink-2">
+                      {S.ontology.importSize(im.byte_size)}
+                    </Td>
+                    <Td className="text-small text-ink-2">
+                      <Counts
+                        created={s.classes_created}
+                        updated={s.classes_updated}
+                        taken={s.classes_key_taken}
+                      />
+                    </Td>
+                    <Td className="text-small text-ink-2">
+                      <Counts created={s.relations_created} updated={s.relations_updated} />
+                    </Td>
+                    <Td className="text-small text-ink-2">
+                      <Counts
+                        created={s.attributes_created}
+                        skipped={sumCounts(s.attributes_skipped)}
+                      />
+                    </Td>
+                    <Td className="u-num text-small text-ink-2">{s.triples ?? "—"}</Td>
+                    <Td className="text-small text-ink-2 whitespace-nowrap">
+                      {S.ontology.importBy(
+                        im.imported_by_name ?? "—",
+                        localDateTime(im.imported_at).slice(0, 16),
+                      )}
+                    </Td>
+                    <Td className="text-right">
+                      <LinkButton onClick={() => setDetail(im)}>
+                        {S.ontology.importDetail}
+                      </LinkButton>
+                    </Td>
+                  </Tr>
+                );
+              })}
+            </TBody>
+          </Table>
+        </div>
+      )}
+
+      {/* 细账：只有出了问题才有人读，所以收在这里，而不是摊在表上 */}
+      <Dialog
+        open={!!detail}
+        onOpenChange={(o) => !o && setDetail(null)}
+        width="lg"
+        closeLabel={S.ui.close}
+        title={detail?.filename ?? ""}
+        description={
+          detail
+            ? S.ontology.importBy(
+                detail.imported_by_name ?? "—",
+                localDateTime(detail.imported_at),
+              )
+            : undefined
+        }
+      >
+        {detail && <ImportDetail im={detail} />}
+      </Dialog>
+    </div>
+  );
+}
+
+/** `{no_domain: 3, unknown_domain: 1}` → 4。缺就是 0 */
+function sumCounts(m: Record<string, number> | undefined): number {
+  return Object.values(m ?? {}).reduce((a, b) => a + b, 0);
+}
+
+/** 表里一格：建了几个 / 更新了几个 / 占了几个键 / 跳过几个。全零就是一横 */
+function Counts({
+  created,
+  updated,
+  taken,
+  skipped,
+}: {
+  created?: number;
+  updated?: number;
+  taken?: number;
+  skipped?: number;
+}) {
+  const parts = [
+    created ? S.ontology.importCreatedN(created) : null,
+    updated ? S.ontology.importUpdatedN(updated) : null,
+    skipped ? S.ontology.importSkippedN(skipped) : null,
+    taken ? S.ontology.importTakenN(taken) : null,
+  ].filter(Boolean);
+  return <>{parts.length ? parts.join(" · ") : "—"}</>;
+}
+
+function ImportDetail({ im }: { im: OntologyImportView }) {
+  const s = im.summary ?? {};
+  const stat = (label: string, n: number | undefined) =>
+    n === undefined ? null : (
+      <div key={label} className="flex items-baseline justify-between gap-3 py-1">
+        <span className="text-small text-ink-2">{label}</span>
+        <span className="u-num text-small text-ink">{n}</span>
+      </div>
+    );
+  const L = S.ontology;
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-x-6">
+        <div className="divide-y divide-line">
+          {stat(L.statClassesCreated, s.classes_created)}
+          {stat(L.statClassesUpdated, s.classes_updated)}
+          {stat(L.statClassesTaken, s.classes_key_taken)}
+          {stat(L.statClassesNoDesc, s.classes_without_description)}
+          {stat(L.statTriples, s.triples)}
+        </div>
+        <div className="divide-y divide-line">
+          {stat(L.statRelationsSeen, s.relations_seen)}
+          {stat(L.statRelationsCreated, s.relations_created)}
+          {stat(L.statRelationsUpdated, s.relations_updated)}
+          {stat(L.statFunctional, s.functional_relations)}
+          {stat(L.statInverseLinked, s.inverse_linked)}
+          {stat(L.statSubPropertyLinked, s.sub_property_linked)}
+          {stat(L.statAttributesSeen, s.attributes_seen)}
+          {stat(L.statAttributesCreated, s.attributes_created)}
+          {/* 跳过的属性**按理由分**：数字只说"少了几个"，理由才说得出下一步
+              该改本体的哪里（域没写、域不在这个库里、值域用不了…） */}
+          {Object.entries(s.attributes_skipped ?? {}).map(([reason, n]) =>
+            stat(
+              `${L.statAttributesSkipped} · ${S.ontology.skipReason[reason] ?? reason}`,
+              n,
+            ),
+          )}
+        </div>
+      </div>
+
+      {/* 没投影下来的 IRI：引用外部词汇表是常态，可「少连了多少」得说得出来 */}
+      {!!s.unprojected?.length && (
+        <div>
+          <p className="mb-1 text-small font-medium text-ink-2">
+            {S.ontology.importUnprojected} ({s.unprojected.length})
           </p>
-        ) : (
-          <ul className="space-y-2">
-            {history.data.imports.map((im) => (
-              <li key={im.id} className="flex items-baseline gap-2 text-small">
-                <span className="font-mono text-ink-2 truncate">
-                  {im.filename}
+          <p className="mb-2 text-fine leading-relaxed text-ink-2">
+            {S.ontology.importUnprojectedBody}
+          </p>
+          <ul className="u-scroll max-h-48 space-y-1 overflow-y-auto">
+            {s.unprojected.map(([iri, n]) => (
+              <li key={iri} className="flex gap-2 text-fine">
+                <span className="min-w-0 truncate font-mono text-ink-2" title={iri}>
+                  {shortIri(iri)}
                 </span>
-                <span className="u-num text-ink-2 shrink-0">
-                  {S.ontology.importSize(im.byte_size)}
-                </span>
-                <span className="ml-auto text-fine text-ink-2 shrink-0">
-                  {S.ontology.importBy(
-                    im.imported_by_name ?? "—",
-                    new Date(im.imported_at).toLocaleDateString(),
-                  )}
-                </span>
+                <span className="u-num shrink-0 text-ink-2">×{n}</span>
               </li>
             ))}
           </ul>
-        )}
-      </div>
+        </div>
+      )}
     </div>
   );
 }

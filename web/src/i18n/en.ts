@@ -732,6 +732,7 @@ export const en = {
     legendNone: "No class matches",
     legendOnly: "Only",
     legendShowAll: (n: number) => `Show all (${n} hidden)`,
+    legendHideAll: "Hide all",
     legendAllHint:
       "Every class on screen, most common first. Click to show or hide.",
     searchMore: (n: number) => `${n} more — load 20`,
@@ -754,6 +755,7 @@ export const en = {
     evidence: "evidence",
     noEvidence: "No evidence recorded",
     noQuote: "(no quote)",
+    openInDoc: "Open the passage in the document",
     /* 抽取器从原文读出来的谓词，规范成了标识符。词表外的说法会被降级成
        related to，原意只在这里活着。
        **措辞不能宣称这是引文**：关系 key 只能是 [a-z0-9_]，所以中文语料里
@@ -862,10 +864,17 @@ export const en = {
       rejected: "Withdrawn",
       /* 并入另一条断言：内容一字未少，不是撤回 */
       merged: "Merged into an existing fact",
+      /* 实体合并。**两个方向分开说**——「吸收了谁」和「被谁吸收」在图上
+         是两件事，回滚也是按方向做的 */
+      merged_in: "Another entity was merged into this one",
+      merged_away: "Merged into another entity",
+      merge_reverted: "Merge undone",
       /* 改的是节点上的类,一条事实都没动 */
       retyped: "Type changed",
       retype_reverted: "Type change undone",
     } as Record<string, string>,
+    /* 对方实体已经不在了（库被清理过）：合并事件仍然要列出来 */
+    historyGoneEntity: "an entity that is gone",
     historyEngine: "engine",
     /* 有效区间的变化：修正后区间闭合到某个时点 */
     historyClosedAt: (t: string) => `closed at ${t}`,
@@ -874,6 +883,11 @@ export const en = {
     historicalNote: (n: number) =>
       `${n} past fact${n === 1 ? "" : "s"} not shown — see Timeline →`,
     undated: "Undated",
+    /* 实体面板的 Relations：两节的标题、组尾的折、行上的证据开关 */
+    fromEntity: (name: string) => `From ${name}`,
+    toEntity: (name: string) => `To ${name}`,
+    past: (n: number) => (n === 1 ? "1 past" : `${n} past`),
+    sources: (n: number) => (n === 1 ? "1 source" : `${n} sources`),
     timelineEmpty: "No dated facts yet.",
     lastConfirmed: (d: string) => `confirmed ${d}`,
     /* 三种来源共用一个标记（引擎接任对账、Review 裁决、有人手改），所以这句
@@ -885,6 +899,7 @@ export const en = {
       "The superseded assertion stays in the ledger — see History for who and when.",
     /* ---- 人工修正有效区间（302） ---- */
     editTime: "Correct the interval",
+    editTitle: "Edit entity",
     timeStart: "Start",
     timeEnd: "End",
     /* 结束端的三态，与账本里的三种写法一一对应（见迁移 0003 的注释） */
@@ -1082,9 +1097,29 @@ export const en = {
     title: "Ontology",
     hint: "Classes & properties",
     tabClasses: "Classes",
+    colName: "Name",
+    multiParentHint: "This class has more than one parent; the indentation follows one of them, and the Parent column lists them all",
+    colKey: "Key",
+    colSignature: "Subject → Object",
+    colInstances: "Instances",
+    colFacts: "Facts",
+    colOnClass: "On class",
+    colDatatype: "Type",
+    colUnit: "Unit",
+    colSingleValued: "Single-valued",
+    yes: "Yes",
+    rowsShown: (n: number) => `${n} rows`,
+    viewTable: "Table",
+    switchToTable: "Switch to table view",
+    switchToGraph: "Switch to graph view",
+    viewDiagram: "Graph",
+    axiomTransitive: "Transitive",
+    axiomSymmetric: "Symmetric",
+    axiomAsymmetric: "Asymmetric",
+    axiomIrreflexive: "Irreflexive",
     tabProperties: "Properties",
     newClass: "New class",
-    newSubClass: "+ Sub-class",
+    newSubClass: "New sub-class",
     newProperty: "New property",
     filter: "Filter…",
     missesShort: "Unmatched",
@@ -1100,7 +1135,31 @@ export const en = {
       "You write the criteria — the model never proposes one. " +
       "What a rule concludes is derived: it never replaces an asserted fact, it carries the readings that made it true, and it retires by itself when they change.",
     rulesEmpty: "No rules yet.",
+    rulesNoMatch: "No rule matches that.",
+    /** 搜的是整条规则，不只是名字——判据里的谓词和值也在里面 */
+    ruleSearch: "Search rules, attributes, values",
     ruleNew: "New rule",
+    /* 按不下去时必须说清为什么。**一条规则判的是属性的值**，没有属性就无从写起——
+       而一个灰着的按钮不解释，读者只会以为坏了 */
+    ruleNeedsAttribute:
+      "A rule tests an attribute's value, and this ontology has none yet. Open a class and add one under Attributes.",
+    ruleNeedsClass: "Add a class first — a rule concludes one.",
+    ruleColRule: "Rule",
+    ruleColDerived: "Derived",
+    ruleColStatus: "Status",
+    /* 条件之间是合取。**写「并且」而不是一个点号**——符号读不出「全都要成立」，
+       而那正是规则最容易被误读的地方 */
+    ruleAnd: "and",
+    /** 组与组之间。**读起来是「或者」而不是符号**——同一条判据的另一种满足方式 */
+    ruleOr: "or",
+    ruleWhere: "where",
+    ruleDropCondition: "Remove this condition",
+    ruleOperandPlaceholder: (kind: string): string =>
+      kind === "set"
+        ? "gas anomaly, post-effect gas anomaly"
+        : kind === "range"
+          ? "8 - 12"
+          : "12.0",
     ruleName: "Name",
     ruleNamePlaceholder: "Gas-bearing well",
     ruleDescription: "What it means (optional)",
@@ -1109,14 +1168,21 @@ export const en = {
     ruleConcludes: "Concludes",
     ruleConcludesTyping: "the class",
     ruleConcludesAttribute: "the attribute",
-    ruleConditions: "When all of",
+    /* 从前是「当以下全部成立」。**一条规则现在可以写第二种情况**，那句话就
+       不再是真的——标签退回一个「当」，全不全由下面那句说明交代 */
+    ruleConditions: "When",
+    ruleConditionsHint:
+      "The conditions in a block must all hold. Add another way and any one block is enough.",
     ruleAddCondition: "Add a condition",
+    /** 加一整块：同一条判据的另一种满足方式，不是另一条规则 */
+    ruleAddGroup: "Another way",
     ruleOpGt: "is above",
     ruleOpGte: "is at least",
     ruleOpLt: "is below",
     ruleOpLte: "is at most",
     ruleOpBetween: "is between",
     ruleOpIn: "is one of",
+    ruleOpNotIn: "is not one of",
     ruleOpPresent: "is recorded",
     ruleOperandNumber: "12.0",
     ruleOperandSet: "gas anomaly, post-effect gas anomaly",
@@ -1138,6 +1204,9 @@ export const en = {
       `${hits} matched · ${inserted} new · ${invalidated} retired`,
     ruleRunCapped: (n: number) =>
       `${n} entity/rule pairs had too many readings to expand; their conclusions are incomplete`,
+    /** 链跑满上限就停了。**说出来**：没接上的那一环与「不满足」长得一样 */
+    ruleRunRoundsCapped: (n: number): string =>
+      `Rules kept concluding after ${n} rounds; anything further down the chain was not reached`,
     ruleNeedsCondition: "A rule needs at least one condition.",
     /* ---- 打磨：可点的计数、常驻的 capped 提示、改结论 ---- */
     ruleEdit: "Edit",
@@ -1184,6 +1253,15 @@ export const en = {
     attributesHint:
       "Literal-valued fields of this class (a person's salary, a contract's amount). Extracted with evidence and history, like any fact.",
     newAttribute: "New attribute",
+    /* 编辑弹窗（面板只展示，改动在弹窗里）：标题与面板里的入口 */
+    edit: "Edit",
+    editClass: "Edit class",
+    editProperty: "Edit property",
+    editAttribute: "Edit attribute",
+    connectTitle: "Connect a relationship",
+    connectOpen: "Connect an existing relationship…",
+    noDescription: "No description yet.",
+    axiomsNone: "None declared.",
     attrDatatype: "Value type",
     attrUnit: "Unit",
     attrUnitHint: "optional — e.g. CNY, %",
@@ -1310,6 +1388,39 @@ export const en = {
     importDone: (created: number, updated: number) =>
       `Imported — ${created} classes created, ${updated} updated.`,
     importHistory: "Previous imports",
+    importColFile: "File",
+    importColFormat: "Format",
+    importColSize: "Size",
+    importColTriples: "Triples",
+    importColWhen: "Imported",
+    importDetail: "Detail",
+    importCreatedN: (n: number) => `${n} new`,
+    importUpdatedN: (n: number) => `${n} updated`,
+    importSkippedN: (n: number) => `${n} skipped`,
+    importTakenN: (n: number) => `${n} key taken`,
+    /* 细账的行名。**动词都是过去式**：这一屏说的是那一次导入做过什么 */
+    statClassesCreated: "Classes created",
+    statClassesUpdated: "Classes updated",
+    statClassesTaken: "Classes whose key was taken",
+    statClassesNoDesc: "Classes without a description",
+    statTriples: "Triples read",
+    statRelationsSeen: "Relations in the file",
+    statRelationsCreated: "Relations created",
+    statRelationsUpdated: "Relations updated",
+    statFunctional: "Relations declared functional",
+    statInverseLinked: "Inverse properties linked",
+    statSubPropertyLinked: "Sub-properties linked",
+    statAttributesSeen: "Attributes in the file",
+    statAttributesCreated: "Attributes created",
+    statAttributesSkipped: "Attributes skipped",
+    /* 跳过的理由。**每一条都要说得出下一步动哪里**，不然报了也白报 */
+    skipReason: {
+      key_taken: "key already in use",
+      unusable_range: "range cannot be a value type",
+      no_domain: "no domain — it never says which class it belongs to",
+      domain_skipped: "its domain class was skipped too",
+      unknown_domain: "domain class is not in this base",
+    } as Record<string, string | undefined>,
     importNoHistory: "No imports yet.",
     importBy: (who: string, when: string) => `${who} · ${when}`,
     importSize: (bytes: number) =>
@@ -1409,6 +1520,7 @@ export const en = {
     schemaLegendInheritance: "Inheritance",
     schemaLegendRelation: "Relations",
     schemaLegendDisjoint: "Disjoint",
+    schemaLegendRule: "Business rule",
     schemaUnscoped: (n: number) => `Unscoped properties (${n})`,
     schemaUnscopedHint:
       "Not limited to specific classes, so no line on the canvas would be honest. Select one to inspect or edit it.",
@@ -1615,6 +1727,10 @@ export const en = {
       escalate_no_verdict: "The adjudicator returned no verdict",
       escalate_entity_changed: "The entity changed while being adjudicated",
       escalate_unsure: "The adjudicator was not confident enough",
+      /* 抽给人看的一份（0026）：机器有把握也不动手，detail 是它本来的答案 */
+      escalate_sample: "Sampled for a person; the adjudicator was confident",
+      /* 执行闸门（0027）：合并会立刻送出图外的东西，把握再高也留给人 */
+      escalate_impact: "Held for a person; the merge would not stay in the graph",
       proposed: "The agent looked and left a proposal",
       governed: "Decided by the agent from precedent",
       namesake: "Two entities with this name in one document",
@@ -1627,6 +1743,12 @@ export const en = {
       auto_merged: "Merged by the AI adjudicator",
       kept_apart: "The AI adjudicator judged these different",
     } as Record<string, string>,
+    /** 闸门留下的原因，按 kind 措辞；value 是谓词标签或一个数 */
+    impact: {
+      contradiction: (p: string) => `it would put two “${p}” facts on one entity`,
+      derived: (n: string) => `${n} derived facts rest on one side`,
+      answered: (n: string) => `one side was named in ${n} answers`,
+    } as Record<string, (v: string) => string>,
     duplicates: "Possible duplicates",
     duplicatesHint:
       "Same name, different context. The AI adjudicates clear cases in the background; the rest wait for you. Merging is always reversible.",
@@ -1637,6 +1759,8 @@ export const en = {
     noFacts: "No recorded facts",
     merge: "Merge",
     keep: "Keep separate",
+    /** 理由框（0026）。是一个问题，不是一张表：可以不答 */
+    rationalePlaceholder: "What told you? Optional",
     // 重复项的类型筛选与批量裁决（#428）
     typesAny: "All",
     typesSame: "Same type",
@@ -1903,6 +2027,7 @@ export const en = {
       "Only the people listed here can see this knowledge base, and their role decides " +
       "what they can change. Deployment admins always have access.",
     addMember: "Add…",
+    addMemberTitle: "Add member",
     roles: { viewer: "Viewer", editor: "Editor", admin: "Admin" },
     remove: "Remove",
     noMembers: "No per-KB roles set.",

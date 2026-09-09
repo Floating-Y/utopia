@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import {
   useCallback,
   useEffect,
@@ -13,19 +14,11 @@ import { circular, circlepack } from "graphology-layout";
 import forceAtlas2 from "graphology-layout-forceatlas2";
 import FA2Layout from "graphology-layout-forceatlas2/worker";
 import Sigma from "sigma";
-import { createNodeBorderProgram } from "@sigma/node-border";
 import EdgeCurveProgram from "@sigma/edge-curve";
-import { NodeSquareShellProgram } from "./squareShellProgram";
 import {
-  drawHoverCard,
-  CANVAS_FONT,
-  CANVAS_LABEL_SIZE,
-  CANVAS_TEXT,
-  CANVAS_TEXT_2,
-  drawPillLabel,
   drawWorldGrid,
-  hexToRgb,
   HOVER_MUTE,
+  lerpColor,
   mix,
   MUTED_SHELL,
   NODE_BORDER_BASE,
@@ -33,17 +26,33 @@ import {
   NODE_CORE_MIX,
   NODE_SHELL_BASE,
   NODE_TINT_MIX,
-  RING_HOVER_MIX,
-  RING_SELECT_MIX,
   TRANSPARENT,
 } from "./graphVisuals";
+// 画布那台机器是两页共用的（#496）：构造选项、状态表、相机、拖拽都在那边，
+// 这个文件只管把实例与事实投影成一张图、说清楚每个节点是什么颜色
+import {
+  attachDrag,
+  deferToHoverLayer,
+  hoveredNode,
+  mutedNode,
+  neighborNode,
+  NODE_TYPE_SHELL,
+  NODE_TYPE_SQUARE,
+  selectedNode,
+  sigmaOptions,
+  softMutedNode,
+} from "./graphCanvas";
 import { EntityHistory } from "./EntityHistory";
-import { fmtTime, parseDateInput } from "../time";
+import { EntityDialog, FactTimeDialog } from "./graphDialogs";
+import { fmtTime } from "../time";
 import { NextStep, nextStep, useReadiness } from "./NextStep";
 import {
   ArrowLeft,
   ArrowRight,
+  ChevronDown,
+  ChevronRight,
   CircleDashed,
+  ExternalLink,
   Grape,
   Loader2,
   Maximize2,
@@ -72,21 +81,19 @@ import {
   Button,
   DangerConfirm,
   ExpandCard,
-  Field,
   HOVER_ROW,
   IconButton,
   Input,
-  NativeSelect,
+  LinkButton,
   Pill,
-  Radio,
   REVEAL,
+  ROW_VALUE,
   Row,
   Segmented,
   ToolButton,
   ToolDivider,
   ToolTower,
   cn,
-  localDate,
   GroupLabel,
 } from "../ui";
 import { usePopoverFlip } from "../ui/popoverFlip";
@@ -236,23 +243,6 @@ const EDGE_FOCUS_DERIVED = "rgba(255,214,140,0.95)";
 const DAY_MS = 24 * 3600 * 1000;
 
 /* 播放淡入：解析 hex / rgb / rgba（含 alpha）并线性插值 */
-function parseRgba(c: string): [number, number, number, number] {
-  if (c.startsWith("#")) {
-    const [r, g, b] = hexToRgb(c);
-    return [r, g, b, 1];
-  }
-  const m = c.match(
-    /rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)(?:[,\s/]+([\d.]+))?/,
-  );
-  if (!m) return [128, 128, 128, 1];
-  return [+m[1], +m[2], +m[3], m[4] !== undefined ? +m[4] : 1];
-}
-function lerpColor(from: string, to: string, t: number): string {
-  const a = parseRgba(from);
-  const b = parseRgba(to);
-  const f = (i: number) => a[i] + (b[i] - a[i]) * t;
-  return `rgba(${Math.round(f(0))},${Math.round(f(1))},${Math.round(f(2))},${f(3).toFixed(3)})`;
-}
 /** 播放中新元素的淡入时长 */
 const FADE_MS = 320;
 
@@ -434,6 +424,8 @@ export function Graph() {
   const hoverRef = useRef<string | null>(null);
   /** 鼠标停在哪条边上。用来把并进它的逆关系说法亮出来 */
   const hoverEdgeRef = useRef<string | null>(null);
+  /** 近到什么程度算「贴脸看」：到了就每条边都写字（见 updateEdgeLabels） */
+  const deepZoomRef = useRef(false);
   const filterRef = useRef<{
     hiddenTypes: Set<string>;
     activeNodes: Set<string> | null;
@@ -698,7 +690,7 @@ export function Graph() {
           typeColor: n.color,
           typeLabel: n.type_label ?? S.graph.untyped,
           typeKey: n.type_key ?? "",
-          type: n.shape === "square" ? "square" : "shell",
+          type: n.shape === "square" ? NODE_TYPE_SQUARE : NODE_TYPE_SHELL,
           size: 5 + Math.min(8, Math.sqrt(Number(n.degree)) * 1.6),
         });
       }
@@ -834,89 +826,24 @@ export function Graph() {
 
     sigmaRef.current?.kill();
     const sigma = new Sigma(g, containerRef.current, {
-      allowInvalidContainer: true,
-      defaultNodeType: "shell",
-      nodeProgramClasses: {
-        // Semantica 节点解剖：状态环 → 描边 → 深色壳 → 微彩核心
-        shell: createNodeBorderProgram({
-          borders: [
-            { size: { value: 0.1 }, color: { attribute: "ringColor" } },
-            { size: { value: 0.07 }, color: { attribute: "borderColor" } },
-            { size: { value: 0.3 }, color: { attribute: "shellColor" } },
-            { size: { fill: true }, color: { attribute: "color" } },
-          ],
-        }),
-        square: NodeSquareShellProgram,
-      },
-      renderEdgeLabels: true,
-      defaultEdgeType: "line",
-      /* 平行边扇成弧（见 `layOutParallelEdges`）。直线那一版把同一对节点之间
-         的每条边画在同一条线段上，于是几个标签逐字符叠成乱码——实测一对节点
-         之间最多压着六条 */
-      edgeProgramClasses: { curved: EdgeCurveProgram },
-      // 边的悬停事件默认是关的。开它是为了 `enterEdge`：并进去的那些说法
-      // 要有地方看得见（见 edgeReducer）
-      enableEdgeEvents: true,
-      labelFont: CANVAS_FONT,
-      labelSize: CANVAS_LABEL_SIZE,
-      labelColor: { color: CANVAS_TEXT },
-      labelRenderedSizeThreshold: 6,
-      labelDensity: 0.7,
-      labelGridCellSize: 140,
-      minCameraRatio: 0.04,
-      maxCameraRatio: 8,
-      /* 边的字与节点同一档（fine）、同一个次要色。从前是 9px/#a1a1a1——
-         9 比界面里最小的字还小一半，而 #a1a1a1 是上一版的 ink-2 */
-      edgeLabelSize: CANVAS_LABEL_SIZE,
-      edgeLabelColor: { color: CANVAS_TEXT_2 },
-      edgeLabelFont: CANVAS_FONT,
-      defaultDrawNodeLabel: drawPillLabel,
-      defaultDrawNodeHover: drawHoverCard,
+      ...sigmaOptions({
+        defaultEdgeType: "line",
+        /* 平行边扇成弧（见 `layOutParallelEdges`）。直线那一版把同一对节点
+           之间的每条边画在同一条线段上，于是几个标签逐字符叠成乱码——实测
+           一对节点之间最多压着六条 */
+        edgeProgramClasses: { curved: EdgeCurveProgram },
+        // 边上写的是谓词，近距离下每条画得出来的边都写（见 updateEdgeLabels）
+        renderEdgeLabels: true,
+        // 上千个节点，得缩得比本体页更远才看得见全貌
+        minCameraRatio: 0.04,
+        maxCameraRatio: 8,
+      }),
       nodeReducer: (node, attrs) => {
         const f = filterRef.current;
         const res = { ...attrs };
         const base = attrs.size as number;
-        // 状态环取节点自己的类型色（见 RING_*_MIX 处的理由）
-        const ownColor = (attrs.typeColor as string) ?? NODE_CORE_BASE;
         if (f.hiddenTypes.has(attrs.typeKey as string)) {
           res.hidden = true;
-          return res;
-        }
-        // Semantica 状态表: muted { ×0.52, 全层压暗 }
-        const muteNode = () => {
-          res.size = base * 0.52;
-          res.color = mix(MUTED_SHELL, NODE_CORE_BASE, 0.3);
-          res.shellColor = MUTED_SHELL;
-          res.borderColor = TRANSPARENT;
-          res.ringColor = TRANSPARENT;
-          res.label = "";
-          res.zIndex = 0;
-        };
-        /* 悬停时其余的按 HOVER_MUTE 压一档（选中是压到底）。
-           邻居不压——悬停要回答的是"它连着谁"，把邻居也压掉就等于没回答 */
-        const softMute = () => {
-          res.size = base * (1 - 0.48 * HOVER_MUTE);
-          res.color = lerpColor(
-            String(attrs.color ?? NODE_CORE_BASE),
-            mix(MUTED_SHELL, NODE_CORE_BASE, 0.3),
-            HOVER_MUTE,
-          );
-          res.shellColor = lerpColor(
-            String(attrs.shellColor ?? NODE_SHELL_BASE),
-            MUTED_SHELL,
-            HOVER_MUTE,
-          );
-          res.borderColor = TRANSPARENT;
-          res.ringColor = TRANSPARENT;
-          res.label = "";
-          res.zIndex = 0;
-        };
-        if (hoverRef.current === node) {
-          res.size = Math.max(base * 1.08, 10.4);
-          res.ringColor = mix(ownColor, "#ffffff", RING_HOVER_MIX);
-          // 悬浮卡接管标签展示；label 本身保留（悬浮卡靠它渲染标题）
-          res.hideBaseLabel = true;
-          res.zIndex = 4;
           return res;
         }
         const hov = hoverRef.current;
@@ -925,38 +852,34 @@ export function Graph() {
           selectedRef.current && g.hasNode(selectedRef.current)
             ? selectedRef.current
             : null;
+        /* **选中压过指到**。这两句从前是反的：指针一落到自己刚选中的那个节点上，
+           它就改画 hover 那一副，选中的记号（反色底牌、加粗的名字）当场消失——
+           而人把指针移过去，往往正因为那是他选的那一个。
+           指到别的节点仍然照常出 hover */
+        if (sel === node) {
+          const picked = selectedNode(res, attrs, base);
+          // 选中的这一个同时被指着：名字改由高亮层画，标签层让开
+          return hov === node ? deferToHoverLayer(picked) : picked;
+        }
+        if (hov === node) return hoveredNode(res, attrs, base);
         if (sel) {
-          if (node === sel) {
-            res.size = Math.max(base * 1.02, 9.2);
-            res.ringColor = mix(ownColor, "#ffffff", RING_SELECT_MIX);
-            res.forceLabel = true;
-            res.zIndex = 3;
-            return res;
-          }
-          if (g.areNeighbors(sel, node)) {
-            // neighbor {×0.76, min 4, zIndex 2}
-            res.size = Math.max(base * 0.76, 4);
-            res.zIndex = 2;
-          } else {
-            muteNode();
-            return res;
-          }
+          // 邻居收到 0.76：上千个节点，得给选中的那一条路让地方
+          if (g.areNeighbors(sel, node)) neighborNode(res, base, 0.76);
+          else return mutedNode(res, base);
         } else if (hov && hov !== node && !g.areNeighbors(hov, node)) {
           // **悬停也压暗其余**，只是比选中轻一档（见 HOVER_MUTE）。
           // 邻居留着：悬停要回答的正是"它连着谁"。
           // **此刻还不存在的节点直接压到底**：这个分支会提前 return，
           // 绕过下面那道时间过滤，只压一半的话它反而比不 hover 时更亮
-          if (f.activeNodes && !f.activeNodes.has(node)) muteNode();
-          else softMute();
-          return res;
+          if (f.activeNodes && !f.activeNodes.has(node))
+            return mutedNode(res, base);
+          return softMutedNode(res, attrs, base);
         } else {
           // default {×0.7}
           res.size = base * 0.7;
         }
-        if (f.activeNodes && !f.activeNodes.has(node)) {
-          muteNode();
-          return res;
-        }
+        if (f.activeNodes && !f.activeNodes.has(node))
+          return mutedNode(res, base);
         // 播放淡入：从 muted 形态渐变到本帧算出的正常形态
         const fs = fadeRef.current.get(node);
         if (fs !== undefined) {
@@ -985,6 +908,8 @@ export function Graph() {
         const f = filterRef.current;
         const res = { ...attrs };
         const [s, t] = g.extremities(edge);
+        // 近距离下每条画得出来的边都写字（见 updateEdgeLabels）
+        if (deepZoomRef.current) res.forceLabel = true;
         /* 并进这条边的逆关系说法，接在本名后面：`PART OF ⁻¹ CONTAINS`。
            **只在关注它的时候显示**——常驻会把标签拉长一倍，而标签太长
            正是这次要治的毛病。
@@ -1168,9 +1093,21 @@ export function Graph() {
       hoverEdgeRef.current = null;
       sigma.refresh();
     });
-    // 边标签只在放大后出现（默认视距下太密，Semantica 同样克制）
-    const updateEdgeLabels = () =>
-      sigma.setSetting("renderEdgeLabels", sigma.getCamera().ratio < 0.7);
+    /* 边标签只在放大后出现（默认视距下太密，Semantica 同样克制）。
+       **再近一档就改成"看得见的线都写字"**：sigma 挑边标签的规矩是
+       「两端的节点名都在显示，才写这条边」（`edgeLabelsToDisplayFromNodes`），
+       而放大之后两端常常都在视口外，于是屏幕当中那条线反倒没有说法——
+       正是想看清一条关系的时候它消失了。`forceLabel` 是 sigma 留的后门，
+       打上就绕开那条启发式 */
+    const updateEdgeLabels = () => {
+      const ratio = sigma.getCamera().ratio;
+      sigma.setSetting("renderEdgeLabels", ratio < 0.7);
+      const deep = ratio < 0.35;
+      if (deep !== deepZoomRef.current) {
+        deepZoomRef.current = deep;
+        sigma.refresh({ skipIndexation: true });
+      }
+    };
     sigma.getCamera().on("updated", updateEdgeLabels);
     updateEdgeLabels();
 
@@ -1186,44 +1123,26 @@ export function Graph() {
     //（否则纯点选也会误启 FA2）；被拖节点由 fa2 的 outputReducer 钉在光标上（见上），
     // 松手后稳定 ~1.2s 停机
     let settleTimer: ReturnType<typeof setTimeout> | null = null;
-    let dragCandidate: string | null = null;
-    let downPoint: { x: number; y: number } | null = null;
-    sigma.on("downNode", (e) => {
-      dragCandidate = e.node;
-      downPoint = { x: e.event.x, y: e.event.y };
-    });
-    sigma.getMouseCaptor().on("mousemovebody", (e) => {
-      if (!dragCandidate) return;
-      if (!dragged) {
-        if (!downPoint || Math.hypot(e.x - downPoint.x, e.y - downPoint.y) < 4)
-          return;
-        // 升格为拖拽
-        dragged = dragCandidate;
+    // 阈值、包围盒冻结那一套在 attachDrag 里；这里只接三个当口。
+    // `dragged` 仍留在这个闭包里——FA2 的 outputReducer 每帧读它，
+    // 把被拖的那个钉回光标（见上面 fa2 的构造）
+    attachDrag(sigma, {
+      onStart: (node) => {
+        dragged = node;
         if (settleTimer) clearTimeout(settleTimer);
         // 静态布局（circular/pack）下拖拽不唤醒力模拟——否则一碰就散架
         if (layoutModeRef.current === "force" && fa2 && !fa2.isRunning())
           fa2.start();
-        // 固定当前包围盒，避免拖拽时相机自动跟随缩放
-        if (!sigma.getCustomBBox()) sigma.setCustomBBox(sigma.getBBox());
-      }
-      const pos = sigma.viewportToGraph(e);
-      dragPos = pos;
-      g.setNodeAttribute(dragged, "x", pos.x);
-      g.setNodeAttribute(dragged, "y", pos.y);
-      // 阻止相机平移
-      e.preventSigmaDefault();
-      e.original.preventDefault();
-      e.original.stopPropagation();
+      },
+      onMove: (_node, pos) => {
+        dragPos = pos;
+      },
+      onEnd: () => {
+        dragged = null;
+        dragPos = null;
+        settleTimer = setTimeout(() => fa2?.stop(), 1200);
+      },
     });
-    const endDrag = () => {
-      dragCandidate = null;
-      downPoint = null;
-      if (!dragged) return;
-      dragged = null;
-      dragPos = null;
-      settleTimer = setTimeout(() => fa2?.stop(), 1200);
-    };
-    sigma.getMouseCaptor().on("mouseup", endDrag);
     sigmaRef.current = sigma;
     if (import.meta.env.DEV) {
       // 调试句柄（仅 dev）：无头环境下检查 reducer 输出
@@ -1358,13 +1277,6 @@ export function Graph() {
 
           {/* chip 上的数是**全部类**，不是被收起来的那几个——
               点开看到的就是全部（搜得到任何一个），写「+3」等于承诺了另一件事 */}
-          {/* 复位。**只要存在隐藏就给一步到位的出口**——「只看」很容易把
-              画面收得很窄，没有这个就得挨个点回来 */}
-          {hiddenTypes.size > 0 && (
-            <Pill onClick={() => setHiddenTypes(new Set())}>
-              {S.graph.legendShowAll(hiddenTypes.size)}
-            </Pill>
-          )}
 
           {legendRest.length > 0 && (
             <div className="relative" ref={legendPop.rootRef}>
@@ -1387,26 +1299,60 @@ export function Graph() {
               {legendPop.open && (
                 <div
                   ref={legendPop.panelRef}
-                  className="u-menu-glass absolute left-0 top-0 z-50 w-64 overflow-hidden rounded-overlay p-2 shadow-2xl"
+                  className="u-menu-glass absolute left-0 top-0 z-50 w-72 overflow-hidden rounded-overlay shadow-2xl"
                 >
-                  {/* 面板盖在 chip 原位，所以**第一行就长成那个 chip 的样子**，
-                      点它收回去——「哪儿展开的就从哪儿收回去」，
-                      与通知/用户卡片的关闭键跟触发键原位重合是同一个道理 */}
-                  <Pill className="mb-2 w-full" onClick={() => legendPop.close()}>
-                    {S.graph.legendMore(types.length)}
-                    <X size={11} className="ml-auto text-ink-2" />
-                  </Pill>
-                  <Input
-                    size="sm"
-                    autoFocus
-                    value={legendQ}
-                    onChange={(e) => setLegendQ(e.target.value)}
-                    placeholder={S.graph.legendSearch}
-                    className="mb-2 w-full"
-                  />
+                  {/* 与库切换器、告警面板、用户菜单同一副解剖：第一行是触发它的
+                      那个胶囊自己，三角翻上去，点它缩回；没有浮在角上的关闭叉
+                      ——「哪儿展开的就从哪儿收回去」 */}
+                  <div
+                    onClick={() => legendPop.close()}
+                    className="u-row-shell flex cursor-pointer items-center gap-3 border-b border-line px-4 py-3"
+                  >
+                    <span className="min-w-0 flex-1 truncate text-body font-medium text-ink">
+                      {S.graph.legendMore(types.length)}
+                    </span>
+                    <ChevronDown
+                      size={12}
+                      className="shrink-0 rotate-180 text-ink-2"
+                    />
+                  </div>
+                  {/* 全开 / 全关。**从顶栏那枚独立胶囊搬进来的**：它只在有隐藏时
+                      才出现，于是那一排的宽度会随着你点类跳来跳去；而它要做的事
+                      («把画面收窄»的反面）本就属于这份清单，不属于清单外面。
+                      两个都常驻、不可用时置灰——一个会消失的出口，第二次要用时
+                      得先想起它长在哪儿 */}
+                  <div className="flex items-center gap-2 border-b border-line px-4 py-2">
+                    <LinkButton
+                      disabled={hiddenTypes.size === 0}
+                      onClick={() => setHiddenTypes(new Set())}
+                    >
+                      {S.graph.legendShowAll(hiddenTypes.size)}
+                    </LinkButton>
+                    <LinkButton
+                      className="ml-auto"
+                      disabled={hiddenTypes.size === types.length}
+                      onClick={() =>
+                        setHiddenTypes(new Set(types.map(([k]) => k)))
+                      }
+                    >
+                      {S.graph.legendHideAll}
+                    </LinkButton>
+                  </div>
+                  {/* 查找：没有自己的框（bare）——它是面板的一段，不是面板里
+                      摆的一个控件，与库切换器的查找同一个做法 */}
+                  <div className="border-b border-line px-4 py-3">
+                    <Input
+                      bare
+                      autoFocus
+                      value={legendQ}
+                      onChange={(e) => setLegendQ(e.target.value)}
+                      placeholder={S.graph.legendSearch}
+                      className="w-full text-body"
+                    />
+                  </div>
                   {/* **列的是全部类，不只是收起来的那些**：想找一个类的时候，
                       没人记得它是不是恰好排进了前几个 */}
-                  <div className="flex max-h-64 flex-col overflow-y-auto">
+                  <div className="u-scroll flex max-h-64 flex-col overflow-y-auto px-2 py-1">
                     {types
                       .filter(([, t]) =>
                         t.label.toLowerCase().includes(legendQ.toLowerCase()),
@@ -1956,7 +1902,13 @@ function TimeScrubber({
           setPlaying(!playing);
         }}
       >
-        {playing ? <Pause size={13} /> : <Play size={13} />}
+        {/* 实心：播放/暂停这一对是媒体键的通用记号，空心的三角看着像
+            「展开」那类折叠柄。lucide 的图标默认只描边，填色要自己给 */}
+        {playing ? (
+          <Pause size={13} fill="currentColor" stroke="none" />
+        ) : (
+          <Play size={13} fill="currentColor" stroke="none" />
+        )}
       </IconButton>
 
       {/* 步长。**播放与柱子共用它**——从前柱子按年、播放按天，
@@ -2626,9 +2578,9 @@ function EntityPanel({
   }, [derived, entityId]);
   // Relations = 按关系分组（查关系）；Timeline = 有效时间轴（事情何时成立）；
   // History = 记录时间轴（我们何时这么认为、又何时改了主意）
-  const [view, setView] = useState<
-    "relations" | "timeline" | "history" | "derived"
-  >("relations");
+  const [view, setView] = useState<"relations" | "history" | "derived">(
+    "relations",
+  );
   useEffect(() => {
     const it = intent?.current;
     if (!it) return;
@@ -2639,11 +2591,9 @@ function EntityPanel({
 
   const e: GraphNode | undefined = detail.data?.entity;
 
-  // 实体修正：抽取给的是初判，判错此前只能整库重抽
+  // 实体修正（名字、类型）在弹窗里：面板只展示
   const qc = useQueryClient();
   const [editing, setEditing] = useState(false);
-  const [draftName, setDraftName] = useState("");
-  const [draftType, setDraftType] = useState("");
   // 同名的其他实体：详情接口打开就给。改名之后再用响应里的那份覆盖——
   // 改完名可能撞上一批新的同名，那时候的答案比打开时的新
   const [renamedPeers, setRenamedPeers] = useState<GraphNode[] | null>(null);
@@ -2656,13 +2606,16 @@ function EntityPanel({
   const [mergeCandidate, setMergeCandidate] = useState<{ id: string; name: string } | null>(
     null,
   );
+  // 什么让你这么定（0026）：可不写；写了就跟着合并进台账
+  const [mergeWhy, setMergeWhy] = useState("");
   const merge = useMutation({
-    mutationFn: (source: string) => api.mergeEntities(kbId, source, entityId),
+    mutationFn: ({ source, why }: { source: string; why: string }) =>
+      api.mergeEntities(kbId, source, entityId, why),
     onSuccess: () => {
       toast.success(S.toast.saved);
       // 本地把并掉的那个摘掉，别等重取——它已经不存在了，留着会让人再点一次
       setSameName((prev) =>
-        (prev ?? sameName).filter((p) => p.id !== merge.variables),
+        (prev ?? sameName).filter((p) => p.id !== merge.variables?.source),
       );
       qc.invalidateQueries({ queryKey: ["entity", kbId, entityId] });
       qc.invalidateQueries({ queryKey: ["graph"] });
@@ -2670,98 +2623,32 @@ function EntityPanel({
     },
     onError: (err: Error) => toast.error(err.message),
   });
-  // 类型下拉要的是全量本体，不是当前视图里出现过的那几个
-  const ontology = useQuery({
-    queryKey: ["ontology", kbId],
-    queryFn: () => api.ontology(kbId),
-    enabled: editing,
-  });
-  const types = ontology.data?.entity_types ?? [];
-
   const openEdit = () => {
     if (!e) return;
-    setDraftName(e.name);
-    setDraftType(types.find((t) => t.key === e.type_key)?.id ?? "");
-    setSameName([]);
     setEditing(true);
   };
-  // 本体是异步来的：它到齐时把类型下拉对到当前类型上
-  useEffect(() => {
-    if (editing && !draftType && e)
-      setDraftType(types.find((t) => t.key === e.type_key)?.id ?? "");
-  }, [editing, draftType, e, types]);
 
-  const save = useMutation({
-    mutationFn: () => {
-      const body: { type_id?: string; canonical_name?: string } = {};
-      if (draftName.trim() && draftName.trim() !== e?.name)
-        body.canonical_name = draftName.trim();
-      const curId = types.find((t) => t.key === e?.type_key)?.id;
-      if (draftType && draftType !== curId) body.type_id = draftType;
-      return api.updateEntity(kbId, entityId, body);
-    },
-    onSuccess: (r) => {
-      setEditing(false);
-      setSameName(r.same_name);
-      toast.success(S.graph.editSaved);
-      // 改了类型/名字，图谱节点与本体计数都要跟着动
-      qc.invalidateQueries({ queryKey: ["entity", kbId, entityId] });
-      qc.invalidateQueries({ queryKey: ["graph", kbId] });
-      qc.invalidateQueries({ queryKey: ["ontology", kbId] });
-    },
-    onError: (err: Error) => toast.error(err.message),
-  });
-
-  const dirty =
-    !!e &&
-    (draftName.trim() !== e.name ||
-      draftType !== (types.find((t) => t.key === e.type_key)?.id ?? ""));
-
-  // Relations = 当下有效的快照（as-of now）；已闭合的历史只出现在 Timeline。
-  // 按「方向 + 谓词」分组：实体自身名不再逐行重复，谓词只出现在小节标题里
-  const { groups, historicalCount } = useMemo(() => {
+  /* Relations 是一张表，不再分「现行」和「年表」两页：**从这个实体出发 / 指向这个实体**
+     两节，节里一行一条——左边关系名、右边实体名，与本体页那张同一副（不再按谓词
+     分二级）；按关系名、再按起点排。此刻不成立的（0022 的口径按读出来的区间判）折在
+     节尾的「N past」里——Wikidata 把历史值留在同一列表里靠结束时间区分，是同一个道理 */
+  const sections = useMemo(() => {
     const all = detail.data?.facts ?? [];
     const nowIso = new Date().toISOString();
-    // 「此刻成立」按读出来的区间判（0022）：结束了不知哪天的那条不再混进现行里
-    const current = all.filter(
-      (f) =>
-        (!f.holds_from || f.holds_from <= nowIso) &&
-        (!f.holds_to || f.holds_to > nowIso),
-    );
-    const map = new Map<
-      string,
-      {
-        key: string;
-        label: string | null;
-        inferred: boolean;
-        direction: string;
-        rows: EntityFact[];
-      }
-    >();
-    for (const f of current) {
-      // 谓词为空的事实归到同一组：它们的共同点就是「说不出是什么关系」
-      const k = `${f.direction}:${f.predicate_key ?? ""}`;
-      if (!map.has(k))
-        map.set(k, {
-          key: k,
-          label: f.predicate_label,
-          inferred: f.inferred,
-          direction: f.direction,
-          rows: [],
-        });
-      map.get(k)!.rows.push(f);
-    }
-    const arr = [...map.values()];
-    for (const gr of arr)
-      gr.rows.sort((a, b) =>
-        (a.valid_from ?? "9999") < (b.valid_from ?? "9999") ? -1 : 1,
-      );
-    arr.sort(
-      (a, b) =>
-        b.rows.length - a.rows.length ||
-        (a.label ?? "").localeCompare(b.label ?? ""),
-    );
-    return { groups: arr, historicalCount: all.length - current.length };
+    const current = (f: EntityFact) =>
+      (!f.holds_from || f.holds_from <= nowIso) &&
+      (!f.holds_to || f.holds_to > nowIso);
+    const order = (a: EntityFact, b: EntityFact) =>
+      (a.predicate_label ?? "\uffff").localeCompare(b.predicate_label ?? "\uffff") ||
+      ((a.valid_from ?? "9999") < (b.valid_from ?? "9999") ? -1 : 1);
+    const split = (dir: "out" | "in") => {
+      const mine = all.filter((f) => f.direction === dir);
+      return {
+        rows: mine.filter(current).sort(order),
+        past: mine.filter((f) => !current(f)).sort(order),
+      };
+    };
+    return { out: split("out"), in: split("in") };
   }, [detail.data]);
 
   return (
@@ -2811,58 +2698,20 @@ function EntityPanel({
       </div>
 
       {editing && e && (
-        <div className="px-4 py-3 border-b border-line space-y-3">
-          <Field label={S.graph.editName} className="mb-2">
-            <Input
-              size="sm"
-              autoFocus
-              value={draftName}
-              onChange={(ev) => setDraftName(ev.target.value)}
-              onKeyDown={(ev) => {
-                if (ev.key === "Enter" && dirty && draftName.trim())
-                  save.mutate();
-                if (ev.key === "Escape") setEditing(false);
-              }}
-              className="w-full"
-            />
-          </Field>
-          <Field label={S.graph.editType} className="mb-2">
-            <NativeSelect
-              size="sm"
-              className="w-full"
-              value={draftType}
-              onChange={(ev) => setDraftType(ev.target.value)}
-            >
-              {types.map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.label}
-                </option>
-              ))}
-            </NativeSelect>
-          </Field>
-          <div className="flex items-center gap-2 pt-1">
-            <Button
-              variant="primary"
-              size="sm"
-              disabled={!dirty || !draftName.trim() || save.isPending}
-              onClick={() => save.mutate()}
-            >
-              {S.graph.editSave}
-            </Button>
-            <Button variant="ghost" size="sm" onClick={() => setEditing(false)}>
-              {S.graph.editCancel}
-            </Button>
-            {!draftName.trim() && (
-              <span className="text-fine text-danger">
-                {S.graph.editEmptyName}
-              </span>
-            )}
-          </div>
-        </div>
+        <EntityDialog
+          kbId={kbId}
+          entityId={entityId}
+          entity={e}
+          onClose={() => setEditing(false)}
+          onSaved={(peers) => {
+            setEditing(false);
+            setSameName(peers);
+          }}
+        />
       )}
 
       {/* 同名不是错误——两个张伟可以并存。只提示，判定是不是同一个是人的事 */}
-      {sameName.length > 0 && !editing && (
+      {sameName.length > 0 && (
         <div className="mx-4 mt-3 rounded-panel border border-line bg-surface px-3 py-2">
           <div className="flex items-start justify-between gap-2">
             <p className="text-fine text-ink-2">
@@ -2921,20 +2770,31 @@ function EntityPanel({
           cancelLabel={S.graph.editCancel}
           busy={merge.isPending}
           onConfirm={() => {
-            merge.mutate(mergeCandidate.id);
+            merge.mutate({ source: mergeCandidate.id, why: mergeWhy });
             setMergeCandidate(null);
+            setMergeWhy("");
           }}
-          onCancel={() => setMergeCandidate(null)}
-        />
+          onCancel={() => {
+            setMergeCandidate(null);
+            setMergeWhy("");
+          }}
+        >
+          <Input
+            className="w-full"
+            placeholder={S.review.rationalePlaceholder}
+            value={mergeWhy}
+            onChange={(e) => setMergeWhy(e.target.value)}
+          />
+        </DangerConfirm>
       )}
 
-      {/* 视图切换：Relations（分组）| Timeline（年表） */}
+      {/* 视图切换：Relations（一张表，过去的折在组尾）| History（记录轴）| Derived */}
       <div className="px-4 pt-3">
         <Segmented
           size="sm"
           value={view}
           onChange={setView}
-          options={(["relations", "timeline", "history", "derived"] as const)
+          options={(["relations", "history", "derived"] as const)
             // 推出来的那一档：**没有派生就不出现**。一个没开推理的库不该看到
             // 一个永远是空的标签页。没落地的也算——那正是这一档要说的事
             .filter(
@@ -2945,78 +2805,56 @@ function EntityPanel({
               label:
                 v === "relations"
                   ? S.graph.viewRelations
-                  : v === "timeline"
-                    ? S.graph.viewTimeline
-                    : v === "history"
-                      ? S.graph.viewHistory
-                      : S.graph.viewDerived,
+                  : v === "history"
+                    ? S.graph.viewHistory
+                    : S.graph.viewDerived,
             }))}
         />
       </div>
 
       <div className="u-scroll flex-1 overflow-y-auto px-2 py-2">
-        {view === "relations" && historicalCount > 0 && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="mx-2 mb-2 mt-1"
-            onClick={() => setView("timeline")}
-          >
-            {S.graph.historicalNote(historicalCount)}
-          </Button>
-        )}
         {view === "relations" &&
-          groups.map((gr) => (
-            <div key={gr.key} className="mb-3 last:mb-1">
-              <GroupLabel
-                className="px-2 pb-1 pt-2"
-                icon={
-                  gr.direction === "in" ? (
-                    <ArrowLeft size={10} />
-                  ) : (
-                    <ArrowRight size={10} />
-                  )
-                }
-                count={gr.rows.length > 1 ? gr.rows.length : undefined}
+          (["out", "in"] as const).map((dir) => {
+            const { rows, past } = sections[dir];
+            if (rows.length === 0 && past.length === 0) return null;
+            const name = e?.name ?? "";
+            return (
+              <FactSection
+                key={dir}
+                dir={dir}
+                title={dir === "out" ? S.graph.fromEntity(name) : S.graph.toEntity(name)}
+                count={rows.length + past.length}
               >
-                <span
-                  className={
-                    gr.label === null ? "italic text-ink-2" : undefined
-                  }
-                  title={
-                    gr.label && gr.inferred
-                      ? S.graph.inferredPredicate
-                      : undefined
-                  }
-                >
-                  {gr.label ?? S.graph.unknownPredicate}
-                </span>
-              </GroupLabel>
-              <div>
-                {gr.rows.map((f) => (
+                {rows.map((f) => (
                   <FactRow
                     key={f.id}
                     kbId={kbId}
+                    dir={dir}
                     fact={f}
                     open={openFact === f.id}
-                    onToggle={() =>
-                      setOpenFact(openFact === f.id ? null : f.id)
-                    }
+                    onToggle={() => setOpenFact(openFact === f.id ? null : f.id)}
                     onNavigate={onNavigate}
                   />
                 ))}
-              </div>
-            </div>
-          ))}
-        {view === "timeline" && (
-          <TimelineView
-            kbId={kbId}
-            facts={detail.data?.facts ?? []}
-            openFact={openFact}
-            onToggle={(id) => setOpenFact(openFact === id ? null : id)}
-            onNavigate={onNavigate}
-          />
-        )}
+                {past.length > 0 && (
+                  <PastFold n={past.length}>
+                    {past.map((f) => (
+                      <FactRow
+                        key={f.id}
+                        kbId={kbId}
+                        dir={dir}
+                        fact={f}
+                        past
+                        open={openFact === f.id}
+                        onToggle={() => setOpenFact(openFact === f.id ? null : f.id)}
+                        onNavigate={onNavigate}
+                      />
+                    ))}
+                  </PastFold>
+                )}
+              </FactSection>
+            );
+          })}
         {view === "history" && (
           <EntityHistory kbId={kbId} entityId={entityId} />
         )}
@@ -3103,338 +2941,6 @@ function EntityPanel({
   );
 }
 
-/** 年表视图：带区间的事实按起点摊开成竖直时间线；无时间的沉到底部 undated。 */
-function TimelineView({
-  kbId,
-  facts,
-  openFact,
-  onToggle,
-  onNavigate,
-}: {
-  kbId: string;
-  facts: EntityFact[];
-  openFact: string | null;
-  onToggle: (id: string) => void;
-  onNavigate: (entityId: string) => void;
-}) {
-  const dated = facts
-    .filter((f) => f.temporal !== "eternal" && (f.valid_from || f.valid_to))
-    .sort((a, b) =>
-      (a.valid_from ?? a.valid_to ?? "") < (b.valid_from ?? b.valid_to ?? "")
-        ? -1
-        : 1,
-    );
-  const undated = facts.filter((f) => !dated.includes(f));
-
-  return (
-    <div className="pt-1">
-      {/* 与 Relations 同一种行：chevron + 两行头（区间在上，谓词和值在下）。
-          年表的次序靠排序和第一行的区间说话，不另画一条线 */}
-      <div>
-        {dated.map((f) => (
-          <TimelineRow
-            key={f.id}
-            kbId={kbId}
-            fact={f}
-            open={openFact === f.id}
-            onToggle={() => onToggle(f.id)}
-            onNavigate={onNavigate}
-          />
-        ))}
-        {dated.length === 0 && (
-          <p className="py-2 text-small text-ink-2">
-            {S.graph.timelineEmpty}
-          </p>
-        )}
-      </div>
-      {undated.length > 0 && (
-        <div className="mt-3">
-          <GroupLabel className="px-2 pb-1">{S.graph.undated}</GroupLabel>
-          {undated.map((f) => (
-            <FactRow
-              key={f.id}
-              kbId={kbId}
-              fact={f}
-              open={openFact === f.id}
-              onToggle={() => onToggle(f.id)}
-              onNavigate={onNavigate}
-            />
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** 年表条目：区间 + 闭合方式标记 + 开放事实的最后确认时间；点击展开证据。 */
-function TimelineRow({
-  kbId,
-  fact,
-  open,
-  onToggle,
-  onNavigate,
-}: {
-  kbId: string;
-  fact: EntityFact;
-  open: boolean;
-  onToggle: () => void;
-  onNavigate: (entityId: string) => void;
-}) {
-  const interval = fmtInterval(fact);
-  const isOpenEnded = !fact.valid_to;
-  const literal = fmtObjectValue(fact.object_value);
-  const [editing, setEditing] = useState(false);
-  return (
-    <ExpandCard
-      open={open}
-      onToggle={onToggle}
-      dim={fact.stale}
-      title={fact.stale ? S.graph.staleFactHint : undefined}
-      header={
-        <>
-        <div className="flex items-center gap-2 u-num text-fine text-ink-2">
-          {interval || "—"}
-          {fact.corrected && (
-            <span className="text-ink-2" title={S.graph.correctedHint}>
-              ⟲
-            </span>
-          )}
-          <span className="ml-auto flex items-center gap-2">
-            {isOpenEnded && fact.last_evidence_time && (
-              <span className="text-ink-2">
-                {S.graph.lastConfirmed(localDate(fact.last_evidence_time))}
-              </span>
-            )}
-            {/* 这一档只有断言事实：派生的区间是算出来的，走 Derived 那条路径，
-                改了下一轮推理也会覆盖（服务端另有 derived_by_rule 的防线） */}
-            <span
-              role="button"
-              tabIndex={0}
-              title={S.graph.editTime}
-              aria-label={S.graph.editTime}
-              onClick={(ev) => {
-                ev.stopPropagation();
-                setEditing((v) => !v);
-              }}
-              onKeyDown={(ev) => {
-                if (ev.key === "Enter" || ev.key === " ") {
-                  ev.preventDefault();
-                  ev.stopPropagation();
-                  setEditing((v) => !v);
-                }
-              }}
-              className={cn(REVEAL, "cursor-pointer rounded-cell p-1", editing && "is-on")}
-            >
-              <Pencil size={10} />
-            </span>
-          </span>
-        </div>
-        <div className="mt-1 flex items-center gap-2 text-body text-ink">
-          <span className="text-ink-2 text-small">
-            {fact.direction === "in" ? "←" : "→"}{" "}
-            <span
-              className={
-                fact.predicate_label === null
-                  ? "italic text-ink-2"
-                  : undefined
-              }
-              title={
-                fact.predicate_label && fact.inferred
-                  ? S.graph.inferredPredicate
-                  : undefined
-              }
-            >
-              {fact.predicate_label ?? S.graph.unknownPredicate}
-            </span>
-          </span>
-          {fact.other_id ? (
-            <span
-              role="link"
-              tabIndex={0}
-              onClick={(ev) => {
-                ev.stopPropagation();
-                onNavigate(fact.other_id!);
-              }}
-              onKeyDown={(ev) => {
-                if (ev.key === "Enter") {
-                  ev.stopPropagation();
-                  onNavigate(fact.other_id!);
-                }
-              }}
-              className="u-inline-link truncate"
-            >
-              {fact.other_name ?? "?"}
-            </span>
-          ) : (
-            <span className="truncate">
-              {fact.other_name ?? literal ?? "?"}
-            </span>
-          )}
-          {fact.stale && (
-            <span className="u-chip u-chip-neutral shrink-0 !text-fine !px-2">
-              {S.graph.staleFactChip}
-            </span>
-          )}
-          {fact.contested && (
-            <ContestedChip kbId={kbId} c={fact.contested} />
-          )}
-        </div>
-        </>
-      }
-    >
-      {editing && (
-        <TimeEditor
-          kbId={kbId}
-          fact={fact}
-          onDone={() => setEditing(false)}
-        />
-      )}
-      {open && <EvidenceList kbId={kbId} fact={fact} />}
-    </ExpandCard>
-  );
-}
-
-/** 有效区间的人工修正表单（302）。
- *
- *  两端一起提交而不是逐端改：区间的两端互相定义，「清空结束端」与「这次不动
- *  结束端」得能分辨。结束端的三个选项与账本里的三种写法一一对应，所以这里
- *  没有「留空即至今」这种隐含约定——那正是 valid_to IS NULL 一度承载两个意思
- *  的老毛病。 */
-function TimeEditor({
-  kbId,
-  fact,
-  onDone,
-}: {
-  kbId: string;
-  fact: EntityFact;
-  onDone: () => void;
-}) {
-  const qc = useQueryClient();
-  const [from, setFrom] = useState(
-    fmtTime(fact.valid_from, fact.valid_from_precision) ?? "",
-  );
-  const [to, setTo] = useState(
-    fmtTime(fact.valid_to, fact.valid_to_precision) ?? "",
-  );
-  const [endMode, setEndMode] = useState<"open" | "unknown" | "date">(
-    fact.valid_to
-      ? "date"
-      : fact.valid_to_precision === "unknown"
-        ? "unknown"
-        : "open",
-  );
-  const [note, setNote] = useState("");
-
-  const save = useMutation({
-    mutationFn: () => {
-      const f = from.trim() ? parseDateInput(from) : null;
-      if (from.trim() && !f) throw new Error(S.graph.timeBadDate);
-      const t = endMode === "date" ? parseDateInput(to) : null;
-      if (endMode === "date" && !t) throw new Error(S.graph.timeBadDate);
-      return api.updateFactTime(kbId, fact.id, {
-        valid_from: f?.iso ?? null,
-        valid_from_precision: f?.precision ?? null,
-        valid_to: t?.iso ?? null,
-        valid_to_precision:
-          endMode === "date"
-            ? (t?.precision ?? null)
-            : endMode === "unknown"
-              ? "unknown"
-              : null,
-        note: note.trim() || undefined,
-      });
-    },
-    onSuccess: (r) => {
-      // 对账的后果要说出来：改了起点可能顺手闭合了继任者的开放区间，
-      // 也可能撞出一条需要人裁的冲突。不说的话图会自己变而没人知道为什么
-      if (r.conflicts) toast.success(S.graph.timeSavedConflicts(r.conflicts));
-      else if (r.closed) toast.success(S.graph.timeSavedClosed(r.closed));
-      else toast.success(S.graph.timeSaved);
-      qc.invalidateQueries({ queryKey: ["entity", kbId] });
-      qc.invalidateQueries({ queryKey: ["graph"] });
-      qc.invalidateQueries({ queryKey: ["review", kbId] });
-      onDone();
-    },
-    onError: (e: Error) => toast.error(e.message),
-  });
-
-  return (
-    <div
-      className="mb-2 rounded-panel border border-line bg-surface p-3"
-      onClick={(ev) => ev.stopPropagation()}
-    >
-      <div className="flex items-center gap-2">
-        <label className="w-11 shrink-0 text-small font-medium text-ink-2">
-          {S.graph.timeStart}
-        </label>
-        <Input
-          value={from}
-          onChange={(e) => setFrom(e.target.value)}
-          placeholder={S.graph.timeFormat}
-          size="sm"
-          className="u-num flex-1"
-        />
-      </div>
-      <div className="mt-2 flex items-start gap-2">
-        <label className="w-11 shrink-0 pt-1 text-small font-medium text-ink-2">
-          {S.graph.timeEnd}
-        </label>
-        <div className="flex-1 space-y-1">
-          {(
-            [
-              ["open", S.graph.timeEndOpen],
-              ["unknown", S.graph.timeEndUnknown],
-              ["date", S.graph.timeEndDate],
-            ] as const
-          ).map(([mode, label]) => (
-            <Radio
-              key={mode}
-              name={`end-${fact.id}`}
-              checked={endMode === mode}
-              onChange={() => setEndMode(mode)}
-              label={label}
-            >
-              {mode === "date" && endMode === "date" && (
-                <Input
-                  size="sm"
-                  value={to}
-                  onChange={(e) => setTo(e.target.value)}
-                  placeholder={S.graph.timeFormat}
-                  className="u-num ml-1 flex-1"
-                />
-              )}
-            </Radio>
-          ))}
-        </div>
-      </div>
-      <div className="mt-2 flex items-center gap-2">
-        <label className="w-11 shrink-0 text-small font-medium text-ink-2">
-          {S.graph.timeNote}
-        </label>
-        <Input
-          value={note}
-          onChange={(e) => setNote(e.target.value)}
-          placeholder={S.graph.timeNotePlaceholder}
-          size="sm"
-          className="flex-1"
-        />
-      </div>
-      <div className="mt-2 flex justify-end gap-2">
-        <Button size="sm" variant="secondary" onClick={onDone}>
-          {S.graph.timeCancel}
-        </Button>
-        <Button variant="primary"
-          size="sm"
-          onClick={() => save.mutate()}
-          disabled={save.isPending}
-        >
-          {S.graph.timeSave}
-        </Button>
-      </div>
-    </div>
-  );
-}
-
 /** 字面值宾语的显示：属性 {value,unit} / 问数映射 {summary} / 其他 JSON 兜底。 */
 function fmtObjectValue(v: Record<string, unknown> | null): string | null {
   if (!v) return null;
@@ -3447,93 +2953,231 @@ function fmtObjectValue(v: Record<string, unknown> | null): string | null {
   return JSON.stringify(v);
 }
 
+/** 一节（从这个实体出发 / 指向这个实体）：可折叠——折叠柄占图标格，正文缩进同样的 24，
+ *  于是每一行的方向箭头正好落在节标题的箭头底下（本体页 Relations 的组同一副） */
+function FactSection({
+  dir,
+  title,
+  count,
+  children,
+}: {
+  dir: "out" | "in";
+  title: string;
+  count: number;
+  children: ReactNode;
+}) {
+  const [open, setOpen] = useState(true);
+  return (
+    <div className="mb-2">
+      <Row
+        className="mt-1"
+        icon={
+          <span className="flex w-4 justify-center">
+            <ChevronRight size={12} className={cn("u-turn", open && "rotate-90")} />
+          </span>
+        }
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="flex items-center gap-2 text-small font-medium">
+          {dir === "out" ? <ArrowRight size={10} /> : <ArrowLeft size={10} />}
+          <span className="truncate">{title}</span>
+          <span className="u-num">{count}</span>
+        </span>
+      </Row>
+      {open && <div className="pl-6">{children}</div>}
+    </div>
+  );
+}
+
+/** 已结束的留在同一节里，折起来：默认看现行的，要看来路展开它 */
+function PastFold({ n, children }: { n: number; children: ReactNode }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <Row
+        icon={
+          <span className="flex w-4 justify-center">
+            <ChevronRight size={12} className={cn("u-turn", open && "rotate-90")} />
+          </span>
+        }
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span className="text-small">{S.graph.past(n)}</span>
+      </Row>
+      {open && <div className="pl-6">{children}</div>}
+    </>
+  );
+}
+
+/** 一条事实是一行，与本体页 Relations 的行同一副：图标格里是方向箭头，左边关系名
+ *  （和 disputed 之类的标记），右边那个实体的名字（区间的小字在名字前）；整行点了
+ *  跳到那个实体。指着这一行才露出「N sources」（在行下摊开证据）与铅笔（区间修正
+ *  弹窗）。行首没有折叠柄——折叠柄在这块面板上只属于节与「过去」的折 */
 function FactRow({
   kbId,
+  dir,
   fact,
+  past,
   open,
   onToggle,
   onNavigate,
 }: {
   kbId: string;
+  dir: "out" | "in";
   fact: EntityFact;
+  /** 已结束的那些：压淡 */
+  past?: boolean;
   open: boolean;
   onToggle: () => void;
   onNavigate: (entityId: string) => void;
 }) {
+  const [editing, setEditing] = useState(false);
   const interval = fmtInterval(fact);
-  // 与 Review 的低置信口径一致：只有低到需要怀疑才挂 chip，常规置信保持沉默
-  const lowConfidence = fact.confidence < 0.75;
+  const go = fact.other_id ? () => onNavigate(fact.other_id!) : undefined;
 
   return (
-    <ExpandCard
-      open={open}
-      onToggle={onToggle}
-      dim={fact.stale}
+    <div
+      className={cn((fact.stale || past) && "opacity-55")}
       title={fact.stale ? S.graph.staleFactHint : undefined}
-      header={
-        <div className="flex items-center gap-2">
-        {fact.other_id ? (
-          <span
-            role="link"
-            tabIndex={0}
-            onClick={(ev) => {
-              ev.stopPropagation();
-              onNavigate(fact.other_id!);
-            }}
-            onKeyDown={(ev) => {
-              if (ev.key === "Enter") {
-                ev.stopPropagation();
-                onNavigate(fact.other_id!);
-              }
-            }}
-            className="u-inline-link truncate text-body text-ink"
-          >
-            {fact.other_name ?? "?"}
-          </span>
-        ) : (
-          <span className="truncate text-body text-ink">
-            {fact.other_name ?? fmtObjectValue(fact.object_value) ?? "?"}
-          </span>
-        )}
-        {lowConfidence && (
-          <span className="shrink-0 u-num u-meta-warn text-fine">
-            {Math.round(fact.confidence * 100)}%
-          </span>
-        )}
-        {fact.stale && (
-          <span className="u-chip u-chip-neutral shrink-0 !text-fine !px-2">
-            {S.graph.staleFactChip}
-          </span>
-        )}
-        {fact.contested && <ContestedChip kbId={kbId} c={fact.contested} />}
-        {interval && (
-          <span className="ml-auto shrink-0 pl-2 u-num text-fine text-ink-2">
-            {interval}
-          </span>
-        )}
-        </div>
-      }
     >
-      {open && <EvidenceList kbId={kbId} fact={fact} />}
-    </ExpandCard>
+      {/* **两行：上面是这条事实，下面是我们对它知道些什么。**
+          从前是一行，而那一行里塞着谓词、区间、宾语、证据数、改期笔。分组的
+          缩进之后只剩 249px，尾部那一组又是 shrink-0，于是唯一能收缩的谓词
+          把亏空全吃了——实测一个实体的 144 行里，35 行的谓词宽度是 0，读起来
+          就是「→ 2023-03-02 ~ now  Project Aurora」：说有这么条事实，就是不说
+          是哪条（#500）。谓词是这一行的主语句，不该是第一个被挤掉的。
+          悬停才现身的那两个动作也一起下来：`u-reveal` 只改透明度，看不见也占着位 */}
+      <div
+        role={go ? "link" : undefined}
+        tabIndex={go ? 0 : undefined}
+        onClick={go}
+        onKeyDown={(ev) => {
+          if (go && ev.key === "Enter") go();
+        }}
+        className={cn(HOVER_ROW, "items-start", go && "cursor-pointer")}
+      >
+        <span className="shrink-0 pt-1 text-violet">
+          {dir === "out" ? <ArrowRight size={12} /> : <ArrowLeft size={12} />}
+        </span>
+        <span className="min-w-0 flex-1">
+          {/* 第一行：谓词 + 宾语，读出来就是这条事实本身。
+              **宾语紧跟着谓词**，不推到右边——主语是面板上那个实体，这一行
+              是它后半句话；把宾语顶到行尾，中间隔一整行空白，两个词就不再
+              读成一句了。谓词按内容占位、放不下才收，剩下的归宾语 */}
+          <span className="flex items-center gap-2">
+            <span
+              className={cn(
+                "min-w-0 truncate text-body text-ink",
+                fact.predicate_label === null && "italic text-ink-2",
+              )}
+              // 谓词还是可能长到放不下（`publishingPrinciples`）——悬停给全名，
+              // 是本体认下的关系就不必再说它是原文的说法
+              title={
+                fact.predicate_label
+                  ? fact.inferred
+                    ? `${fact.predicate_label} · ${S.graph.inferredPredicate}`
+                    : fact.predicate_label
+                  : undefined
+              }
+            >
+              {fact.predicate_label ?? S.graph.unknownPredicate}
+            </span>
+            <span className={ROW_VALUE}>
+              {fact.other_name ?? fmtObjectValue(fact.object_value) ?? "?"}
+            </span>
+          </span>
+          {/* 第二行：何时成立、要不要留神、以及看证据与改期的入口。
+              **没有日期也要说一句**——空着的时候，「原文没写日期」和
+              「有日期只是我没显示」在界面上长得一模一样，而这个产品的全部
+              重点就是时间。
+              置信度与「区间是对账闭合的」那个 ⟲ 都撤了：一个是数字、一个是
+              没人猜得出的符号，两者都只在这一行占位，说不清事。它们在证据
+              那一档里用整句话说得明白（见 EvidenceList） */}
+          <span className="flex items-center gap-2">
+            <span
+              className={cn(
+                "u-num text-fine",
+                interval ? "text-ink-2" : "italic text-ink-2",
+              )}
+            >
+              {interval || S.graph.undated}
+            </span>
+            {fact.stale && (
+              <span className="u-chip u-chip-neutral shrink-0 !text-fine !px-2">
+                {S.graph.staleFactChip}
+              </span>
+            )}
+            {fact.contested && <ContestedChip kbId={kbId} c={fact.contested} />}
+            <span className="ml-auto flex shrink-0 items-center gap-2 pl-2">
+              {fact.evidence_count > 0 && (
+                <LinkButton
+                  className={cn(REVEAL, "text-fine", open && "is-on")}
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    onToggle();
+                  }}
+                >
+                  {S.graph.sources(fact.evidence_count)}
+                </LinkButton>
+              )}
+              {/* 这一档只有断言事实：派生的区间是算出来的，走 Derived 那条路径 */}
+              <span
+                role="button"
+                tabIndex={0}
+                title={S.graph.editTime}
+                aria-label={S.graph.editTime}
+                onClick={(ev) => {
+                  ev.stopPropagation();
+                  setEditing(true);
+                }}
+                onKeyDown={(ev) => {
+                  if (ev.key === "Enter" || ev.key === " ") {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    setEditing(true);
+                  }
+                }}
+                className={cn(REVEAL, "cursor-pointer rounded-cell p-1 text-ink-2")}
+              >
+                <Pencil size={10} />
+              </span>
+            </span>
+          </span>
+        </span>
+      </div>
+      {open && (
+        <div className="pb-2 pl-2 pr-2">
+          <EvidenceList kbId={kbId} fact={fact} />
+        </div>
+      )}
+      {editing && (
+        <FactTimeDialog kbId={kbId} fact={fact} onClose={() => setEditing(false)} />
+      )}
+    </div>
   );
 }
 
-/** 证据展开区（FactRow 与 TimelineRow 共用）：quote + 跳原文 + 版本角标 + 置信。 */
+/** 证据展开区（FactRow 在行下摊开）：quote + 跳原文 + 版本角标 + 置信。 */
 function EvidenceList({ kbId, fact }: { kbId: string; fact: EntityFact }) {
   const evidence = useQuery({
     queryKey: ["evidence", fact.id],
     queryFn: () => api.factEvidence(kbId, fact.id),
   });
   return (
-    <div className="space-y-2">
+    /* 多段就滚，不把整个面板顶长。一条事实最多见过十几段证据，全摊开的话
+       它下面那些事实全被挤出屏幕——而展开一条是为了读它，不是为了失去上下文 */
+    <div className="u-scroll max-h-64 space-y-2 overflow-y-auto">
       {evidence.data?.evidence.map((ev: Evidence) => (
-        <Link
+        /* **一段原文一张卡，卡本身不是链接。**
+           从前整块是个 `<Link>`：想读原文，手一动就跳去了文档页；想选一句
+           复制，松手也是跳走。展开这个动作要回答的是「凭什么这么说」，
+           那句话就在这儿，读完了才谈得上要不要去看上下文——所以跳转收进
+           末尾那个小角标，点它才走。
+           底色取最低那一档，**而且没有悬停态**：整张卡不可点，给它一个高亮
+           等于在骗手；会响应的只有末尾那个角标，它自己有 `u-hover-ink` */
+        <div
           key={ev.chunk_id}
-          to="/kb/$kbId/doc/$docId"
-          params={{ kbId, docId: ev.document_id }}
-          search={{ chunk: ev.chunk_id }}
-          className="u-hover-ink block text-small text-ink-2"
+          className="rounded-cell bg-surface px-2 py-2 text-small text-ink-2"
         >
           {/* 原文说的谓词，只在它与事实行上显示的不同时才写出来。本体外的谓词
               事实行上已经显示原文说法（0052），相同的话再写一遍是噪声；
@@ -3544,14 +3188,28 @@ function EvidenceList({ kbId, fact }: { kbId: string; fact: EntityFact }) {
                 {S.graph.proposedPredicate(ev.proposed_predicate)}
               </div>
             )}
-          <div className="line-clamp-2 italic">
+          {/* **不截断**。从前是 line-clamp-2，于是「看原文」看到的是原文的
+              前两行——想读全的唯一办法是跳去文档页，那就等于没有展开这一档 */}
+          <div className="whitespace-pre-wrap italic text-ink">
             {ev.quote ? `“${ev.quote}”` : S.graph.noQuote}
           </div>
-          <div className="mt-1 text-ink-2">
-            {S.graph.sectionRef(ev.filename, ev.seq + 1)}
+          <div className="mt-2 flex items-center gap-2">
+            {/* 小角标：出处 + 去文档页看上下文。这是这张卡上唯一会走人的地方 */}
+            <Link
+              to="/kb/$kbId/doc/$docId"
+              params={{ kbId, docId: ev.document_id }}
+              search={{ chunk: ev.chunk_id }}
+              className="u-hover-ink inline-flex min-w-0 items-center gap-1 text-fine text-ink-2"
+              title={S.graph.openInDoc}
+            >
+              <span className="truncate">
+                {S.graph.sectionRef(ev.filename, ev.seq + 1)}
+              </span>
+              <ExternalLink size={11} className="shrink-0" />
+            </Link>
             {ev.stale && (
               <span
-                className="ml-2 u-num text-fine text-ink-2"
+                className="u-num shrink-0 text-fine text-ink-2"
                 title={S.graph.staleEvidenceHint}
               >
                 {S.graph.fromVersion(ev.doc_version)}
@@ -3559,17 +3217,23 @@ function EvidenceList({ kbId, fact }: { kbId: string; fact: EntityFact }) {
             )}
             {ev.document_deleted && (
               <span
-                className="ml-2 text-fine text-contest"
+                className="shrink-0 text-fine text-contest"
                 title={S.graph.sourceDeletedHint}
               >
                 {S.graph.sourceDeleted}
               </span>
             )}
           </div>
-        </Link>
+        </div>
       ))}
       {evidence.data?.evidence.length === 0 && (
         <p className="text-small text-ink-2">{S.graph.noEvidence}</p>
+      )}
+      {/* 这条区间不是原文写的，是引擎对账或人工裁决闭合的。**从事实行搬到这里**：
+          在行上它是一个 ⟲，谁也猜不出是什么意思；证据这一档本来就在回答
+          「凭什么这么说」，一句话说得明白 */}
+      {fact.corrected && (
+        <p className="text-fine text-ink-2">{S.graph.correctedHint}</p>
       )}
       {/* 置信度只在低到值得怀疑时说话（与 Review 低置信口径一致），常规不标 */}
       {fact.confidence < 0.75 && (

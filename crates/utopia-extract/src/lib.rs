@@ -83,6 +83,9 @@ pub struct PromptRelation {
     /// **一律用 key**：模型要输出的就是 key，中文库里 person 的 label 是"人物"，
     /// 写进签名等于教它输出一个不存在的类型（docs/decisions/0004）
     pub signature: String,
+    /// 时间语义（`relation_types.temporal`）：`state` / `event` / `eternal`（0031）。
+    /// 只有 event 与 eternal 会在清单里带标记——状态是默认，写出来只多花 token
+    pub temporal: String,
 }
 
 /// Response-scoped reference to a persistent entity; database UUIDs must never enter prompts.
@@ -140,15 +143,32 @@ pub fn build_messages(
             } else {
                 String::new()
             };
+            // 事件与恒常带方括号标记；状态是默认，不标（0031）
+            let mark = temporal_mark(&r.temporal)
+                .map(|m| format!(" [{m}]"))
+                .unwrap_or_default();
             match (paren.is_empty(), d.is_empty()) {
-                (false, false) => format!("- {} ({paren}): {d}", r.key),
-                (false, true) => format!("- {} ({paren})", r.key),
-                (true, false) => format!("- {}: {d}", r.key),
-                (true, true) => format!("- {}", r.key),
+                (false, false) => format!("- {} ({paren}){mark}: {d}", r.key),
+                (false, true) => format!("- {} ({paren}){mark}", r.key),
+                (true, false) => format!("- {}{mark}: {d}", r.key),
+                (true, true) => format!("- {}{mark}", r.key),
             }
         })
         .collect::<Vec<_>>()
         .join("\n");
+    // 标记也只在真有事件或恒常关系时解释一次；全是状态的库，提示词一字不变。
+    // 说的是**写什么**而不是「它是什么」：事件的那一刻进 valid_from、valid_to 留空
+    // ——不然模型照状态的样子填一个起点，账本就把一次收购读成从那天起一直持续
+    let temporal_note = if relations
+        .iter()
+        .any(|r| temporal_mark(&r.temporal).is_some())
+    {
+        "\n         3b. A relation marked [event] happens at one moment: put the date it happened in \
+            valid_from and leave valid_to null — it has no span and does not end. A relation \
+            marked [eternal] holds regardless of time: leave both dates null."
+    } else {
+        ""
+    };
     // 记号只在真有签名时解释一次；没有签名的库，提示词一字不变。
     // 说明用英文——提示词的**指令语言**是英文，只有 description 跟语料走
     //
@@ -253,7 +273,7 @@ pub fn build_messages(
             company\", \"no longer available\", \"until recently\". Use null only for something \
             still going on. These are not interchangeable: null asserts it still holds, and \
             writing null for a relation the text says is over makes us claim the opposite of \
-            the source.\n\
+            the source.{temporal_note}\n\
          4. {time_ctx}\n\
          5. quote must be a contiguous excerpt from the source text; every fact needs one.\n\
          6. confidence in 0~1: 0.9 explicitly stated, 0.7 inferred, 0.5 uncertain.\n\
@@ -261,6 +281,27 @@ pub fn build_messages(
          8. If no listed relation fits, do not force the nearest one — write the predicate the \
             text itself uses, in snake_case (e.g. \"available_on\", \"runs_on\"). A relation \
             named after the text is worth more than a listed one that says something false.\n\
+         8a. The same holds for a literal the text states outright — an amount, a share count, \
+            a percentage, a capacity, a date, a job title, a ticker. Write it as a fact with \
+            \"value\" and no \"object\": {{\"subject\":\"NVIDIA\",\"subject_ref\":\"e1\",\
+            \"predicate\":\"purchase_price\",\"value\":\"$11.9 billion\",\"confidence\":0.9,\
+            \"quote\":\"...\"}}. Name the predicate after the text when no listed attribute \
+            fits — \"purchase_price\", \"job_title\", \"generation_capacity\", \"record_date\". \
+            Attach it to the entity the text attaches it to, and keep the literal as written, \
+            units and all. **A stated figure left out is the loss that costs most**: the reader \
+            came for those numbers, and no later step can recover one that was never written \
+            down.\n\
+         8b. A **listed** relation also takes \"value\" when what the text gives is a \
+            string rather than another entity — a job title, a designation, a ticker, a \
+            model number. Never invent an entity for a string. And when the text introduces \
+            someone by their role — \"X, founder and CEO of Y\", \"Z, co-CEO of W\" — write \
+            both facts: the tie to the organization, and the role itself as a value on the \
+            person. The tie alone says they are connected; the role is what the sentence \
+            was actually telling you.\n\
+         8c. A list of named parties is a list of facts — one per name. \"partners \
+            including A, B, C and D\" is four facts, not one; \"advisors A and B\" is two. \
+            Do not collapse an enumeration into a summary or into its first member. \
+            The same applies to the entities: each named party is its own entity.\n\
          9. The same holds for entity types: if none of the listed types fits, write the type \
             the text implies, in snake_case (e.g. \"model\", \"technology\"). Do not fall back \
             to a broad listed type such as \"thing\" or \"creative_work\" merely because \
@@ -289,6 +330,16 @@ pub fn build_messages(
             content: user,
         },
     ]
+}
+
+/// 清单里给关系带的标记：事件 `[event]`、恒常 `[eternal]`；状态不标。
+/// 认不出的值当状态——数据库的 CHECK 只放这三个进来，这里不再报错
+fn temporal_mark(temporal: &str) -> Option<&'static str> {
+    match temporal {
+        "event" => Some("event"),
+        "eternal" => Some("eternal"),
+        _ => None,
+    }
 }
 
 /// 已在本文档中出现过的实体，放进提示词的字符预算。
@@ -608,7 +659,7 @@ pub fn build_adjudication_messages(pairs: &[AdjudicationPair]) -> Vec<ChatMessag
          these names, or on pairs of the same two types. Treat them as how the owners of this \
          base want such cases judged. Follow a precedent on the same pair unless the facts of \
          this pair clearly differ from it; when precedents disagree with each other, answer \
-         \"unsure\". A precedent never overrides a contradiction in the facts.\n\
+         \"unsure\". A precedent never overrides a contradiction in the facts. Some precedents quote what the person wrote when deciding: weigh that stated ground, not only the outcome; a decision made for a reason that does not hold here is not a precedent for this pair.\n\
          \n\
          Output exactly one JSON object and nothing else:\n\
          {{\"verdicts\":[{{\"i\":0,\"verdict\":\"same|different|unsure\",\"confidence\":0.9,\
@@ -791,7 +842,44 @@ mod prompt_shape_tests {
             label: key.replace('_', " "),
             description: description.into(),
             signature: signature.into(),
+            temporal: "state".into(),
         }
+    }
+
+    fn timed(key: &str, description: &str, temporal: &str) -> PromptRelation {
+        PromptRelation {
+            temporal: temporal.into(),
+            ..rel(key, description, "")
+        }
+    }
+
+    /// 事件与恒常在清单里带标记，说明只出现一次（0031）
+    #[test]
+    fn an_event_and_an_eternal_relation_are_marked() {
+        let rels = vec![
+            rel("works_at", "受雇于某个组织。", "person → organization"),
+            timed("acquired", "One company buys another.", "event"),
+            timed("capital_of", "", "eternal"),
+        ];
+        let msgs = build_messages(&[], &rels, &[], None, "a.txt", &[], "text");
+        let s = &msgs[0].content;
+        assert!(s.contains("- works_at (person → organization): 受雇于某个组织。"));
+        assert!(s.contains("- acquired [event]: One company buys another."));
+        // 没有描述时括号里是 label，标记跟在括号后面
+        assert!(s.contains("- capital_of (capital of) [eternal]"));
+        assert!(s.contains("A relation marked [event] happens at one moment"));
+        assert!(s.contains("leave valid_to null"));
+    }
+
+    /// **全是状态的库，提示词一字不变**：不标、不解释
+    #[test]
+    fn a_base_of_states_pays_nothing_for_the_marks() {
+        let rels = vec![rel("works_at", "d", "")];
+        let msgs = build_messages(&[], &rels, &[], None, "a.txt", &[], "text");
+        let s = &msgs[0].content;
+        assert!(!s.contains("[event]"));
+        assert!(!s.contains("[eternal]"));
+        assert!(!s.contains("happens at one moment"));
     }
 
     /// 签名进括号，而且**一律是 key**：中文库的 label 是"人物"，

@@ -7,7 +7,6 @@ import type {
   ButtonHTMLAttributes,
   InputHTMLAttributes,
   ReactNode,
-  SelectHTMLAttributes,
   TextareaHTMLAttributes,
 } from "react";
 import {
@@ -16,6 +15,7 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  CircleAlert,
   Search as SearchIcon,
 } from "lucide-react";
 import { S } from "../i18n";
@@ -139,7 +139,7 @@ export const IconButton = forwardRef<
   );
 });
 
-/* ---------- Input / Textarea / NativeSelect ---------- */
+/* ---------- Input / Textarea ---------- */
 type InputSize = { size?: "sm" | "md" };
 
 export const Input = forwardRef<
@@ -205,22 +205,10 @@ export const Textarea = forwardRef<
 });
 
 /* 原生 select：弹层无法主题化，所以只给"两三个选项、不值得一个 Dropdown"的地方用 */
-export function NativeSelect({
-  className,
-  size = "md",
-  ...props
-}: Omit<SelectHTMLAttributes<HTMLSelectElement>, "size"> & InputSize) {
-  return (
-    <select
-      className={cn(
-        "input-dark appearance-none",
-        size === "sm" ? "u-input-sm" : "u-input-md",
-        className,
-      )}
-      {...props}
-    />
-  );
-}
+/* `NativeSelect` 去了：页面里一个都不剩。原生 select 的弹层是操作系统画的，
+   主题化不了——同一页上两种下拉，一种是我们的面，一种是系统的灰框。留着一个
+   没人用的组件，只会让它某天又溜回来。小而有界的枚举用 `Dropdown`，
+   成百上千的（本体的类、部署里的人）用 `SearchSelect`。 */
 
 /* ---------- Dropdown（自制下拉，替代原生 select：原生弹层无法主题化） ---------- */
 export interface DropdownOption {
@@ -915,6 +903,50 @@ export function SettingsCard({
   );
 }
 
+/* ---------- StatusCell（表里的一格状态） ----------
+   **顺利就是普通文字，出事才有颜色。** 一列里每行都挂着一个彩色胶囊时，
+   颜色不再指示任何东西——十二个「Ready」和一个「Failed」长得一样重，
+   眼睛得逐行读才找得到坏的那一行。所以状态词就是次要色的一句话，
+   失败在前面加一个红色的叹号：**红的是那个符号，不是整句话**，
+   一列扫下来只有几个红点跳出来。
+   给了 onClick 就是可点的（点开看报错原文）。 */
+export function StatusCell({
+  danger,
+  onClick,
+  title,
+  children,
+}: {
+  danger?: boolean;
+  onClick?: () => void;
+  title?: string;
+  children: ReactNode;
+}) {
+  const body = (
+    <>
+      {danger && <CircleAlert size={12} className="shrink-0 text-danger" />}
+      {children}
+    </>
+  );
+  const cls = "inline-flex items-center gap-1.5 text-small text-ink-2";
+  if (!onClick) {
+    return (
+      <span className={cls} title={title}>
+        {body}
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      title={title}
+      onClick={onClick}
+      className={cn(cls, "u-linkbtn")}
+    >
+      {body}
+    </button>
+  );
+}
+
 /* ---------- Chip（状态胶囊） ---------- */
 export type ChipTone =
   "neutral" | "info" | "success" | "warn" | "danger" | "violet";
@@ -1098,7 +1130,7 @@ export function SectionMark({ text, title }: { text: string; title: string }) {
     <RouterLink
       to="/"
       title={title}
-      className="relative inline-flex text-white text-title"
+      className="u-wordmark-top relative inline-flex text-white"
       style={{ fontFamily: "var(--font-brand)", letterSpacing: "0.06em" }}
     >
       {[...text].map((ch, i) => (
@@ -1169,6 +1201,11 @@ export function rowClass(
 }
 /** 行右端小字：小一档、淡一档，整行被指着时跟着提亮 */
 export const ROW_TRAILING = "ml-auto shrink-0 text-fine text-ink-2 group-hover:text-ink";
+/** 紧跟在标签后面的值——与 `ROW_TRAILING` 同一副颜色，但**不推到右边**。
+ *  一左一右适合"名字 …… 数量"这种两栏读法；「谓词 宾语」是一句话，中间隔一
+ *  整行空白就读不成句子了 */
+export const ROW_VALUE =
+  "min-w-0 flex-1 truncate text-fine text-ink-2 group-hover:text-ink";
 
 export function Row({
   active,
@@ -1546,7 +1583,7 @@ export const HOVER_ROW =
 export const REVEAL = "u-reveal";
 
 /* 各在自己文件里的组件，从这里一并导出，页面只认 "../ui" 一个入口 */
-export { Dialog, DangerConfirm } from "./dialog";
+export { Dialog, DangerConfirm, FormDialog } from "./dialog";
 export { Tooltip } from "./tooltip";
 export { Table, THead, TBody, Tr, Th, Td } from "./table";
 export { Field } from "./field";

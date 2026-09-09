@@ -251,6 +251,83 @@ async fn a_rule_types_a_well_and_says_which_readings_did_it() -> anyhow::Result<
     run
 }
 
+/// 两组「或」（0029 / #476）：第二组独自成立时，落下的结论只挂**它自己那条**读数。
+///
+/// 钉的是纯逻辑那层看不见的一件事：前提链进 `fact_derivations` 的是这一组的
+/// 前提，不是这条规则全部条件碰过的事实——「凭哪条读数」在库里也得是真的。
+#[tokio::test]
+async fn either_group_concludes_and_names_only_its_own_reading() -> anyhow::Result<()> {
+    let Some(url) = utopia_store::test_db::url() else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&url).await?;
+    let f = seed(&pool).await?;
+
+    let run = async {
+        // 只有一条全烃读数，没有解释结论：第 0 组（全烃 > 8 且 解释 ∈ {…}）
+        // 不成立，第 1 组（全烃 > 20）成立
+        let a = attr(
+            &pool,
+            &f,
+            f.thc,
+            serde_json::json!(25.0),
+            "2023-06-01T00:00:00Z",
+        )
+        .await?;
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO attribute_rules (id, kb_id, name, subject_type_id, conclusion, conclude_type_id)
+             VALUES ($1, $2, 'gas-bearing (two ways)', $3, 'typing', $4)",
+        )
+        .bind(id)
+        .bind(f.kb)
+        .bind(f.well)
+        .bind(f.gas_bearing)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO attribute_rule_conditions
+                (id, rule_id, group_seq, seq, predicate_id, op, operand)
+             VALUES ($1, $2, 0, 0, $3, 'gt', $4),
+                    ($5, $2, 0, 1, $6, 'in', $7),
+                    ($8, $2, 1, 0, $3, 'gt', $9)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(id)
+        .bind(f.thc)
+        .bind(serde_json::json!(8.0))
+        .bind(Uuid::now_v7())
+        .bind(f.category)
+        .bind(serde_json::json!(["气测异常"]))
+        .bind(Uuid::now_v7())
+        .bind(serde_json::json!(20.0))
+        .execute(&pool)
+        .await?;
+
+        let report = utopia_store::reasoning::materialize(&pool, f.kb).await?;
+        assert_eq!(report.rule_hits, 1, "第二组独自成立，一次命中");
+
+        let rows = derived(&pool, &f).await?;
+        assert_eq!(rows.len(), 1);
+        let premises: Vec<(Uuid,)> = sqlx::query_as(
+            "SELECT premise_fact_id FROM fact_derivations WHERE derived_fact_id = $1",
+        )
+        .bind(rows[0].id)
+        .fetch_all(&pool)
+        .await?;
+        let got: Vec<Uuid> = premises.into_iter().map(|(x,)| x).collect();
+        assert_eq!(got, vec![a], "前提只有这一组用到的那条读数");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(f.org)
+        .execute(&pool)
+        .await?;
+    run
+}
+
 /// 阈值抬到读数之上再跑：结论**作废而不是删除**——记录轴上留着「我们曾据此推出」
 #[tokio::test]
 async fn raising_the_threshold_invalidates_without_deleting() -> anyhow::Result<()> {
@@ -520,6 +597,7 @@ async fn changing_the_conclusion_retires_the_old_one() -> anyhow::Result<()> {
                 type_id: None,
                 predicate_id: Some(verdict),
                 value: Some(serde_json::json!("含气")),
+                expr: None,
             }),
         )
         .await?;
@@ -702,4 +780,76 @@ async fn capped_of(pool: &PgPool, kb: Uuid, rule_id: Uuid) -> anyhow::Result<i64
         .find(|r| r["id"].as_str() == Some(&rule_id.to_string()))
         .expect("规则在列表里");
     Ok(r["capped"].as_i64().expect("capped 是个数"))
+}
+
+/// 「不属于」写进库、读回来、真的判得动（0029 / #476）。
+///
+/// 钉的是编译那一步：`parse_operand` 曾经只给 `in` 留了分支，`not_in` 落到
+/// 数字那一支上解析不出来，于是**整条规则被当成写坏的跳过**——它什么都不推，
+/// 而规则页上它看着一切正常。这种病只有打在真库上才看得见：纯逻辑那层的用例
+/// 是直接构造 `Operand::Set` 的，绕过了正出问题的那一步。
+#[tokio::test]
+async fn a_rule_that_says_not_one_of_is_not_silently_skipped() -> anyhow::Result<()> {
+    let Some(url) = utopia_store::test_db::url() else {
+        return Ok(());
+    };
+    let pool = PgPool::connect(&url).await?;
+    let f = seed(&pool).await?;
+
+    let run = async {
+        attr(
+            &pool,
+            &f,
+            f.thc,
+            serde_json::json!(12.3),
+            "2023-06-01T00:00:00Z",
+        )
+        .await?;
+        attr(
+            &pool,
+            &f,
+            f.category,
+            serde_json::json!("水层"),
+            "2023-06-01T00:00:00Z",
+        )
+        .await?;
+
+        let id = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO attribute_rules (id, kb_id, name, subject_type_id, conclusion, conclude_type_id)
+             VALUES ($1, $2, 'not-water', $3, 'typing', $4)",
+        )
+        .bind(id)
+        .bind(f.kb)
+        .bind(f.well)
+        .bind(f.gas_bearing)
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO attribute_rule_conditions (id, rule_id, seq, predicate_id, op, operand)
+             VALUES ($1, $2, 0, $3, 'not_in', $4)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(id)
+        .bind(f.category)
+        .bind(serde_json::json!(["气测异常"]))
+        .execute(&pool)
+        .await?;
+
+        let report = utopia_store::reasoning::materialize(&pool, f.kb).await?;
+        assert_eq!(report.attribute_rules, 1, "规则要被读进来");
+        assert_eq!(
+            report.rule_hits, 1,
+            "「水层」不属于 {{气测异常}}，这条规则应当命中——从前它整条被跳过"
+        );
+        assert_eq!(derived(&pool, &f).await?.len(), 1);
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(f.org)
+        .execute(&pool)
+        .await?;
+    run
 }

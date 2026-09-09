@@ -30,6 +30,9 @@ pub struct RuleReq {
     pub conclude_predicate_id: Option<Uuid>,
     #[serde(default)]
     pub conclude_value: Option<serde_json::Value>,
+    /// 算出来的结论那棵树（0032）：`conclusion = "computed"` 时给
+    #[serde(default)]
+    pub conclude_expr: Option<serde_json::Value>,
     pub conditions: Vec<ConditionInput>,
 }
 
@@ -53,6 +56,8 @@ pub struct RulePatch {
     pub conclude_predicate_id: Option<Uuid>,
     #[serde(default)]
     pub conclude_value: Option<serde_json::Value>,
+    #[serde(default)]
+    pub conclude_expr: Option<serde_json::Value>,
 }
 
 pub async fn list(
@@ -82,6 +87,7 @@ pub async fn create(
         req.conclude_type_id,
         req.conclude_predicate_id,
         req.conclude_value.clone(),
+        req.conclude_expr.clone(),
         &req.conditions,
     )
     .await?;
@@ -110,6 +116,7 @@ pub async fn update(
         type_id: req.conclude_type_id,
         predicate_id: req.conclude_predicate_id,
         value: req.conclude_value.clone(),
+        expr: req.conclude_expr.clone(),
     });
     utopia_store::business_rules::update(
         &state.pool,
@@ -196,5 +203,9 @@ pub async fn run_now(
         "capped": report.rule_capped,
         "inserted": report.inserted,
         "invalidated": report.invalidated,
+        // 链跑了几轮，以及有没有跑满上限就停（0030）。**跑满得说出来**——
+        // 没接上的那一环与「不满足」在结果里长得一模一样
+        "rounds": report.rule_rounds,
+        "rounds_capped": report.rule_rounds_capped,
     })))
 }

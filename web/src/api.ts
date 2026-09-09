@@ -324,8 +324,10 @@ export interface ChunkFact {
  * 在界面上看不出区别，而那正是「推理污染知识」的样子。 */
 /** 一条条件：这个属性、这样比、跟这个值比 */
 export interface RuleCondition {
+  /** 组号：同组「与」，组间「或」（决定记录 0029）。不带 = 第 0 组 */
+  group?: number;
   predicate_id: string;
-  /** gt | gte | lt | lte | between | in | present */
+  /** gt | gte | lt | lte | between | in | not_in | present */
   op: string;
   /** 数字 / [lo,hi] / 字符串数组；present 不带 */
   operand?: unknown;
@@ -586,6 +588,8 @@ export type AgentPrecedent =
       left: string;
       right: string;
       at: string;
+      /** 人拍板时写的那一句（0026）；0026 之前的决定没有 */
+      why?: string | null;
     }
   | { family: "type_pair"; merged: number; kept: number; reverted: number };
 
@@ -907,6 +911,11 @@ export interface EntityHistoryEvent {
     | "corrected"
     | "rejected"
     | "merged"
+    /** 别人并进了它：事实搬到它名下 */
+    | "merged_in"
+    /** 它并进了别人：这个 id 从此不再单独存在 */
+    | "merged_away"
+    | "merge_reverted"
     | "retyped"
     | "retype_reverted";
   direction: "out" | "in" | null;
@@ -1119,12 +1128,36 @@ export interface ImportPlan {
   functional_relations: number;
 }
 
+/** 一次导入记下的账。**键与 `owl_import.rs` 写进 `summary` 的一一对应**；
+ *  全是可选的——老记录可能缺字段，界面按缺失处理而不是显示 0 */
+export interface OntologyImportSummary {
+  classes_created?: number;
+  classes_updated?: number;
+  classes_key_taken?: number;
+  classes_without_description?: number;
+  relations_seen?: number;
+  relations_created?: number;
+  relations_updated?: number;
+  functional_relations?: number;
+  /** 逆属性 / 父属性连上了几条——目标 IRI 不在这个库里时会静默跳过 */
+  inverse_linked?: number;
+  sub_property_linked?: number;
+  attributes_seen?: number;
+  attributes_created?: number;
+  /** **按原因分组的计数**，不是一个数：`{no_domain: 3, unknown_domain: 1}`。
+   *  跳过一个属性的理由不止一种，而理由才是人下一步要处理的东西 */
+  attributes_skipped?: Record<string, number>;
+  /** 没投影下来的 IRI 与出现次数（服务端最多记 30 条） */
+  unprojected?: [string, number][];
+  triples?: number;
+}
+
 export interface OntologyImportView {
   id: string;
   filename: string;
   format: string;
   byte_size: number;
-  summary: Record<string, unknown>;
+  summary: OntologyImportSummary;
   imported_by_name: string | null;
   imported_at: string;
 }
@@ -1745,6 +1778,10 @@ export const api = {
       capped: number;
       inserted: number;
       invalidated: number;
+      /** 链跑了几轮：1 就是没有链，2 就是一条规则读了另一条的结论（0030） */
+      rounds: number;
+      /** 跑满上限还在产出：链比 MAX_DEPTH 长，后面那几环没接上 */
+      rounds_capped: boolean;
     }>(`/api/v1/kbs/${kbId}/rules/run`, { method: "POST" }),
 
   entityHistory: (kbId: string, entityId: string, page: number, per = 30) =>
@@ -2042,13 +2079,15 @@ export const api = {
       `/api/v1/kbs/${kbId}/review?queue=${queue}&limit=${limit}&offset=${offset}&types=${types}`,
     ),
   /** 一批重复项同一个动作（#428）：每条各自裁、各自记台账，回来逐条说成没成 */
-  reviewBatch: (kbId: string, ids: string[], action: "merge" | "keep") =>
+  /** `rationale`：人拍板时写的那一句（0026）——什么让你这么定。可不写；写了就跟着
+   *  决定一起进台账，下一次裁决器和 agent 读到的先例就不只是结果 */
+  reviewBatch: (kbId: string, ids: string[], action: "merge" | "keep", rationale?: string) =>
     request<{
       decided: number;
       outcomes: { id: string; error: string | null }[];
     }>(`/api/v1/kbs/${kbId}/review/batch`, {
       method: "POST",
-      body: JSON.stringify({ ids, action }),
+      body: JSON.stringify({ ids, action, rationale: rationale || null }),
     }),
   /** 闭合日期带精度（year | month | day）：写多少位就是多少精度，服务端照存 */
   closeFact: (kbId: string, factId: string, validTo: string, precision: string) =>
@@ -2079,10 +2118,10 @@ export const api = {
       `/api/v1/kbs/${kbId}/review/pending/${pendingId}`,
       { method: "POST", body: JSON.stringify({ action }) },
     ),
-  decideReview: (kbId: string, reviewId: string, action: "merge" | "keep") =>
+  decideReview: (kbId: string, reviewId: string, action: "merge" | "keep", rationale?: string) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/review/${reviewId}`, {
       method: "POST",
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ action, rationale: rationale || null }),
     }),
   /** 对一条数据映射口径表态（0011）。改状态不删行——拒绝留痕，下一轮探索不再提议它 */
   decideMapping: (
@@ -2126,10 +2165,10 @@ export const api = {
    *  第一个要看的就是「我们拿什么去找的」 */
   /** 手动合并：把 source 并进 target。**方向要紧**——source 消失，
    *  它的事实搬到 target 上；合并可整体回滚（entity_merges 记着快照） */
-  mergeEntities: (kbId: string, source: string, target: string) =>
+  mergeEntities: (kbId: string, source: string, target: string, rationale?: string) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/entities/merge`, {
       method: "POST",
-      body: JSON.stringify({ source, target }),
+      body: JSON.stringify({ source, target, rationale: rationale || null }),
     }),
   typeResolutionPreview: (kbId: string) =>
     request<{ items: TypeSuggestion[] }>(
@@ -2204,10 +2243,15 @@ export const api = {
     request<ReviewSummary>(`/api/v1/kbs/${kbId}/review/summary`),
   /** 回答 agent 的一笔（0025）：merge / keep 答一条建议，revert 撤回一条自动合并，
    *  merge 也能推翻一条自动分开。走的是人的裁决路径，成为新先例 */
-  agentAnswer: (kbId: string, decisionId: string, action: "merge" | "keep" | "revert") =>
+  agentAnswer: (
+    kbId: string,
+    decisionId: string,
+    action: "merge" | "keep" | "revert",
+    rationale?: string,
+  ) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/review/agent/${decisionId}`, {
       method: "POST",
-      body: JSON.stringify({ action }),
+      body: JSON.stringify({ action, rationale: rationale || null }),
     }),
   reviewHistory: (kbId: string, page: number, per = 20) =>
     request<{ events: ReviewHistoryEvent[]; total: number }>(
