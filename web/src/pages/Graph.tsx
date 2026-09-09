@@ -49,7 +49,9 @@ import { NextStep, nextStep, useReadiness } from "./NextStep";
 import {
   ArrowLeft,
   ArrowRight,
+  ChevronRight,
   CircleDashed,
+  ExternalLink,
   Grape,
   Loader2,
   Maximize2,
@@ -62,7 +64,6 @@ import {
   X,
   ZoomIn,
   ZoomOut,
-  ChevronRight,
 } from "lucide-react";
 import {
   api,
@@ -3013,6 +3014,13 @@ function FactRow({
       className={cn((fact.stale || past) && "opacity-55")}
       title={fact.stale ? S.graph.staleFactHint : undefined}
     >
+      {/* **两行：上面是这条事实，下面是我们对它知道些什么。**
+          从前是一行，而那一行里塞着谓词、区间、宾语、证据数、改期笔。分组的
+          缩进之后只剩 249px，尾部那一组又是 shrink-0，于是唯一能收缩的谓词
+          把亏空全吃了——实测一个实体的 144 行里，35 行的谓词宽度是 0，读起来
+          就是「→ 2023-03-02 ~ now  Project Aurora」：说有这么条事实，就是不说
+          是哪条（#500）。谓词是这一行的主语句，不该是第一个被挤掉的。
+          悬停才现身的那两个动作也一起下来：`u-reveal` 只改透明度，看不见也占着位 */}
       <div
         role={go ? "link" : undefined}
         tabIndex={go ? 0 : undefined}
@@ -3020,76 +3028,93 @@ function FactRow({
         onKeyDown={(ev) => {
           if (go && ev.key === "Enter") go();
         }}
-        className={cn(HOVER_ROW, go && "cursor-pointer")}
+        className={cn(HOVER_ROW, "items-start", go && "cursor-pointer")}
       >
-        <span className="shrink-0 text-violet">
+        <span className="shrink-0 pt-1 text-violet">
           {dir === "out" ? <ArrowRight size={12} /> : <ArrowLeft size={12} />}
         </span>
-        <span
-          className={cn(
-            "truncate text-body text-ink",
-            fact.predicate_label === null && "italic text-ink-2",
-          )}
-          title={
-            fact.predicate_label && fact.inferred ? S.graph.inferredPredicate : undefined
-          }
-        >
-          {fact.predicate_label ?? S.graph.unknownPredicate}
-        </span>
-        {lowConfidence && (
-          <span className="shrink-0 u-num u-meta-warn text-fine">
-            {Math.round(fact.confidence * 100)}%
-          </span>
-        )}
-        {fact.stale && (
-          <span className="u-chip u-chip-neutral shrink-0 !text-fine !px-2">
-            {S.graph.staleFactChip}
-          </span>
-        )}
-        {fact.contested && <ContestedChip kbId={kbId} c={fact.contested} />}
-        {fact.corrected && (
-          <span className="shrink-0 text-fine text-ink-2" title={S.graph.correctedHint}>
-            ⟲
-          </span>
-        )}
-        <span className="ml-auto flex min-w-0 shrink-0 items-center gap-2 pl-2">
-          {interval && (
-            <span className="u-num text-fine text-ink-2">{interval}</span>
-          )}
-          <span className={cn(ROW_TRAILING, "max-w-40 truncate")}>
-            {fact.other_name ?? fmtObjectValue(fact.object_value) ?? "?"}
-          </span>
-          {fact.evidence_count > 0 && (
-            <LinkButton
-              className={cn(REVEAL, "text-fine", open && "is-on")}
-              onClick={(ev) => {
-                ev.stopPropagation();
-                onToggle();
-              }}
-            >
-              {S.graph.sources(fact.evidence_count)}
-            </LinkButton>
-          )}
-          {/* 这一档只有断言事实：派生的区间是算出来的，走 Derived 那条路径 */}
-          <span
-            role="button"
-            tabIndex={0}
-            title={S.graph.editTime}
-            aria-label={S.graph.editTime}
-            onClick={(ev) => {
-              ev.stopPropagation();
-              setEditing(true);
-            }}
-            onKeyDown={(ev) => {
-              if (ev.key === "Enter" || ev.key === " ") {
-                ev.preventDefault();
-                ev.stopPropagation();
-                setEditing(true);
+        <span className="min-w-0 flex-1">
+          {/* 第一行：谓词 + 宾语，读出来就是这条事实本身 */}
+          <span className="flex items-center gap-2">
+            <span
+              className={cn(
+                "min-w-0 flex-1 truncate text-body text-ink",
+                fact.predicate_label === null && "italic text-ink-2",
+              )}
+              // 谓词还是可能长到放不下（`publishingPrinciples`）——悬停给全名，
+              // 是本体认下的关系就不必再说它是原文的说法
+              title={
+                fact.predicate_label
+                  ? fact.inferred
+                    ? `${fact.predicate_label} · ${S.graph.inferredPredicate}`
+                    : fact.predicate_label
+                  : undefined
               }
-            }}
-            className={cn(REVEAL, "cursor-pointer rounded-cell p-1 text-ink-2")}
-          >
-            <Pencil size={10} />
+            >
+              {fact.predicate_label ?? S.graph.unknownPredicate}
+            </span>
+            <span className={cn(ROW_TRAILING, "max-w-40 truncate")}>
+              {fact.other_name ?? fmtObjectValue(fact.object_value) ?? "?"}
+            </span>
+          </span>
+          {/* 第二行：何时成立、成色如何、凭什么、以及改期的入口 */}
+          <span className="flex items-center gap-2">
+            {interval && (
+              <span className="u-num text-fine text-ink-2">{interval}</span>
+            )}
+            {lowConfidence && (
+              <span className="shrink-0 u-num u-meta-warn text-fine">
+                {Math.round(fact.confidence * 100)}%
+              </span>
+            )}
+            {fact.stale && (
+              <span className="u-chip u-chip-neutral shrink-0 !text-fine !px-2">
+                {S.graph.staleFactChip}
+              </span>
+            )}
+            {fact.contested && <ContestedChip kbId={kbId} c={fact.contested} />}
+            {fact.corrected && (
+              <span
+                className="shrink-0 text-fine text-ink-2"
+                title={S.graph.correctedHint}
+              >
+                ⟲
+              </span>
+            )}
+            <span className="ml-auto flex shrink-0 items-center gap-2 pl-2">
+              {fact.evidence_count > 0 && (
+                <LinkButton
+                  className={cn(REVEAL, "text-fine", open && "is-on")}
+                  onClick={(ev) => {
+                    ev.stopPropagation();
+                    onToggle();
+                  }}
+                >
+                  {S.graph.sources(fact.evidence_count)}
+                </LinkButton>
+              )}
+              {/* 这一档只有断言事实：派生的区间是算出来的，走 Derived 那条路径 */}
+              <span
+                role="button"
+                tabIndex={0}
+                title={S.graph.editTime}
+                aria-label={S.graph.editTime}
+                onClick={(ev) => {
+                  ev.stopPropagation();
+                  setEditing(true);
+                }}
+                onKeyDown={(ev) => {
+                  if (ev.key === "Enter" || ev.key === " ") {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    setEditing(true);
+                  }
+                }}
+                className={cn(REVEAL, "cursor-pointer rounded-cell p-1 text-ink-2")}
+              >
+                <Pencil size={10} />
+              </span>
+            </span>
           </span>
         </span>
       </div>
@@ -3112,14 +3137,20 @@ function EvidenceList({ kbId, fact }: { kbId: string; fact: EntityFact }) {
     queryFn: () => api.factEvidence(kbId, fact.id),
   });
   return (
-    <div className="space-y-2">
+    /* 多段就滚，不把整个面板顶长。一条事实最多见过十几段证据，全摊开的话
+       它下面那些事实全被挤出屏幕——而展开一条是为了读它，不是为了失去上下文 */
+    <div className="u-scroll max-h-64 space-y-2 overflow-y-auto">
       {evidence.data?.evidence.map((ev: Evidence) => (
-        <Link
+        /* **一段原文一张卡，卡本身不是链接。**
+           从前整块是个 `<Link>`：想读原文，手一动就跳去了文档页；想选一句
+           复制，松手也是跳走。展开这个动作要回答的是「凭什么这么说」，
+           那句话就在这儿，读完了才谈得上要不要去看上下文——所以跳转收进
+           末尾那个小角标，点它才走。
+           底色取最低那一档，**而且没有悬停态**：整张卡不可点，给它一个高亮
+           等于在骗手；会响应的只有末尾那个角标，它自己有 `u-hover-ink` */
+        <div
           key={ev.chunk_id}
-          to="/kb/$kbId/doc/$docId"
-          params={{ kbId, docId: ev.document_id }}
-          search={{ chunk: ev.chunk_id }}
-          className="u-hover-ink block text-small text-ink-2"
+          className="rounded-cell bg-surface px-2 py-2 text-small text-ink-2"
         >
           {/* 原文说的谓词，只在它与事实行上显示的不同时才写出来。本体外的谓词
               事实行上已经显示原文说法（0052），相同的话再写一遍是噪声；
@@ -3130,14 +3161,28 @@ function EvidenceList({ kbId, fact }: { kbId: string; fact: EntityFact }) {
                 {S.graph.proposedPredicate(ev.proposed_predicate)}
               </div>
             )}
-          <div className="line-clamp-2 italic">
+          {/* **不截断**。从前是 line-clamp-2，于是「看原文」看到的是原文的
+              前两行——想读全的唯一办法是跳去文档页，那就等于没有展开这一档 */}
+          <div className="whitespace-pre-wrap italic text-ink">
             {ev.quote ? `“${ev.quote}”` : S.graph.noQuote}
           </div>
-          <div className="mt-1 text-ink-2">
-            {S.graph.sectionRef(ev.filename, ev.seq + 1)}
+          <div className="mt-2 flex items-center gap-2">
+            {/* 小角标：出处 + 去文档页看上下文。这是这张卡上唯一会走人的地方 */}
+            <Link
+              to="/kb/$kbId/doc/$docId"
+              params={{ kbId, docId: ev.document_id }}
+              search={{ chunk: ev.chunk_id }}
+              className="u-hover-ink inline-flex min-w-0 items-center gap-1 text-fine text-ink-2"
+              title={S.graph.openInDoc}
+            >
+              <span className="truncate">
+                {S.graph.sectionRef(ev.filename, ev.seq + 1)}
+              </span>
+              <ExternalLink size={11} className="shrink-0" />
+            </Link>
             {ev.stale && (
               <span
-                className="ml-2 u-num text-fine text-ink-2"
+                className="u-num shrink-0 text-fine text-ink-2"
                 title={S.graph.staleEvidenceHint}
               >
                 {S.graph.fromVersion(ev.doc_version)}
@@ -3145,14 +3190,14 @@ function EvidenceList({ kbId, fact }: { kbId: string; fact: EntityFact }) {
             )}
             {ev.document_deleted && (
               <span
-                className="ml-2 text-fine text-contest"
+                className="shrink-0 text-fine text-contest"
                 title={S.graph.sourceDeletedHint}
               >
                 {S.graph.sourceDeleted}
               </span>
             )}
           </div>
-        </Link>
+        </div>
       ))}
       {evidence.data?.evidence.length === 0 && (
         <p className="text-small text-ink-2">{S.graph.noEvidence}</p>
