@@ -114,7 +114,9 @@ rules corpus declared and undeclared, a Chinese corpus declared and undeclared):
   writes the currency as a sibling key (`"currency": "CNY"`). The prompt now asks for the
   figure as written, the scanner reads ISO codes, currency words and CJK magnitudes (万, 亿),
   a sibling `currency` key becomes the unit, and the attribute's default unit is used only
-  when the text carries no unit token at all — a wrong currency is worse than none.
+  when the text carries no unit token at all — a wrong currency is worse than none. The same
+  rule (`unit_for`) now governs an attribute written on an entity, which used to stamp the
+  declared unit unconditionally: `500 兆瓦` filed under 金额 came out as ¥500.
 - **Two mentions of one edge in parallel can both insert.** The dedup in `insert_fact_inner`
   is a read-then-write with no unique index behind it; two documents describing the same
   `(subject, predicate, object, moment)` extracted at the same time produced two rows with
@@ -126,10 +128,13 @@ rules corpus declared and undeclared, a Chinese corpus declared and undeclared):
 
 ## Open questions
 
-- Where does the amount go when the relation is not adopted yet (`predicate_id` is null,
-  wording on the evidence)? This cut drops it with a reason. Keeping it keyed by wording
-  until adoption would preserve the figure; the bootstrap would then have to propose the
-  qualifier along with the relation.
+- ~~Where does the amount go when the relation is not adopted yet?~~ Answered: a qualifier
+  on a fact whose predicate is unknown binds to an attribute the base already defines (no
+  ontology change, so no switch), and adoption (`adopt`) carries the qualifiers onto the new
+  row and declares them on the relation. A qualifier that binds to nothing — the base has no
+  such attribute, or the ontology is frozen — is written as a literal fact on the subject,
+  worded `relation.key` on its evidence and recorded in `ontology_misses`, the shape rule 8a
+  gives an unlisted figure. Nothing about an edge is dropped for want of a definition.
 - The canvas. An edge label with the amount is a rendering change and belongs with the
   parallel-edge work; the timeline reading an event as a point is
   [0031](0031-an-event-holds-at-the-moment-it-names.md)'s UI cut.
