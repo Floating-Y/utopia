@@ -15,6 +15,7 @@ import forceAtlas2 from "graphology-layout-forceatlas2";
 import FA2Layout from "graphology-layout-forceatlas2/worker";
 import Sigma from "sigma";
 import EdgeCurveProgram from "@sigma/edge-curve";
+import { EdgeRectangleProgram } from "sigma/rendering";
 import {
   drawWorldGrid,
   HOVER_MUTE,
@@ -826,6 +827,48 @@ export function Graph() {
       },
     };
 
+    /* **此刻还连着吗**。
+     *
+     * `areNeighbors` 只问图上有没有这条边，不问时间轴停的这一刻它还成不成立；
+     * 边那边是问的（见 `liveNow`）。两边不一致，画出来就是「节点亮着、线却
+     * 没有」：悬停 Google DeepMind，Arthur Mensch 亮着，可它那条
+     * former_employee_of 早就结束了，线被压回背景色——看着像凭空亮了一个。
+     * 派生边关掉时同理：那条边整条不画，另一头就不该还当邻居亮着。
+     *
+     * **按焦点节点缓存一份**：这个判断每帧要对每个节点问一次，而枢纽点动辄
+     * 几百条边，逐节点扫一遍度数太亏。时间轴每动一次 `activeEdges` 都是新的
+     * Set（见 `recomputeActive`），拿它的身份当键就够，再带上边数兜住图本身
+     * 被换掉的情况 */
+    const liveNbr = {
+      focus: "",
+      edges: null as Set<string> | null,
+      derived: true,
+      size: -1,
+      set: new Set<string>(),
+    };
+    const isLiveNeighbor = (focus: string, node: string) => {
+      const { activeEdges, showDerived } = filterRef.current;
+      if (
+        liveNbr.focus !== focus ||
+        liveNbr.edges !== activeEdges ||
+        liveNbr.derived !== showDerived ||
+        liveNbr.size !== g.size
+      ) {
+        const set = new Set<string>();
+        g.forEachEdge(focus, (e, attrs, src, tgt) => {
+          if (activeEdges && !activeEdges.has(e)) return;
+          if (!showDerived && attrs.derived === true) return;
+          set.add(src === focus ? tgt : src);
+        });
+        liveNbr.focus = focus;
+        liveNbr.edges = activeEdges;
+        liveNbr.derived = showDerived;
+        liveNbr.size = g.size;
+        liveNbr.set = set;
+      }
+      return liveNbr.set.has(node);
+    };
+
     sigmaRef.current?.kill();
     const sigma = new Sigma(g, containerRef.current, {
       ...sigmaOptions({
@@ -833,7 +876,15 @@ export function Graph() {
         /* 平行边扇成弧（见 `layOutParallelEdges`）。直线那一版把同一对节点
            之间的每条边画在同一条线段上，于是几个标签逐字符叠成乱码——实测
            一对节点之间最多压着六条 */
-        edgeProgramClasses: { curved: EdgeCurveProgram },
+        /* **同一个类注册两遍**，后注册的那两个专给高亮的边用（见 `boost()`）。
+           sigma 一个程序一批绘制，批次先后就是这里的键序，`zIndex` 只在批内
+           排——所以一条压暗的直边照样会盖在高亮的弧边上，放大看就是白线被
+           一条条黑细条切断。让高亮的边整批走最后画的程序，才真的在最上层。 */
+        edgeProgramClasses: {
+          curved: EdgeCurveProgram,
+          lineTop: EdgeRectangleProgram,
+          curvedTop: EdgeCurveProgram,
+        },
         // 边上写的是谓词，近距离下每条画得出来的边都写（见 updateEdgeLabels）
         renderEdgeLabels: true,
         // 上千个节点，得缩得比本体页更远才看得见全貌
@@ -866,9 +917,15 @@ export function Graph() {
         if (hov === node) return hoveredNode(res, attrs, base);
         if (sel) {
           // 邻居收到 0.76：上千个节点，得给选中的那一条路让地方
-          if (g.areNeighbors(sel, node)) neighborNode(res, base, 0.76);
+          if (isLiveNeighbor(sel, node)) neighborNode(res, base, 0.76);
+          /* **指到谁，就把谁的邻居也留出来**。边那边悬停是压过选中的
+             （`boost()` 在最前面），节点这边不跟上，选中之后再指别处就成了
+             一圈亮着的边通向一圈黑着的点——指过去正是想读"它连着谁"，
+             而那一问什么也答不出来 */
+          else if (hov && isLiveNeighbor(hov, node))
+            neighborNode(res, base, 0.76);
           else return mutedNode(res, base);
-        } else if (hov && hov !== node && !g.areNeighbors(hov, node)) {
+        } else if (hov && hov !== node && !isLiveNeighbor(hov, node)) {
           // **悬停也压暗其余**，只是比选中轻一档（见 HOVER_MUTE）。
           // 邻居留着：悬停要回答的正是"它连着谁"。
           // **此刻还不存在的节点直接压到底**：这个分支会提前 return，
@@ -1018,6 +1075,8 @@ export function Graph() {
                   : EDGE_FOCUS;
           res.size = Math.max((attrs.size as number) * 1.42, 1.85);
           res.zIndex = 5;
+          // 换到最后画的那批（见 `edgeProgramClasses`）：光有 zIndex 压不住别的程序
+          res.type = res.type === "curved" ? "curvedTop" : "lineTop";
         };
         /* **时间轴停在某一刻时，这条边此刻存不存在**。
            悬停的两条分支都会提前 return，绕过下面那道时间过滤——
@@ -1047,6 +1106,11 @@ export function Graph() {
         }
         if (f.activeEdges && !f.activeEdges.has(edge)) {
           res.color = EDGE_DIM;
+          /* **压暗了就退出最上层那批**（见 `boost()`）。这一档在 `boost()`
+             之后：一条挨着选中项、但此刻时间轴上还不存在的边，颜色已经被压
+             回背景色，却还留着高亮时换上的置顶程序——那就成了一条画在所有
+             高亮边之上的暗线，正好把它们切断 */
+          res.type = attrs.type as string;
           res.label = "";
           return res;
         }
@@ -2999,7 +3063,9 @@ function FactSection({
         onClick={() => setOpen((v) => !v)}
       >
         <span className="flex items-center gap-2 text-small font-medium">
-          {dir === "out" ? <ArrowRight size={10} /> : <ArrowLeft size={10} />}
+          {/* 与下面每条事实行的方向箭头**同一尺寸**（12）。它们是同一个记号、
+              还特意排成一列，标题这个小 2px 就只会读成没对齐 */}
+          {dir === "out" ? <ArrowRight size={12} /> : <ArrowLeft size={12} />}
           <span className="truncate">{title}</span>
           <span className="u-num">{count}</span>
         </span>
