@@ -1407,7 +1407,10 @@ pub(crate) async fn adopt_attribute_core(
     } else {
         // **domain 从数据里取。** 属性必须声明能挂在哪些类下，猜错的代价是硬的：
         // 主语类型对不上就整条丢弃。这些事实的主语现在是什么类是事实，不是判断
-        let mut domains: Vec<Uuid> = facts.iter().map(|(_, type_id, _)| *type_id).collect();
+        let mut domains: Vec<Uuid> = facts
+            .iter()
+            .filter_map(|(_, type_id, _)| *type_id)
+            .collect();
         domains.sort_unstable();
         domains.dedup();
         if domains.is_empty() {
@@ -1446,7 +1449,16 @@ pub(crate) async fn adopt_attribute_core(
         // 抽取写进去的形状是 {"value": …}，取里面那一层来换算
         let raw = object_value.get("value").unwrap_or(object_value);
         match utopia_extract::normalize_attr_value(&datatype, raw) {
-            Some(v) => rewrites.push((*fact_id, json!({ "value": v }))),
+            // **单位跟着值走**。抽取那一步把 `$5 billion` 的 `$` 单记了一格
+            // （见 extraction 里那段说明）；换算成 5e9 之后符号丢掉的话，
+            // 剩下的数就不知道是钱还是别的什么了
+            Some(v) => {
+                let mut next = json!({ "value": v });
+                if let Some(u) = object_value.get("unit") {
+                    next["unit"] = u.clone();
+                }
+                rewrites.push((*fact_id, next))
+            }
             // 换不动的**不改写**：宁可让它继续没有谓词，等下一次，
             // 也不把一个换不动的值硬塞进类型化的属性里
             None => unconvertible += 1,
