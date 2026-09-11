@@ -24,6 +24,7 @@ import Graphology from "graphology";
 import { circular } from "graphology-layout";
 import forceAtlas2 from "graphology-layout-forceatlas2";
 import Sigma from "sigma";
+import { onThemeChange } from "../theme";
 import { EdgeArrowProgram, EdgeLineProgram } from "sigma/rendering";
 import EdgeCurveProgram, { EdgeCurvedArrowProgram } from "@sigma/edge-curve";
 import {
@@ -36,6 +37,23 @@ import {
   NODE_TINT_MIX,
   RING_SELECT_MIX,
   TRANSPARENT,
+  EDGE_SUBCLASS,
+  EDGE_SUBCLASS_FOCUS,
+  EDGE_RELATION,
+  EDGE_RELATION_FOCUS,
+  EDGE_DISJOINT,
+  EDGE_DISJOINT_FOCUS,
+  EDGE_RULE,
+  EDGE_RULE_FOCUS,
+  EDGE_SCHEMA_DIM as EDGE_DIM,
+  LEGEND_SUBCLASS,
+  LEGEND_RELATION,
+  LEGEND_DISJOINT,
+  LEGEND_RULE,
+  INK,
+  refreshPalette,
+  CANVAS_TEXT,
+  CANVAS_TEXT_2,
 } from "./graphVisuals";
 // 画布那台机器是两页共用的（#496）：构造选项、状态表、相机、拖拽都在那边，
 // 这个文件只管把本体投影成一张图、说清楚每个节点是什么颜色
@@ -81,31 +99,6 @@ import { usePopoverFlip } from "../ui/popoverFlip";
    看起来变暗（Graph.tsx 的 EDGE_DIM 处有同一条注释）。这里的边不需要
    动画淡入淡出，所以不必再搬一套 lerp/parseRgba，几个状态各写一个
    现成的颜色字面量就够了。 */
-const EDGE_SUBCLASS = "rgba(235,235,235,0.55)";
-const EDGE_SUBCLASS_FOCUS = "rgba(255,255,255,0.95)";
-// 与 Graph.tsx 的 EDGE_COLOR 同一个灰，RGB 再压一档：这里的线粗一倍
-// （MIN_EDGE_THICKNESS），同一个色值会显得更亮
-const EDGE_RELATION = "rgba(128,128,128,0.3)";
-const EDGE_RELATION_FOCUS = "rgba(255,255,255,0.6)";
-const EDGE_DISJOINT = "rgba(255,157,175,0.45)"; // --u-danger
-const EDGE_DISJOINT_FOCUS = "rgba(255,157,175,0.9)";
-/* 业务规则：紫（--u-violet）。**推出来的东西全站都是这个色**——图谱页的派生边、
-   文库里抽取完成的徽章都用它，所以「这条边上的类不是抽取来的，是规则算出来的」
-   不必再学一遍。弧线：规则的结论多半正是主类的子类，那对类之间已经有一条继承
-   边，直线会与它重叠 */
-/* 图例上的色块不用画布上那几个带 alpha 的值。**画布靠亮度区分继承与关系**
-   （继承亮而细、关系灰而粗，两种线常常压在一起，只能这么分），可图例是四个
-   并排的小方块，同样两毫米高、一个 95% 白一个 60% 白，读出来不是"两种边"，
-   是"这排线粗细不匀"——用户第一眼就是这么说的。
-   这里一律实色，同一强度，区别交给颜色本身；取的是各自的**常态**色而不是
-   聚焦色，因为常态才是画面上多数时候的样子 */
-const LEGEND_SUBCLASS = "#ebebeb";
-const LEGEND_RELATION = "#8c8c8c";
-const LEGEND_DISJOINT = "#ff9daf";
-const LEGEND_RULE = "#c4a5ff";
-const EDGE_RULE = "rgba(196,165,255,0.5)";
-const EDGE_RULE_FOCUS = "rgba(196,165,255,0.95)";
-const EDGE_DIM = "rgba(48,48,48,0.4)";
 
 /** 三种边各自的语义——驱动颜色/暗淡/可点选，与「用哪个 sigma 程序画」分开管 */
 const SUBCLASS_KIND = "subclass";
@@ -277,6 +270,8 @@ export function buildSchemaGraph(
    *  条件写在规则里。得出属性值的那种没有目标节点，不画（它在规则表里） */
   rules: BusinessRule[] = [],
 ): SchemaGraphResult {
+  // 壳色、边色烤进图属性，构图前先把调色板读成当前主题的值（0038）
+  refreshPalette();
   const graph = new Graphology({ multi: true });
   const byId = new Map(entityTypes.map((t) => [t.id, t]));
   const depths = classDepths(entityTypes);
@@ -610,6 +605,8 @@ export function OntologySchemaGraph({
   );
 
   // 取景：大本体只画用得最多的那几个类，左栏点到的类补进来（见 schemaScope）
+  // 主题一变，模式图要重构（壳色烤在属性里）
+  const [themeTick, setThemeTick] = useState(0);
   const [revealed, setRevealed] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -635,8 +632,7 @@ export function OntologySchemaGraph({
   // 取景，选中/悬停都是别的状态，不会触发这里
   const schema = useMemo(
     () => buildSchemaGraph(entityTypes, objectRelations, scope.drawn, rules),
-    [entityTypes, objectRelations, scope.drawn, rules],
-  );
+    [entityTypes, objectRelations, scope.drawn, rules, themeTick]);
 
   /** 把一个类带到眼前：还在取景之外就先揭开、重建之后再对焦；画着但在视口
    *  外就把相机推过去；已经在视口里就只高亮，画面不动 */
@@ -785,6 +781,8 @@ export function OntologySchemaGraph({
   useEffect(() => {
     const g = graphRef.current;
     if (!containerRef.current || !g) return;
+    // 画布颜色从令牌读（0038）：建实例前读一次，切主题后再读一次并重画
+    refreshPalette();
     const sigma = new Sigma(g, containerRef.current, {
       ...sigmaOptions({
         defaultEdgeType: EDGE_TYPE_ARROW,
@@ -827,7 +825,7 @@ export function OntologySchemaGraph({
             // 这条关系的 domain 与 range 就是它连着的
             const endpoints = new Set([...rel.domains, ...rel.ranges]);
             if (endpoints.has(node)) {
-              res.ringColor = mix(ownColorOf(attrs), "#ffffff", RING_SELECT_MIX);
+              res.ringColor = mix(ownColorOf(attrs), INK, RING_SELECT_MIX);
               return neighborNode(res, base);
             }
             return mutedNode(res, base);
@@ -975,7 +973,19 @@ export function OntologySchemaGraph({
       (window as unknown as Record<string, unknown>).__schemaGraph = g;
       (window as unknown as Record<string, unknown>).__schemaSigma = sigma;
     }
+    const offTheme = onThemeChange(() => {
+      refreshPalette();
+      // 标签色是建实例时按当时的调色板定死的（sigmaOptions），实例不重建就得改设置
+      sigma.setSetting("labelColor", { color: CANVAS_TEXT });
+      sigma.setSetting("edgeLabelColor", { color: CANVAS_TEXT_2 });
+      setThemeTick((t) => t + 1);
+      sigma.refresh();
+      // 世界网格只在相机动时重画：这里补一笔，不然它停在上一套墨色
+      if (gridRef.current) drawWorldGrid(gridRef.current, sigma);
+    });
     return () => {
+      offTheme();
+
       sigma.kill();
       sigmaRef.current = null;
     };
