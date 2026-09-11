@@ -1016,7 +1016,10 @@ pub async fn entity_detail(
     .ok_or(AppError::NotFound)?;
 
     let mut facts: Vec<EntityFact> = sqlx::query_as(&format!(
-        "SELECT f.id,
+        "SELECT f.id, f.recorded_at, f.invalidated_at, f.supersedes,
+                ARRAY(SELECT DISTINCT fe.document_id FROM fact_evidence fe
+                      WHERE fe.fact_id = f.id AND fe.document_id IS NOT NULL
+                      ORDER BY fe.document_id) AS document_ids,
                 CASE WHEN {subject} = $2 THEN 'out' ELSE 'in' END AS direction,
                 COALESCE(r.key, fact_surface_predicate(f.id)) AS predicate_key,
                 COALESCE(r.label, fact_surface_predicate(f.id)) AS predicate_label,
