@@ -107,6 +107,23 @@ pub enum QualifierWrite {
 
 /// 往一条边上写一个字面值属性。**属性不进事实的去重键**：同一条边再听到一次带了
 /// 金额的，是同一条边补上金额，不是第二条边。
+/// 两个属性值是不是同一个：数按数比（`65` 与 `65.0` 是同一个数——老库里存着整数，
+/// 新写的是浮点），其余按结构比
+fn qualifier_values_agree(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (a, b) {
+        (serde_json::Value::Number(x), serde_json::Value::Number(y)) => x.as_f64() == y.as_f64(),
+        (serde_json::Value::Object(x), serde_json::Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, v)| y.get(k).is_some_and(|w| qualifier_values_agree(v, w)))
+        }
+        (serde_json::Value::Array(x), serde_json::Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(v, w)| qualifier_values_agree(v, w))
+        }
+        _ => a == b,
+    }
+}
+
 pub async fn upsert_fact_qualifier(
     pool: &PgPool,
     fact_id: Uuid,
@@ -121,7 +138,7 @@ pub async fn upsert_fact_qualifier(
     .fetch_optional(pool)
     .await?;
     match existing {
-        Some((v,)) if &v == value => Ok(QualifierWrite::Same),
+        Some((v,)) if qualifier_values_agree(&v, value) => Ok(QualifierWrite::Same),
         Some(_) => Ok(QualifierWrite::Conflict),
         None => {
             sqlx::query(
@@ -487,8 +504,55 @@ async fn insert_fact_inner(
             return Ok((*ended, false));
         }
     }
-    // 精确重复：同 valid_from → 复用
-    if let Some((existing, _, _, _)) = same.iter().find(|(_, vf, _, _)| *vf == validity.from) {
+    /* **「某天结束了」的观察（没起点、有终点）撞上同断言的开放行：关上它，不另立一行。**
+    另立一行让两条各说各话，开放的那条照旧被读成「至今仍是」——实测「移出失信名单」
+    「辞去董事职务」各多出一条 `- → 日期`，而原来那条还开着。事件没有开放行
+    （两端同一刻），所以只有状态走这里。修正走 supersede（作废 + 改写，证据和边上的
+    属性随行），与 #393 关「不知哪天」同一条路；起点比终点晚的开放行不是这一段 */
+    if temporal == Temporal::State && validity.from.is_none() {
+        if let Some(to) = validity.to {
+            // 已经关在这一天的：同一件事，复用那一行
+            if let Some((ended, _, _, _)) = same.iter().find(|(_, _, vt, _)| *vt == Some(to)) {
+                attest_earlier(pool, *ended, validity.attested_at).await?;
+                return Ok((*ended, false));
+            }
+            let open = same
+                .iter()
+                .filter(|(_, vf, vt, vtp)| {
+                    vt.is_none() && vtp.is_none() && vf.is_none_or(|f| f <= to)
+                })
+                .max_by_key(|(_, vf, _, _)| *vf);
+            if let Some((open, _, _, _)) = open {
+                if let Some(closed) = crate::temporal::close_superseded(
+                    pool,
+                    *open,
+                    to,
+                    validity.to_precision.unwrap_or("day"),
+                )
+                .await?
+                {
+                    return Ok((closed, true));
+                }
+            }
+        }
+    }
+    // 精确重复：同 valid_from → 复用。同起点、**这次带了终点、那行还开着** → 关上它
+    // （「自 2020-01-10 起任董事」之后读到「2020-01-10 至 2024-04-30 任董事」）
+    if let Some((existing, _, vt, vtp)) = same.iter().find(|(_, vf, _, _)| *vf == validity.from) {
+        if temporal == Temporal::State && vt.is_none() && vtp.is_none() {
+            if let Some(to) = validity.to {
+                if let Some(closed) = crate::temporal::close_superseded(
+                    pool,
+                    *existing,
+                    to,
+                    validity.to_precision.unwrap_or("day"),
+                )
+                .await?
+                {
+                    return Ok((closed, true));
+                }
+            }
+        }
         attest_earlier(pool, *existing, validity.attested_at).await?;
         return Ok((*existing, false));
     }
@@ -504,15 +568,48 @@ async fn insert_fact_inner(
             attest_earlier(pool, *existing, validity.attested_at).await?;
             return Ok((*existing, false));
         }
+        // 没有开放行，但这次观察的文档日期落在某条**已关上**的行里：说的是那一段，不是
+        // 新的一段——处罚决定书里的「董事李文博」，日期在他的任期之内。另立一条裸行会被
+        // 读成「至今仍是」，而任期明明已经关上了。文档日期在段之后的照旧另立：那可能真是
+        // 新的一段（再次任职），拿不准时宁分勿合
+        if let Some(at) = validity.attested_at {
+            if let Some((existing, _, _, _)) = same
+                .iter()
+                .find(|(_, vf, vt, _)| vt.is_some_and(|t| at <= t) && vf.is_none_or(|f| f <= at))
+            {
+                attest_earlier(pool, *existing, validity.attested_at).await?;
+                return Ok((*existing, false));
+            }
+        }
     }
-    // 时间精化候选：已有无时无终的裸行，本次观察带了起点 → 落库后作废裸行并链上
+    // 时间精化候选：已有无起点的行（裸行，或只知道终点的行——并行抽取时说结束的那份
+    // 文档可能先到），本次观察带了起点 → 落库后作废那行并链上。只知道终点的行，
+    // 终点跟着走：这次没说终点就沿用它的，说了就得是同一个
+    let mut validity = validity;
     let refine_target = if validity.from.is_some() {
         same.iter()
-            .find(|(_, vf, vt, _)| vf.is_none() && vt.is_none())
-            .map(|(id, _, _, _)| *id)
+            .find(|(_, vf, vt, _)| {
+                vf.is_none() && (vt.is_none() || validity.to.is_none() || *vt == validity.to)
+            })
+            .map(|(id, _, vt, vtp)| (*id, *vt, vtp.clone()))
     } else {
         None
     };
+    if let Some((_, Some(vt), vtp)) = &refine_target {
+        if validity.to.is_none() {
+            validity.to = Some(*vt);
+            validity.to_precision = vtp.as_deref().map(|p| match p {
+                "year" => "year",
+                "month" => "month",
+                "day" => "day",
+                "hour" => "hour",
+                "minute" => "minute",
+                "second" => "second",
+                _ => ENDED_UNKNOWN,
+            });
+        }
+    }
+    let refine_target = refine_target.map(|(id, _, _)| id);
 
     let id = Uuid::now_v7();
     let insert_sql = match object {
@@ -568,6 +665,17 @@ async fn insert_fact_inner(
             "INSERT INTO fact_evidence (fact_id, chunk_id, quote, proposed_predicate, document_id, doc_version)
              SELECT $1, chunk_id, quote, proposed_predicate, document_id, doc_version
              FROM fact_evidence WHERE fact_id = $2
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(id)
+        .bind(old_id)
+        .execute(pool)
+        .await?;
+        // 边上的属性也随行（0037）：裸行上已有的金额、职务不因为精化了时间而丢
+        sqlx::query(
+            "INSERT INTO fact_qualifiers (fact_id, qualifier_type_id, value, entity_id)
+             SELECT $1, qualifier_type_id, value, entity_id
+             FROM fact_qualifiers WHERE fact_id = $2
              ON CONFLICT DO NOTHING",
         )
         .bind(id)

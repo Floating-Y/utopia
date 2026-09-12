@@ -292,6 +292,15 @@ pub async fn resolve_mention(
         });
     };
 
+    // 这一次调用**绝不能归上去**的全部：调用方点名排除的（`exclude`），加上这一轮
+    // 看过、并且会被判「不是同一个」的同名候选。下面无论走哪条分支决定新建，都要把
+    // 这份名单递给 `create_entity`——锁里那条回捞按名字捞，不给名单就会把它们捞回来
+    let weighed: Vec<Uuid> = exclude
+        .iter()
+        .copied()
+        .chain(candidates.iter().map(|c| c.id))
+        .collect();
+
     // 有画像的候选算相似度；无画像（历史数据/无 embedding 期创建）单独归类
     let mut scored: Vec<(&Candidate, f32)> = Vec::new();
     let mut unprofiled: Option<&Candidate> = None;
@@ -347,7 +356,16 @@ pub async fn resolve_mention(
                         });
                     }
                 }
-                let id = create_entity(pool, kb_id, type_id, &name, context).await?;
+                let (id, created) =
+                    create_entity(pool, kb_id, type_id, &name, context, &weighed).await?;
+                if !created {
+                    // 并行的另一份文档刚建好它：用它的，审核对也是它排的
+                    return Ok(Resolution {
+                        entity_id: id,
+                        created: false,
+                        reviews: Vec::new(),
+                    });
+                }
                 refresh_disambiguators(pool, kb_id, &name).await?;
                 let reviews = [(best, sim), (runner, r_sim)]
                     .into_iter()
@@ -403,7 +421,15 @@ pub async fn resolve_mention(
             });
         }
     }
-    let id = create_entity(pool, kb_id, type_id, &name, context).await?;
+    let (id, created) = create_entity(pool, kb_id, type_id, &name, context, &weighed).await?;
+    if !created {
+        // 并行的另一份文档刚建好它：用它的，审核对也是它排的
+        return Ok(Resolution {
+            entity_id: id,
+            created: false,
+            reviews: Vec::new(),
+        });
+    }
     refresh_disambiguators(pool, kb_id, &name).await?;
     let mut reviews = best_scored
         .filter(|(_, sim)| *sim >= SIM_NEW)
@@ -877,7 +903,21 @@ async fn resolve_type_drift(
         }
     }
 
-    let id = create_entity(pool, kb_id, type_id, name, context).await?;
+    // 同上：点名排除的，加上跨类型同名里掂量过的
+    let weighed: Vec<Uuid> = exclude
+        .iter()
+        .copied()
+        .chain(cross.iter().map(|c| c.id))
+        .collect();
+    let (id, created) = create_entity(pool, kb_id, type_id, name, context, &weighed).await?;
+    if !created {
+        // 并行的另一份文档刚建好它：用它的，审核对也是它排的
+        return Ok(Resolution {
+            entity_id: id,
+            created: false,
+            reviews: Vec::new(),
+        });
+    }
     if !cross.is_empty() {
         // 跨类型同名并存：消歧后缀按名字分组（不分类型），需要刷新
         refresh_disambiguators(pool, kb_id, name).await?;
@@ -911,6 +951,13 @@ async fn resolve_type_drift(
     })
 }
 
+/// 新建一个实体。返回 `(id, 是否真的新建)`。
+///
+/// **同名同类的新建串行化。** 上面的查找不在事务里：两份文档并行抽取，同一个名字
+/// 各自查一遍都没有、各自建一个——实测「澜图数据」在同一秒里建了两个，之后每一次
+/// 提到它都撞上两个候选，再各建一个、各排一对审核，一篇语料跑完裂成四个。
+/// 这里按（库，名字）拿事务级咨询锁，锁里再查一次：别人刚建好的，就用它的。
+/// 不同类型的同名不在此列——那是消歧的事，不是竞态
 async fn create_entity(
     pool: &PgPool,
     kb_id: Uuid,
@@ -918,7 +965,37 @@ async fn create_entity(
     type_id: Option<Uuid>,
     name: &str,
     context: Option<&[f32]>,
-) -> AppResult<Uuid> {
+    // 调用方**刚刚掂量过、并且决定不并**的那些同名实体。
+    //
+    // 锁里那条回捞不加这个就分不清两件事：一件是「并行的另一份文档一毫秒前
+    // 建好了同名的它」——该用它的；另一件是「这个名字本来就有人，而调用方看过
+    // 之后决定另建一个」——这时回捞只会捞回它刚拒绝的那个候选，等于让一把锁
+    // 替人把 mention 归到其中一个身上。同名并列那条路上这正是 #270 禁的事：
+    // 分不开就别硬分，谁也不归，两个都送审。
+    weighed: &[Uuid],
+) -> AppResult<(Uuid, bool)> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))")
+        .bind(kb_id.to_string())
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+    let existing: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM entities
+         WHERE kb_id = $1 AND canonical_name = $2 AND type_id IS NOT DISTINCT FROM $3
+           AND merged_into IS NULL AND id <> ALL($4)
+         ORDER BY id LIMIT 1",
+    )
+    .bind(kb_id)
+    .bind(name)
+    .bind(type_id)
+    .bind(weighed)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some((id,)) = existing {
+        tx.commit().await?;
+        return Ok((id, false));
+    }
     let id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO entities (id, kb_id, type_id, canonical_name, profile_embedding, profile_n)
@@ -930,9 +1007,10 @@ async fn create_entity(
     .bind(name)
     .bind(context.map(|c| Vector::from(c.to_vec())))
     .bind(i32::from(context.is_some()))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
-    Ok(id)
+    tx.commit().await?;
+    Ok((id, true))
 }
 
 async fn touch_entity(pool: &PgPool, id: Uuid) -> AppResult<()> {
