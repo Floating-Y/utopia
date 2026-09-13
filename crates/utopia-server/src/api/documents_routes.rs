@@ -380,7 +380,8 @@ fn content_time(filename: &str, bytes: &[u8]) -> Option<chrono::DateTime<chrono:
     {
         return None;
     }
-    // ponytail: 只解码头部 4 KiB；更多格式需要时再在各自解析器中读取日期。
+    // 只解码头部 4 KiB：日期行只认开头。PDF、Word 这类格式要读日期时，在各自的解析器里
+    // 读它们自己的元数据，不在这里猜
     const HEADER_BYTES: usize = 4096;
     let text = utopia_ingest::decode_text(&bytes[..bytes.len().min(HEADER_BYTES)]);
     let header = if bytes.len() > HEADER_BYTES {
