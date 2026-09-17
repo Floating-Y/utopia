@@ -90,6 +90,7 @@ pub async fn align_types(state: &AppState, kb_id: Uuid) -> anyhow::Result<()> {
             .fetch_one(&mut *guard)
             .await?;
     if !locked {
+        // 正在跑的那份结束时会自己看一眼有没有新东西（见 align_types_locked 末尾）；这里不排
         tracing::info!(%kb_id, "类别词对齐已有一份在跑，这次跳过");
         return Ok(());
     }
@@ -108,6 +109,7 @@ async fn align_types_locked(
     client: &utopia_llm::LlmClient,
 ) -> anyhow::Result<()> {
     let pool = &state.pool;
+    let run_started = chrono::Utc::now();
     let classes = utopia_store::graph::entity_types(pool, kb_id).await?;
     let by_id: HashMap<Uuid, &EntityType> = classes.iter().map(|c| (c.id, c)).collect();
     let by_key: HashMap<&str, &EntityType> = classes.iter().map(|c| (c.key.as_str(), c)).collect();
@@ -129,6 +131,7 @@ async fn align_types_locked(
             Some(b) => b.decided_by != "person" && stale.contains(&s.kind_word),
         })
         .collect();
+    let attempted: HashSet<String> = todo.iter().map(|s| s.kind_word.clone()).collect();
     tracing::info!(%kb_id, kind_words = sigs.len(), to_decide = todo.len(), classes = classes.len(), "类别词对齐开始");
 
     // 没有类可绑：每个词都是「没有」，并提成建议；类出现后 `stale` 会把它们再交回来
@@ -157,6 +160,8 @@ async fn align_types_locked(
     }
 
     let (mut bound, mut none, mut undecided, mut skipped) = (0usize, 0usize, 0usize, 0usize);
+    // 调用或解析失败的批次：这轮跳过，结束时自己再排一次，不等下一篇文档来排
+    let mut failed = 0usize;
     for batch in todo.chunks(BATCH) {
         let cands = candidates_for(state, kb_id, batch, &classes).await?;
         // 两票：第二票把候选倒过来给，防止「选第一个」这种顺序偏好冒充一致
@@ -201,6 +206,7 @@ async fn align_types_locked(
                     Ok(r) => r,
                     Err(e) => {
                         tracing::warn!(%kb_id, error = %e, "类别词对齐调用失败，这一批留到下次");
+                        failed += 1;
                         continue;
                     }
                 };
@@ -208,6 +214,7 @@ async fn align_types_locked(
                 Ok(x) => x,
                 Err(e) => {
                     tracing::warn!(%kb_id, error = %e, "类别词对齐回复解析失败，这一批留到下次");
+                    failed += 1;
                     continue;
                 }
             };
@@ -299,9 +306,40 @@ async fn align_types_locked(
             }
         }
     }
-    tracing::info!(%kb_id, bound, none, undecided, skipped, "类别词对齐完成");
+    tracing::info!(%kb_id, bound, none, undecided, skipped, failed, "类别词对齐完成");
     if bound > 0 {
         state.emit_graph(kb_id);
     }
+    // 同短语对齐：失败过、来了没试过的新词、本轮判完的又过期了，就再排一次
+    let again = failed > 0 || {
+        let stale_now: HashSet<String> = type_bindings::stale(pool, kb_id)
+            .await?
+            .into_iter()
+            .collect();
+        type_bindings::signatures(pool, kb_id)
+            .await?
+            .iter()
+            .any(|s| !attempted.contains(&s.kind_word) && !existing.contains_key(&s.kind_word))
+            || type_bindings::bindings(pool, kb_id).await?.iter().any(|b| {
+                b.decided_by != "person"
+                    && b.decided_at >= run_started
+                    && stale_now.contains(&b.kind_word)
+            })
+    };
+    if again {
+        utopia_store::jobs::enqueue_unless_queued(
+            pool,
+            "align_types",
+            serde_json::json!({ "kb_id": kb_id }),
+        )
+        .await?;
+    }
+    // 两端的类定了，短语的签名才定：短语对齐排在它后面
+    utopia_store::jobs::enqueue_unless_queued(
+        pool,
+        "align_phrases",
+        serde_json::json!({ "kb_id": kb_id }),
+    )
+    .await?;
     Ok(())
 }

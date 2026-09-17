@@ -49,6 +49,31 @@ classes of context neighbours, interleaved and never scored together; a class in
 subtree applied on its own, a cross-axis class sent to a person, each pair acknowledged once) runs
 from the ontology page; extraction no longer enqueues it [0001, 0016, #736].
 
+**A relation phrase binds to a property per signature** [0044 cut 2, #751]. A signature is a
+phrase as the documents wrote it, the class of its subject and the class of its object, or "value"
+when the object is a figure, a title or a status; the classes come from the kind-word bindings, and
+a side whose kind word is bound to no class is its own signature. Each signature is decided once,
+after the kind words, by the same shape as [#741]: candidates are the properties whose declared
+domain and range admit the two ends in either direction (an undeclared end admits anything), the
+model sees the signature with three of its statements and their quotes, and two votes with the
+candidates in opposite orders must agree on the property and the direction (forward when the
+statement's subject is the property's subject, reverse when its object is) for the signature to
+bind. A signature the votes disagree on is `undecided` for the alignment queue of #725; one with no
+fitting property is `none`, its statements stay in the open graph and it counts toward the
+workbench's suggestions. Bindings live in `phrase_bindings` and go stale when the property they
+bound to changes or a property is added; a person's decision is never overwritten by the agent. On
+the 25-document batch with a hand-written ontology of 14 classes and 28 properties, and 60 of
+400 kind words bound, 423 signatures cover 861 statements: 36 bind (184 statements), 110 bind to
+nothing, 1 splits the votes and 276 have no admissible property because an end is unbound; a
+judge reading the chunk finds 95% of the resulting typed facts stated by the document, 4% worded
+wrongly and 1% not stated. Offering every property to an unbound end raised coverage to 85
+signatures and dropped the judge to 87%, and on the NVDA releases, where 15 of 230 kind words
+bind, to 59%: the generic "value" attribute swallowed every cash-flow row. Coverage therefore
+follows the kind-word bindings and the ontology's size, not the binder. What still goes wrong is
+a phrase that carries part of the value ("下降 1.4%" bound to a change property loses its sign)
+and a table section read as a change ("changes in operating assets › accounts payable"). Nothing is materialised yet: the typed rows with `from_statement_id` are
+the next slice.
+
 **Argument order is enforced, participation is guided.** A declared domain or range shapes
 candidates and never discards a fact; argument order is the key's encoding convention, so a fact
 whose subject violates the domain while the object fits is swapped by the signature and marked
@@ -102,10 +127,10 @@ the prompt, a description is read by people and by the aligner.
 
 ## Proposed and not built
 
-- **Alignment** (0044 cut 2): a table of signature (phrase, subject classes, object classes) to
-  property and direction with confidence and ontology version; implication rules proposed by the
-  aligner, approved on the workbench, executed by code with cached readings; typed rows carrying
-  `from_statement_id`; recomputation per changed signature. The prototype aligner reached 14.7% and
+- **Alignment** (0044 cut 2), the rest: typed rows carrying `from_statement_id`, materialised
+  from bound signatures and recomputed per changed signature; implication rules proposed by the
+  aligner, approved on the workbench, executed by code with cached readings (the sign of "下降
+  1.4%" is such a reading); a signature that tells a figure from words on the value side. The prototype aligner reached 14.7% and
   12.1% of gold recall in two runs against 15.5% for the withdrawn bound pass, so the bar for cut 2
   is parity over two clean runs [0044, #729].
 - **The workbench** (0044 cut 5): the ontology page fed by suggestions from the open graph (frequent
