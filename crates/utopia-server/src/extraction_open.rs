@@ -61,11 +61,18 @@ fn locate(hay: &str, needle: &str) -> Option<(i32, i32)> {
 /// 整块里搜得到不等于这句说了它。引文里有、但引文本身没在块里定位到的，起点退回整块里的第一处
 fn locate_time(chunk: &str, quote: Option<(&str, Option<(i32, i32)>)>, words: &str) -> Option<i32> {
     let (q, span) = quote?;
-    let (inner, _) = locate(q, words)?;
-    match span {
-        Some((start, _)) => Some(start + inner),
-        None => locate(chunk, words).map(|(s, _)| s),
+    if let Some((inner, _)) = locate(q, words) {
+        return match span {
+            Some((start, _)) => Some(start + inner),
+            None => locate(chunk, words).map(|(s, _)| s),
+        };
     }
+    // 表格的一行：期数写在表头行里，不在这一行里；这一块就是这张表（分块器让表头
+    // 跟着每一块走），所以在整块里找。判据是结构的：引文是一行 `|` 开头的表格行
+    if q.trim_start().starts_with('|') {
+        return locate(chunk, words).map(|(s, _)| s);
+    }
+    None
 }
 
 /// 名字的查找键：空白折叠、小写。陈述里写的名字和 `e` 里列的名字要一字不差，
@@ -368,6 +375,31 @@ pub(crate) async fn run_open(
                 },
                 None => None,
             };
+            // 短语就是值、短语就是主语：表格丢了列头（或没有说明句）时模型的两种写法
+            // （#743 的财报长文里各占一类）。陈述照落——值和主语都在，信息没丢——只记一笔
+            // 让它可量；只比字面，不认词
+            let same = |a: &str, b: &str| a.trim().eq_ignore_ascii_case(b.trim());
+            if value.is_some_and(|v| same(v, phrase)) {
+                drop_signal(
+                    state,
+                    kb_id,
+                    document_id,
+                    reason::PHRASE_IS_VALUE,
+                    "kept, but the phrase is the value itself",
+                    Some(phrase),
+                )
+                .await;
+            } else if same(&s.subject, phrase) {
+                drop_signal(
+                    state,
+                    kb_id,
+                    document_id,
+                    reason::PHRASE_IS_SUBJECT,
+                    "kept, but the phrase is the subject's own name",
+                    Some(phrase),
+                )
+                .await;
+            }
             let value_json;
             let fact_object = match (object, value) {
                 (Some(o), _) if o == subject => {
@@ -732,6 +764,19 @@ mod tests {
             None
         );
         assert_eq!(locate_time(text, None, "2019"), None);
+    }
+
+    #[test]
+    fn a_table_row_takes_its_period_from_the_header_in_the_same_chunk() {
+        let text = "|  | Q2 FY27 | Q1 FY27 |\n| --- | --- | --- |\n| Revenue | $96,221 | $81,615 |";
+        let row = ("| Revenue | $96,221 | $81,615 |", Some((46, 76)));
+        // 期数在表头行里，不在这一行里：表格行在整块里找
+        assert_eq!(locate_time(text, Some(row), "Q2 FY27"), Some(5));
+        // 不是表格行的引文还是只认自己那句
+        assert_eq!(
+            locate_time(text, Some(("Revenue was up.", None)), "Q2 FY27"),
+            None
+        );
     }
 
     #[test]
