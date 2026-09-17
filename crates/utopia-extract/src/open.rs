@@ -164,7 +164,11 @@ to Brightway Builders for $2 million\" gives city council —awarded→ paving c
 of Hillside School\" gives Jane Doe —is headmaster of→ Hillside School with {\"title\": \
 \"interim headmaster\"}. A statement with a value takes qualifiers the same way: \"the plant \
 cut water use by 12% compared to 2019\" gives the plant \"cut water use\" = \"12%\" with \
-{\"compared to\": \"2019\"}. qualifiers is null when there are none.\n\
+{\"compared to\": \"2019\"}. A statement the passage does not assert as holding but requires, \
+plans, expects, forecasts or makes conditional carries a qualifier keyed \"mood\" whose value \
+is the passage's own words for that (\"要\", \"should\", \"will\", \"is expected to\", \"if the \
+merger closes\"); the phrase stays as written. A verb that reports (announced, said, revealed) \
+is not a mood: what was announced is stated. qualifiers is null when there are none.\n\
 4. When a description has another thing folded into it, also write the statement that unfolds \
 it: \"hospitals accredited by the Joint Commission\" also gives Joint Commission —accredited→ \
 hospitals. Do not unfold a description that only names what it belongs to or is about: \"the \
