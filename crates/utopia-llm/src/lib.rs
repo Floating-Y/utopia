@@ -103,6 +103,62 @@ pub fn rate_limited(err: &anyhow::Error) -> Option<&RateLimited> {
     err.chain().find_map(|e| e.downcast_ref::<RateLimited>())
 }
 
+/// 值得再试一次的那几类失败，连它们各自的「等多久」。**判据是「它会自己好」**：
+/// 端点在限流、端点这会儿不可用（502/503/504）、请求根本没送到（连接被重置、响应中断）。
+///
+/// **读超时不在里面。** `READ_TIMEOUT` 是 300 秒没有第一个字节，重试五次就是 25 分钟；
+/// 一个总是超时的调用不会因为多等而变好，它要的是更小的分块或更快的端点。
+///
+/// 实测一篇 32 块的文档在一小时里两类都撞上：502 四次、连接没送到两次。
+pub fn transient(err: &anyhow::Error) -> Option<(&'static str, Option<Duration>)> {
+    if let Some(hit) = rate_limited(err) {
+        return Some(("端点限流", hit.retry_after));
+    }
+    if let Some(hit) = unavailable(err) {
+        return Some(("端点不可用", hit.retry_after));
+    }
+    if err.chain().any(|e| e.is::<Interrupted>()) {
+        return Some(("流断在半路", None));
+    }
+    let sending = err
+        .chain()
+        .find_map(|e| e.downcast_ref::<Unreachable>())
+        .filter(|u| !u.0.is_timeout());
+    sending.map(|_| ("请求没送到", None))
+}
+
+/// 端点开口了又半路没了：流断在一句话中间，既没有 `[DONE]` 也没有 `finish_reason`。
+///
+/// **做成类型是因为它长得像成功。** 拼到一半的回复是一段合法的字符串，调用方看不出
+/// 它本该更长；抽取会把它当成模型给的全部答案，少掉的那些陈述无声无息。
+#[derive(Debug, thiserror::Error)]
+#[error("LLM stream ended in the middle of the answer ({got} chars in)")]
+pub struct Interrupted {
+    /// 断掉时已经拼到多少字——报障时它说明「不是一开口就断」
+    pub got: usize,
+}
+
+/// 端点这会儿不可用：502 / 503 / 504，或者它自己说的 408。**跟 [`RateLimited`] 同一类，
+/// 理由也同一条：它会自己好。** 网关抽风、上游重启、排队超时都是几秒到几十秒的事，
+/// 而 400（提示词不合法）、401（密钥错）重试一万次还是错。
+///
+/// 混在 [`Rejected`] 里的代价实测过：本地代理对上游的一次 `fetch failed` 回 502，
+/// 32 块的一篇文档里随机几块就此报废，整篇抽取失败重来——一次调用 5% 的失败率，
+/// 一篇长文档第一遍几乎必失败（1 − 0.95³² ≈ 81%），而任务只重试三次。
+#[derive(Debug, thiserror::Error)]
+#[error("LLM endpoint is unavailable ({status}): {detail}")]
+pub struct Unavailable {
+    pub status: u16,
+    /// 端点给的 `Retry-After`（有则更准，多数不给）
+    pub retry_after: Option<Duration>,
+    pub detail: String,
+}
+
+/// anyhow 错误链里的 [`Unavailable`]，穿透 context 层。
+pub fn unavailable(err: &anyhow::Error) -> Option<&Unavailable> {
+    err.chain().find_map(|e| e.downcast_ref::<Unavailable>())
+}
+
 /// 账号付不起这次请求：欠费，或者套餐配额用尽。
 ///
 /// **跟 [`RateLimited`] 分开，因为它不会自己好。** 限流等一分钟就过去，
@@ -187,6 +243,21 @@ fn failure(
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return anyhow::Error::new(RateLimited {
+            status: status.as_u16(),
+            retry_after,
+            detail,
+        });
+    }
+    // 网关与排队的那几个：等一等再来。**500 不在里面**——它可以是端点自己的 bug，
+    // 重试只是把同一个崩溃再触发一遍
+    if matches!(
+        status,
+        reqwest::StatusCode::REQUEST_TIMEOUT
+            | reqwest::StatusCode::BAD_GATEWAY
+            | reqwest::StatusCode::SERVICE_UNAVAILABLE
+            | reqwest::StatusCode::GATEWAY_TIMEOUT
+    ) {
+        return anyhow::Error::new(Unavailable {
             status: status.as_u16(),
             retry_after,
             detail,
@@ -340,6 +411,107 @@ impl LlmClient {
             .as_str()
             .map(|s| strip_reasoning(s).to_string())
             .ok_or_else(|| anyhow::anyhow!("Unexpected LLM response shape: {body}"))
+    }
+
+    /// 一次问答，**走流式但整段返回**：调用方拿到的和 [`Self::chat_at`] 一样是一个
+    /// 字符串，区别只在字节怎么到。
+    ///
+    /// **为什么长提示词的那几条路要用它**：[`READ_TIMEOUT`] 量的是「多久没有新字节」，
+    /// 而非流式调用的第一个字节要等模型把整段生成完——于是模型思考的时间全部算作沉默。
+    /// 开着推理，一块密集的正文实测首字节 227 秒、偶尔越过 300 秒被判死；同一块流式下
+    /// 2.6 秒就有字节（思考过程在流），总时长一样是 230 秒左右。流式不会更快，它让
+    /// 「沉默」回到它本来的意思，超时于是只杀真正卡住的请求。
+    ///
+    /// 思考过程不进返回值：只收 `delta.content`，推理的增量（`reasoning` /
+    /// `reasoning_content`）读都不读；`<think>` 混在 content 里的那种照旧由
+    /// [`strip_reasoning`] 切掉。
+    pub async fn chat_at_streaming(
+        &self,
+        messages: &[ChatMessage],
+        temperature: Option<f32>,
+    ) -> anyhow::Result<String> {
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": true,
+            // 用量随最后一帧回来：比较两次运行的第一件事是看 completion token，
+            // 换成流式不能把这个数弄丢
+            "stream_options": { "include_usage": true },
+        });
+        if let Some(t) = temperature {
+            body["temperature"] = json!(t);
+        }
+        let resp = self
+            .request("/chat/completions")
+            .json(&body)
+            .send()
+            .await
+            .map_err(Unreachable)?;
+        let status = resp.status();
+        let retry_after = retry_after_of(resp.headers());
+        if !status.is_success() {
+            return Err(response_failure("LLM", status, retry_after, resp).await?);
+        }
+        let mut bytes = resp.bytes_stream();
+        let (mut buf, mut answer) = (String::new(), String::new());
+        let (mut saw_frame, mut ended) = (false, false);
+        while let Some(part) = bytes.next().await {
+            let part = part.map_err(Unreachable)?;
+            buf.push_str(&String::from_utf8_lossy(&part));
+            // SSE 帧以空行分隔；最后一个不完整的帧留在 buf 里等下一片
+            while let Some(pos) = buf.find(
+                "
+
+",
+            ) {
+                let frame = buf[..pos].to_string();
+                buf.drain(..pos + 2);
+                self.take_frame(&frame, &mut answer, &mut saw_frame, &mut ended);
+            }
+        }
+        // **收尾那一帧也算**：末尾不跟空行的实现有的是，丢掉它就是丢掉答案的尾巴
+        let rest = std::mem::take(&mut buf);
+        if !rest.trim().is_empty() {
+            self.take_frame(&rest, &mut answer, &mut saw_frame, &mut ended);
+        }
+        if !saw_frame {
+            anyhow::bail!("LLM stream carried no frames");
+        }
+        // 端点开口了又半路没了：拼到一半的回复长得像成功，不做成错误就会被当成
+        // 模型给的全部答案
+        if !ended {
+            return Err(anyhow::Error::new(Interrupted { got: answer.len() }));
+        }
+        Ok(strip_reasoning(&answer).to_string())
+    }
+
+    /// 一个 SSE 帧：取内容增量、认终止信号、顺手记用量。推理的增量读都不读。
+    fn take_frame(&self, frame: &str, answer: &mut String, saw_frame: &mut bool, ended: &mut bool) {
+        for line in frame.lines() {
+            let Some(data) = line.strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
+            if data == "[DONE]" {
+                *ended = true;
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue;
+            };
+            *saw_frame = true;
+            if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
+                answer.push_str(delta);
+            }
+            // 模型自己说完了：正常收尾（stop）或撞上它的输出上限（length），两种都是
+            // 端点把话说完了，与「流断在半路」不同
+            if v["choices"][0]["finish_reason"].is_string() {
+                *ended = true;
+            }
+            // 用量只在最后一帧（choices 为空）出现
+            if !v["usage"].is_null() {
+                log_usage(&self.model, &v);
+            }
+        }
     }
 
     /// 工具对话（非流式）：messages 为 OpenAI 协议原始 JSON
@@ -779,6 +951,161 @@ mod tests {
         };
         assert!(!is_unreachable(&error));
         assert!(error.to_string().contains(diagnosis), "{error:#}");
+    }
+
+    /// 流式的一次问答收成整段：只要 `delta.content`，推理的增量不进返回值，
+    /// 用量那一帧不当内容，没有一帧是错（端点开了流却什么都没发）
+    #[tokio::test]
+    async fn a_streamed_answer_arrives_whole_without_its_reasoning() {
+        let sse = [
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking hard\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"e\\\":[\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"]}\"}}]}",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":9000}}",
+            "data: [DONE]",
+            "",
+        ]
+        .join(
+            "
+
+",
+        );
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+        let answer = client_at(addr)
+            .chat_at_streaming(
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                Some(0.0),
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(answer, "{\"e\":[]}", "只收 content 的增量，拼成整段");
+
+        // 开了流却一帧都没发：那不是空答案，那是没答
+        // 末帧不跟空行：尾巴不能丢
+        let tail = "data: {\"choices\":[{\"delta\":{\"content\":\"head\"}}]}
+
+data: {\"choices\":[{\"delta\":{\"content\":\"tail\"},\"finish_reason\":\"stop\"}]}";
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", tail).await;
+        let answer = client_at(addr)
+            .chat_at_streaming(
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                None,
+            )
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(answer, "headtail", "最后一帧没有空行收尾，也要算进去");
+
+        // 开口了又半路没了：那不是一个短答案，那是没答完，值得再试一次
+        let cut = "data: {\"choices\":[{\"delta\":{\"content\":\"half an ans\"}}]}
+
+";
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", cut).await;
+        let err = client_at(addr)
+            .chat_at_streaming(
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                None,
+            )
+            .await
+            .expect_err("断在半路该是错误");
+        server.await.unwrap();
+        assert_eq!(
+            crate::transient(&err).map(|(w, _)| w),
+            Some("流断在半路"),
+            "{err:#}"
+        );
+
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", "").await;
+        let err = client_at(addr)
+            .chat_at_streaming(
+                &[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }],
+                None,
+            )
+            .await
+            .expect_err("没有帧该是错误");
+        server.await.unwrap();
+        assert!(format!("{err:#}").contains("no frames"), "{err:#}");
+    }
+
+    /// 会自己好的与不会自己好的分开：网关那几个是 [`Unavailable`]，密钥错那类照旧
+    /// 是 [`Rejected`]，欠费与限流各归各位。调用方据此决定「等一会儿再来」还是「这块废了」
+    #[tokio::test]
+    async fn a_gateway_failure_is_transient_and_a_bad_key_is_not() {
+        for status in [
+            "502 Bad Gateway",
+            "503 Service Unavailable",
+            "504 Gateway Timeout",
+            "408 Request Timeout",
+        ] {
+            let (addr, server) = an_http_response(status, "text/plain", "upstream hiccup").await;
+            let err = client_at(addr)
+                .chat(&[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }])
+                .await
+                .expect_err("非成功状态该是错误");
+            server.await.unwrap();
+            let hit = crate::unavailable(&err)
+                .unwrap_or_else(|| panic!("{status} 该是会自己好的那一类：{err:#}"));
+            assert_eq!(hit.status, status[..3].parse::<u16>().unwrap());
+            assert!(
+                format!("{err:#}").contains("upstream hiccup"),
+                "原话要带出来：{err:#}"
+            );
+        }
+
+        // 请求根本没送到（连不上）：也是会自己好的一类
+        let nowhere = ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        };
+        let dead = LlmClient::new("http://127.0.0.1:1", None, "m");
+        let err = dead.chat(&[nowhere]).await.expect_err("连不上该是错误");
+        assert!(crate::is_unreachable(&err), "{err:#}");
+        assert_eq!(
+            crate::transient(&err).map(|(w, _)| w),
+            Some("请求没送到"),
+            "{err:#}"
+        );
+
+        // 密钥错、请求不合法：重试一万次还是错，不能混进去
+        for status in [
+            "401 Unauthorized",
+            "400 Bad Request",
+            "500 Internal Server Error",
+        ] {
+            let (addr, server) = an_http_response(status, "text/plain", "no").await;
+            let err = client_at(addr)
+                .chat(&[ChatMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                }])
+                .await
+                .expect_err("非成功状态该是错误");
+            server.await.unwrap();
+            assert!(
+                crate::unavailable(&err).is_none(),
+                "{status} 不该被当成会自己好的：{err:#}"
+            );
+            assert!(
+                crate::rate_limited(&err).is_none(),
+                "{status} 不是限流：{err:#}"
+            );
+        }
     }
 
     /// #527 的正题：一个回纯文本的 502，五条请求路径（对话、工具对话、两种流式、嵌入）

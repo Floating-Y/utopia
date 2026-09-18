@@ -509,6 +509,7 @@ export const en = {
       quote_not_in_chunk: "Kept, but the quoted sentence is not in the text verbatim",
       time_not_in_quote: "A time mention's words are not in the text",
       unknown_ref: "The item points at nothing in the reply",
+      chunk_unextracted: "A passage the endpoint could not answer for",
       phrase_is_value: "Kept, but the phrase is the value itself",
       phrase_is_subject: "Kept, but the phrase is the subject's own name",
     } as Record<string, string>,
@@ -925,6 +926,10 @@ export const en = {
     shownName: "shown name",
     nameUntil: (d: string) => `until ${d}`,
     removeName: "Remove",
+    // 问一句再移除：名字是事实，界面上没有再加回来的地方
+    removeNameAsk: "Remove this name?",
+    removeNameCancel: "Keep",
+    removeNameGo: "Remove",
     nameRemoved: "Name removed",
     timelineEmpty: "No dated facts yet.",
     lastConfirmed: (d: string) => `confirmed ${d}`,
