@@ -3,7 +3,8 @@
 use anyhow::Context;
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
+use std::process::Command;
 
 /// 文本解码：chardetng 探测编码（覆盖 GBK/GB18030/BIG5 等中文常见编码）。
 pub fn plain_text(bytes: &[u8]) -> String {
@@ -16,7 +17,56 @@ pub fn plain_text(bytes: &[u8]) -> String {
 }
 
 pub fn pdf(bytes: &[u8]) -> anyhow::Result<String> {
-    pdf_extract::extract_text_from_mem(bytes).context("PDF text-layer extraction failed")
+    let extracted = std::panic::catch_unwind(|| pdf_extract::extract_text_from_mem(bytes));
+    let original_error = match extracted {
+        Ok(Ok(text)) if !text.trim().is_empty() => return Ok(text),
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(panic) => Some(
+            panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| {
+                    panic
+                        .downcast_ref::<&str>()
+                        .map(|message| (*message).to_owned())
+                })
+                .unwrap_or_else(|| "PDF parser panicked".to_owned()),
+        ),
+    };
+
+    match pdf_with_poppler(bytes) {
+        Ok(text) => Ok(text),
+        // An empty text layer still needs the existing OCR path when Poppler is unavailable.
+        Err(_) if original_error.is_none() => Ok(String::new()),
+        Err(error) => anyhow::bail!(
+            "PDF text-layer extraction failed: {}; Poppler fallback failed: {error:#}",
+            original_error.unwrap_or_default()
+        ),
+    }
+}
+
+fn pdf_with_poppler(bytes: &[u8]) -> anyhow::Result<String> {
+    let mut input = tempfile::NamedTempFile::new().context("Could not create a temporary PDF")?;
+    input
+        .write_all(bytes)
+        .context("Could not write the temporary PDF")?;
+    input.flush().context("Could not flush the temporary PDF")?;
+
+    let output = Command::new("pdftotext")
+        .args(["-enc", "UTF-8", "-nopgbrk"])
+        .arg(input.path())
+        .arg("-")
+        .output()
+        .context("Could not run pdftotext")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "pdftotext exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    String::from_utf8(output.stdout).context("pdftotext returned invalid UTF-8")
 }
 
 /// docx：解压 word/document.xml。正文 w:t 取字、w:p 分段；表格（w:tbl）收成网格交给

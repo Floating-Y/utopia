@@ -43,6 +43,8 @@ git push -u origin fix/some-thing
 
 依赖：Docker、Rust 1.85+、Node 20+、pnpm。
 
+Rust 解析器读不了的 PDF 会交给 `pdftotext`。源码部署还需要安装 Poppler 及中文 CMap 数据（Debian：`poppler-utils poppler-data`）；Docker 镜像已包含两者。
+
 ```bash
 docker compose up -d db                 # pgvector 版 Postgres
 cargo run -p utopia-server              # 自动跑迁移，:1516
