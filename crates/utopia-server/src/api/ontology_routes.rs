@@ -138,6 +138,15 @@ pub async fn create_entity_type(
         json!({ "key": key, "label": req.label.trim() }),
     )
     .await;
+    // 本体多了一个类：类别词的绑定里那些「没有」和「没定」的要重判（0044 对齐第一片）
+    let _ = utopia_store::jobs::enqueue_unless_pending(
+        &state.pool,
+        "align_types",
+        json!({ "kb_id": kb_id }),
+        // 去抖：一批编辑（导一个包、建一串属性）只排一次
+        std::time::Duration::from_secs(5),
+    )
+    .await;
     Ok(Json(json!({ "id": id })))
 }
 
@@ -174,6 +183,15 @@ pub async fn update_entity_type(
         Some(id),
         json!({ "label": req.label.trim(), "color": req.color, "shape": req.shape,
                 "description": req.description }),
+    )
+    .await;
+    // 类的定义改了：绑到它的类别词过期，重判
+    let _ = utopia_store::jobs::enqueue_unless_pending(
+        &state.pool,
+        "align_types",
+        json!({ "kb_id": kb_id }),
+        // 去抖：一批编辑（导一个包、建一串属性）只排一次
+        std::time::Duration::from_secs(5),
     )
     .await;
     Ok(Json(json!({ "ok": true })))
@@ -309,6 +327,15 @@ pub async fn create_relation_type(
     if let Some(q) = req.qualifiers.as_deref() {
         utopia_store::ontology::set_relation_qualifiers(&state.pool, kb_id, id, q).await?;
     }
+    // 多了一个属性：判成 none / undecided 的签名也许对得上了（0044 对齐第二片）
+    utopia_store::jobs::enqueue_unless_pending(
+        &state.pool,
+        "align_phrases",
+        serde_json::json!({ "kb_id": kb_id }),
+        // 去抖：一批编辑（导一个包、建一串属性）只排一次
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
     let _ = utopia_store::audit::record(
         &state.pool,
         Some(kb_id),
@@ -347,6 +374,15 @@ pub async fn update_relation_type(
     if let Some(q) = req.qualifiers.as_deref() {
         utopia_store::ontology::set_relation_qualifiers(&state.pool, kb_id, id, q).await?;
     }
+    // 属性改了定义或域/值域：绑到它的签名过期，判成 none 的也许对得上了
+    utopia_store::jobs::enqueue_unless_pending(
+        &state.pool,
+        "align_phrases",
+        serde_json::json!({ "kb_id": kb_id }),
+        // 去抖：一批编辑（导一个包、建一串属性）只排一次
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
     let _ = utopia_store::audit::record(
         &state.pool,
         Some(kb_id),

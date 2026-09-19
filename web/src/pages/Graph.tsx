@@ -95,6 +95,7 @@ import {
   type BlockedDerivation,
   type ProofStep,
 } from "../api";
+import { originHint, originLabel } from "../origin";
 import { S } from "../i18n";
 import { predicateSentence } from "../predicateText";
 import {
@@ -2893,13 +2894,14 @@ function EntityPanel({
 
 
       {/* 视图切换：Relations（一张表，过去的折在组尾）| History（记录轴）| Derived */}
-      {/* **左边比头部多一档**（24 而不是 16）。两个盒子本来都从 px-4 起，可
-          分段控件自己还有一圈内距（p-1 加按钮的 px-2），于是「Relations」四个字
-          落在 29，而标题「OpenAI」落在 35——标题前面是色点加 gap，正好差 6px，
-          看着就是这一排比标题往左漏出去一截。加一档之后字落在 37，压回标题上。
-          这一条只给这里：本体页那条是 `fill` 的整条，与下面正文同宽，
-          它的左缘该跟正文对齐，不跟标题对齐 */}
-      <div className="pl-6 pr-4 pt-3">
+      {/* **左缘与下面那一列折叠箭头同起**（16）。它们上下紧挨着，中间没有别的东西，
+          于是这一段读起来是一条竖线；从前对的是标题里的字（pl-6，让「Relations」
+          四个字落在 37、压住标题），可标题在另一个盒子里、还隔着一条分隔线，那条
+          对齐看不见，看得见的是它比下面整整齐齐的一列往右缩了一档。
+          16 = 滚动区的 px-2 加行自己的 px-2，也就是每一行底色开始的地方；
+          12 的箭头在 16 的图标格里居中，所以字形还在里面 2px——那 2px 是这个
+          产品里每一个图标都有的，不是这一处没对齐 */}
+      <div className="pl-4 pr-4 pt-3">
         <Segmented
           size="sm"
           value={view}
@@ -3121,6 +3123,11 @@ function NameSection({
   names: NameView[];
 }) {
   const [open, setOpen] = useState(true);
+  /* 移除一个名字要问一句，**第二下落在另一个按钮上**——同图谱页重推推理那一处的
+     手势（同一个控件连点两下在这产品里一直是「收回去」）。够不上 DangerConfirm 那一
+     档（红标题、逐字输入，留给删库），但也不能一点就走：名字是事实（0041），移除是
+     把那条 `known_as` 作废，**而界面上没有再加回名字的地方**——点错了只能重抽文档 */
+  const [armed, setArmed] = useState<string | null>(null);
   const qc = useQueryClient();
   const remove = useMutation({
     mutationFn: (factId: string) => api.rejectFact(kbId, factId),
@@ -3164,15 +3171,35 @@ function NameSection({
                     {n.canonical && <span>{S.graph.shownName}</span>}
                     {until && <span className="u-num">{S.graph.nameUntil(until)}</span>}
                     {n.evidence_count > 0 && <span>{S.graph.sources(n.evidence_count)}</span>}
-                    {!n.canonical && (
-                      <LinkButton
-                        className={cn(REVEAL, "ml-auto text-fine")}
-                        disabled={remove.isPending}
-                        onClick={() => remove.mutate(n.fact_id)}
-                      >
-                        {S.graph.removeName}
-                      </LinkButton>
-                    )}
+                    {!n.canonical &&
+                      (armed === n.fact_id ? (
+                        /* 问句与两个目标就地展开：一行之内换不了别的排布，而问句
+                           必须和它问的那个名字在同一行，否则「移除哪一个」得靠记 */
+                        <span className="ml-auto flex items-center gap-2 text-fine">
+                          <span className="text-ink-2">{S.graph.removeNameAsk}</span>
+                          <LinkButton onClick={() => setArmed(null)}>
+                            {S.graph.removeNameCancel}
+                          </LinkButton>
+                          <LinkButton
+                            className="text-danger"
+                            disabled={remove.isPending}
+                            onClick={() => {
+                              setArmed(null);
+                              remove.mutate(n.fact_id);
+                            }}
+                          >
+                            {S.graph.removeNameGo}
+                          </LinkButton>
+                        </span>
+                      ) : (
+                        <LinkButton
+                          className={cn(REVEAL, "ml-auto text-fine")}
+                          disabled={remove.isPending}
+                          onClick={() => setArmed(n.fact_id)}
+                        >
+                          {S.graph.removeName}
+                        </LinkButton>
+                      ))}
                   </span>
                 </span>
               </div>
@@ -3300,7 +3327,14 @@ function FactRow({
                 fact.predicate_label
                   ? fact.inferred
                     ? `${predicateSentence(fact.predicate_label)} · ${S.graph.inferredPredicate}`
-                    : predicateSentence(fact.predicate_label)
+                    : // 本体认下的关系是从原文的说法算出来的（0044 决定 1）：
+                      // 悬停说出那句原话，画布上少画的那条边不等于把它藏了
+                      [
+                        predicateSentence(fact.predicate_label),
+                        fact.said_as ? S.graph.saidAs(fact.said_as) : null,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")
                   : undefined
               }
             >
@@ -3473,6 +3507,15 @@ function EvidenceList({ kbId, fact }: { kbId: string; fact: EntityFact }) {
               </span>
               <ExternalLink size={11} className="shrink-0" />
             </Link>
+            {/* 出处不是原文时写一句（0040）：OCR 第几页、录音哪一段谁说的、模型描述 */}
+            {originLabel(ev.origin, ev.anchor) && (
+              <span
+                className="shrink-0 text-fine text-ink-2"
+                title={originHint(ev.origin, ev.origin_model)}
+              >
+                {originLabel(ev.origin, ev.anchor)}
+              </span>
+            )}
             {ev.stale && (
               <span
                 className="u-num shrink-0 text-fine text-ink-2"

@@ -30,7 +30,7 @@ mod workspaces;
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::{header, HeaderValue, Method};
-use axum::routing::{any, get, patch, post};
+use axum::routing::{any, get, patch, post, put};
 use axum::{Json, Router};
 use serde_json::json;
 use tower_http::cors::CorsLayer;
@@ -138,6 +138,14 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
         .route(
             "/workspaces/{id}/settings",
             get(settings_routes::get).put(settings_routes::put),
+        )
+        .route(
+            "/workspaces/{id}/settings/ocr",
+            put(settings_routes::put_ocr),
+        )
+        .route(
+            "/workspaces/{id}/settings/transcribe",
+            put(settings_routes::put_transcribe),
         )
         .route(
             "/workspaces/{id}/settings/test",
@@ -489,6 +497,15 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             post(review_routes::decide_pending),
         )
         .route("/kbs/{id}/review/{review_id}", post(review_routes::decide))
+        // 对齐队列（#725）：人定签名的属性与方向、类别词的类
+        .route(
+            "/kbs/{id}/review/alignment/phrases/{binding_id}",
+            post(review_routes::decide_alignment_phrase),
+        )
+        .route(
+            "/kbs/{id}/review/alignment/kind-words/{kind_word}",
+            post(review_routes::decide_alignment_kind_word),
+        )
         // 语义层映射的表态（0011）。跟消解审核并排——都是「引擎提议、人裁决」
         .route(
             "/kbs/{id}/review/mappings/{mapping_id}",

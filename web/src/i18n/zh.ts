@@ -209,6 +209,10 @@ export const zh: Strings = {
         title: "映射探索没有提出任何口径",
         hint: "模型读了挂载的库表结构，但没找到可提的指标或维度。到「数据映射 > 数据源」刷新结构、给列加注释，再探索一次。",
       },
+      "document.needs_reader": {
+        title: "有文件要靠模型才读得出来",
+        hint: "扫描件和图片要配文档识别服务，录音要配能分出说话人的转写模型；每一行写着缺的是什么。文件已经留着，还没读出任何内容；到「管理 > 模型」存好读取模型，就会自动读。",
+      },
       "governance.tripped": {
         title: "agent 停止自动裁决了",
         hint: "七天内它的合并被撤回了两次，开关已自动关掉。到「审核 > Agent」看看它做了什么，想让它接着跑就在库设置里再打开。",
@@ -450,18 +454,15 @@ export const zh: Strings = {
       "这些是从文档里抽出来的，但在写入途中被挡下了。每行说明原因与条数。",
     dropsExample: "例如",
     dropReason: {
-      attr_domain_mismatch: "属性挂在了错误的类上",
-      subject_not_declared: "主语类型未知",
-      attr_no_value: "属性没有取值",
-      attr_datatype: "取值与数据类型不符",
-      low_confidence: "低于置信度阈值",
       object_missing: "关系缺少宾语",
       malformed_item: "模型给的这一条结构不合",
       truncated_reply: "模型的输出被截断",
-      domain_mismatch: "主语对不上这个关系，对调也不行",
-      not_an_entity_name: "那个名字是一句话，不是一个东西",
-      clause_suspect: "已保留，但这个名字像从句：给守卫攒的样本",
-      direction_corrected: "已按签名把主宾掰正",
+      quote_not_in_chunk: "已保留，但引文不是原文原样",
+      time_not_in_quote: "时间词不在原文里",
+      unknown_ref: "这一条指向的东西不在回复里",
+      chunk_unextracted: "这一段端点没能答上，没有进图",
+      phrase_is_value: "已保留，但短语就是那个值",
+      phrase_is_subject: "已保留，但短语就是主语的名字",
     },
     reExtractSource: "重新抽取",
     reExtractTitle: "重新抽取这个来源？",
@@ -731,6 +732,7 @@ export const zh: Strings = {
     openInDoc: "在文档里看这一段",
     proposedPredicate: (p: string) => `从原文读作「${p}」`,
     /* 本体没认下这条关系：显示的词来自原文，不是词表里的关系 */
+    saidAs: (words: string) => `原文的说法：“${words}”`,
     inferredPredicate: "本体里没有这个关系，这是原文的说法",
     /* 连原文说法都没留下的老数据（0052 之前）。不编一个「有关联」出来 */
     unknownPredicate: "说不出是什么关系",
@@ -832,6 +834,9 @@ export const zh: Strings = {
     shownName: "显示名",
     nameUntil: (d) => `至 ${d}`,
     removeName: "移除",
+    removeNameAsk: "移除这个名字？",
+    removeNameCancel: "留着",
+    removeNameGo: "移除",
     nameRemoved: "已移除这个名字",
     timelineEmpty: "还没有带日期的事实。",
     lastConfirmed: (d: string) => `${d} 确认`,
@@ -880,6 +885,18 @@ export const zh: Strings = {
     nowBtn: "现在",
     play: "播放时间线",
     pause: "暂停",
+  },
+  origin: {
+    ocr: (page: number | null) => (page === null ? "OCR 识别" : `OCR 识别 · 第 ${page} 页`),
+    transcribed: (span: string | null, speakers: string[]) =>
+      ["转写", span, speakers.length > 0 ? speakers.join("、") : null]
+        .filter(Boolean)
+        .join(" · "),
+    described: "模型描述",
+    ocrHint: "从扫描件或图片上识别出来的文字，个别字或数字可能认错。",
+    transcribedHint: "从录音转写出来的文字，人名可能听错。",
+    describedHint: "模型对一张图的描述，没有人这样写过或说过。",
+    readBy: (model: string) => `读取模型：${model}。`,
   },
   doc: {
     backToLibrary: "← 返回文库",
@@ -1034,6 +1051,19 @@ export const zh: Strings = {
     ok: (reply: string) => `已连通，认证通过（${reply}）`,
     okDim: (dim: number) => `已连通，认证通过（维度 ${dim}）`,
     unsaved: "有未保存的修改。先保存这张卡，再测试。",
+    readersTitle: "读扫描件与录音",
+    readersIntro:
+      "扫描件、图片和录音没有可以直接解析的文字，各要一个读取模型。它们和对话模型分开配置，敏感文件可以留在自己的服务器上。读取模型配好之前传上来的文件会先等着，消息中心会提示；存好之后自动读。",
+    ocrService: "文档识别（OCR）",
+    ocrHint: "MinerU 服务（mineru-api）。先识别每页版面再认字，每段文字都记着所在的页和位置。",
+    serviceUrl: "服务地址",
+    backend: "后端（可选）",
+    transcribeModel: "录音转写",
+    transcribeHint:
+      "会标注说话人的 OpenAI 兼容转写接口（diarized_json），例如 gpt-4o-transcribe-diarize。分不出谁说的转写不会采用。",
+    okVersion: (version: string) => `已连通（MinerU ${version}）`,
+    okReachable: "已连通，认证通过",
+    savedRequeued: (n: number) => `已保存。${n} 个等待中的文件开始读取。`,
   },
   ontology: {
     title: "本体",
@@ -1504,6 +1534,7 @@ export const zh: Strings = {
     railMappings: "数据映射",
     railViolations: "公理",
     railDefects: "本体",
+    railAlignment: "对齐",
     railDecisions: "决定",
     railMerges: "合并",
     railAgent: "Agent",
@@ -1628,6 +1659,20 @@ export const zh: Strings = {
     batchDone: (ok, failed) =>
       failed === 0 ? `已裁 ${ok} 对` : `已裁 ${ok} 对，${failed} 对没成，留在队列里`,
     lowConfidence: "低置信度事实",
+    // 对齐队列（#725）
+    alignment: "对齐器拿不定的",
+    alignmentHint:
+      "两类东西之间的一个说法，或一个类别词，对齐器的两票不一致。选出文档这个说法对应本体的哪个属性或类，或者说没有对得上的：那些陈述就留在开放图谱里。你定了就算数，对齐器不会改人的判定。",
+    alignmentValue: "一个值",
+    alignmentNone: "没有对得上的",
+    alignmentForward: "照原文方向",
+    alignmentReverse: "反过来",
+    alignmentBind: "绑定",
+    alignmentLeaveOpen: "留在开放图谱",
+    alignmentStatements: (n: number) => `${n} 条陈述`,
+    alignmentEntities: (n: number) => `${n} 样东西`,
+    alignmentVotes: (first: string, second: string) => `两票：${first} · ${second}`,
+    alignmentTyped: (kept: number, retired: number) => `类型化图谱已重算：${kept} 条成了类型化事实，${retired} 行作废`,
     defects: "本体自相矛盾",
     defectsHint:
       "定义本身的问题，没有牵涉任何事实。这一档排在前面：定义站不住的时候，据它报出来的每一条事实级结论都可疑。",
@@ -1708,6 +1753,7 @@ export const zh: Strings = {
       "从你让助手记住的话里抽出的事实。这里的东西都还没进图：那句话已经存下，事实等你点头。" +
       "确认后以那句话为证据进账本；驳回后不会再被提议。",
     pendingNoPredicate: "本体里没有这个关系，这个词是模型自己的说法。",
+    pendingOwnWords: "文档自己的话；对到本体上是对齐那一步的事。",
     pendingNoPredicateChip: "本体里没有这个关系",
     pendingSaidBy: (name: string) => `${name} 说的`,
     pendingSaidVia: (name: string, agent: string) => `${name} 说的 · 经 ${agent}`,
@@ -1731,7 +1777,8 @@ export const zh: Strings = {
     conflictReason: {
       no_time: "新事实没有日期",
       simultaneous: "起始日期相同",
-      low_confidence: "置信度低",
+      described_evidence: "新的那条是看图读出来的",
+      low_confidence: "新的那条不够确信",
     },
     conflictVs: "对",
     conflictSince: (d: string) => `自 ${d} 起`,

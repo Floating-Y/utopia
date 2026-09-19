@@ -93,7 +93,15 @@ pub struct Document {
     pub status: String,
     pub error: Option<String>,
     pub doc_time: Option<DateTime<Utc>>,
+    /// `doc_time` 从哪来：`content`（正文里读出）/ `source`（来源系统给的：发布时间、
+    /// 归档日期）/ `none`（没有日期）。上传时刻与文件修改时刻都不是文档的日期
+    /// （0045 决定 3，#714）：老值 `upload_time` / `file_mtime` 读作没有日期，见
+    /// [`Document::dated_at`]
     pub doc_time_source: String,
+    /// 文档的时间语境（0045 决定 3）：它自己的日期、它定义的期间与历法、叙述设下的锚点。
+    /// 服务端边抽取边填；`time_context_at` 是最近一次写下它的时刻
+    pub time_context: Option<serde_json::Value>,
+    pub time_context_at: Option<DateTime<Utc>>,
     /// 图谱抽取状态：none → queued → extracting → done | failed
     pub graph_status: String,
     /// 抽取失败原因（失败时才有）。与 error 分列——那列归解析管道，
@@ -111,8 +119,22 @@ pub struct Document {
     pub deleted_at: Option<DateTime<Utc>>,
     /// 真删（#268 下半）：内容已抹掉，回不来。行留作墓碑
     pub purged_at: Option<DateTime<Utc>>,
+    /// 这份文件的字要靠哪一种模型读，而那种模型还没配：`ocr` / `transcribe`（0040）。
+    /// 文档此时是 failed；配上之后按它重新排进处理队列
+    pub reader_needed: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl Document {
+    /// 文档自己的日期：只认正文或来源系统给的（`content` / `source`）。上传、同步、
+    /// 抽取的时刻是记录时间，不是文档的日期（0045 决定 3，#714）——别的来源一律 `None`
+    pub fn dated_at(&self) -> Option<DateTime<Utc>> {
+        match self.doc_time_source.as_str() {
+            "content" | "source" => self.doc_time,
+            _ => None,
+        }
+    }
 }
 
 /// 摄入来源（"来源即文件夹"：容器 + 定时同步）。
@@ -432,6 +454,16 @@ pub struct LlmSettings {
     pub embed_model: Option<String>,
     pub embed_dim: Option<i32>,
     pub updated_at: DateTime<Utc>,
+    /// 读扫描件、图片的版面识别服务（MinerU，0040）；空 = 没配，那类文件降级
+    pub ocr_base_url: Option<String>,
+    #[serde(skip_serializing)]
+    pub ocr_api_key: Option<String>,
+    pub ocr_backend: Option<String>,
+    /// 会标说话人的转写模型（OpenAI `/audio/transcriptions` + `diarized_json`，0040）
+    pub transcribe_base_url: Option<String>,
+    #[serde(skip_serializing)]
+    pub transcribe_api_key: Option<String>,
+    pub transcribe_model: Option<String>,
 }
 
 impl LlmSettings {
@@ -440,6 +472,12 @@ impl LlmSettings {
     }
     pub fn embed_ready(&self) -> bool {
         self.embed_base_url.is_some() && self.embed_model.is_some()
+    }
+    pub fn ocr_ready(&self) -> bool {
+        self.ocr_base_url.is_some()
+    }
+    pub fn transcribe_ready(&self) -> bool {
+        self.transcribe_base_url.is_some() && self.transcribe_model.is_some()
     }
 }
 
@@ -687,6 +725,10 @@ pub struct GraphEdge {
     /// 两个来源都拿不出时为 None——那是 add_evidence 记录原文说法之前的老数据
     pub predicate: Option<String>,
     pub label: Option<String>,
+    /// 这条类型化边是从哪条开放陈述算出来的，那条陈述的原话（0044 决定 1，#755）。
+    /// 画布把一条陈述只画一条边：有类型化行就画它，标签是属性的名字——原话不能因此
+    /// 从画面上消失，它跟在这一格里。几条陈述算出同一行时是它们的原话，去重后拼起来
+    pub said_as: Option<String>,
     /// true = 这条边的名字来自原文，不是本体认下的关系。界面要显示得看得出区别
     pub inferred: bool,
     /// true = 这条边是**推出来的**，不是任何人断言的（R1，住在 `derived_facts`）。
@@ -748,6 +790,8 @@ pub struct NameView {
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct EntityFact {
     pub id: Uuid,
+    /// 这条类型化事实是从哪条开放陈述算出来的，那条陈述的原话（#755）
+    pub said_as: Option<String>,
     pub recorded_at: DateTime<Utc>,
     pub invalidated_at: Option<DateTime<Utc>>,
     pub supersedes: Option<Uuid>,
@@ -875,6 +919,8 @@ pub struct GraphChange {
     pub document_id: Option<Uuid>,
     pub filename: Option<String>,
     pub quote: Option<String>,
+    /// 这条引文从哪来（0040）：stated / ocr / transcribed / described；没有证据为空
+    pub quote_origin: Option<String>,
 }
 
 /// 消解审核项的一侧实体摘要。
@@ -960,6 +1006,13 @@ pub struct EvidenceView {
     pub stale: bool,
     /// 这条证据所在的文档已被删除（#268）。事实若还活着，是因为它另有出处
     pub document_deleted: bool,
+    /// 引文从哪来（0040）：`stated` 文件里写的、`ocr` 扫描页上认出来的、`transcribed`
+    /// 录音转写、`described` 模型对一张图的描述——最后一种没有原话可对
+    pub origin: String,
+    /// 读出这段文字的引擎或模型；原文为空
+    pub origin_model: Option<String>,
+    /// 指回原文件的位置：页码（和框）、录音起止毫秒与说话人、图在哪一页
+    pub anchor: Option<serde_json::Value>,
 }
 
 /// 这个库走到哪一步了（#313）：四个页面的空状态共用同一个判断。
@@ -989,7 +1042,8 @@ pub struct Readiness {
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ConflictView {
     pub id: Uuid,
-    /// no_time | simultaneous | low_confidence
+    /// no_time | simultaneous | described_evidence（`low_confidence` 是 0045 第 3 刀
+    /// 之前记下的，历史行还带着它）
     pub reason: String,
     pub created_at: DateTime<Utc>,
     pub predicate_label: String,
@@ -1011,6 +1065,10 @@ pub struct ChunkFull {
     pub id: Uuid,
     pub seq: i32,
     pub text: String,
+    /// 这块文字从哪来（0040）：查看器按它标出认出来的字，按锚点翻到那一页
+    pub origin: String,
+    pub origin_model: Option<String>,
+    pub anchor: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -1381,6 +1439,18 @@ pub struct PendingFactView {
     /// 网页端对话记的记忆这一位是空的——那时「谁说的」就是那个人本人
     pub proposed_token_name: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// 文档自己的关系短语（0044）。Some = 这是一条开放陈述：点头后按 `layer = 'open'`
+    /// 落进 `facts`，短语照写、没有谓词、不写 `valid_*`；None = 老的带本体形状
+    pub phrase: Option<String>,
+    /// 开放陈述按文档角色词记的属性：`[{"role": "amount", "value": "$2 million"} |
+    /// {"role": "to", "entity_id": "<uuid>"}]`。只在 `phrase` 非空时有意义
+    pub qualifiers: Option<serde_json::Value>,
+    /// 陈述提到的时间词，**照抄，永远不是日期**（0045）：
+    /// `[{"text": "March 4, 2011", "char_start": 143}]`，偏移是 `chunks.text` 里的字符偏移
+    pub time_words: Option<serde_json::Value>,
+    /// 引文在 `chunks.text` 里的字符偏移（不是字节），服务端搜文本算出；NULL = 没定位到
+    pub quote_start: Option<i32>,
+    pub quote_end: Option<i32>,
 }
 
 /// 一句记忆是谁提的。
@@ -1409,6 +1479,8 @@ pub struct ReviewCounts {
     pub lowconf: i64,
     pub mappings: i64,
     pub violations: i64,
+    /// 对齐器两票不一致的签名与类别词（#725 对齐队列）
+    pub alignment: i64,
     pub defects: i64,
     pub merges: i64,
     /// agent 写下、等人回答的建议（0025）
@@ -1512,6 +1584,7 @@ pub struct ReviewWaiting {
     pub lowconf: QueueWait,
     pub violations: QueueWait,
     pub defects: QueueWait,
+    pub alignment: QueueWait,
 }
 
 /// 办过的：近 7 天与近 30 天两个窗口，加近 14 天每天一根柱

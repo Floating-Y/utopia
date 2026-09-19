@@ -245,6 +245,10 @@ export const en = {
         title: "The model account cannot pay for requests",
         hint: "Extraction and embedding are stopped and will not resume on their own. Top up the account, or set an endpoint that can serve in Administration → Models.",
       },
+      "document.needs_reader": {
+        title: "A file needs a model to be read",
+        hint: "Scans and images need a document-reading service, and recordings need a transcription model that labels speakers. Each line says what was missing. The file is kept and nothing was read from it yet; it is read as soon as the reader is saved under Administration → Models.",
+      },
       "governance.tripped": {
         title: "The agent stopped deciding on its own",
         hint: "Two of its merges were reverted within seven days, so the switch went off. Look at what it did under Review → Agent, then turn it back on in the base settings when you want it to resume.",
@@ -499,20 +503,15 @@ export const en = {
       "Each line says why, and how many.",
     dropsExample: "e.g.",
     dropReason: {
-      attr_domain_mismatch: "Attribute on the wrong class",
-      subject_not_declared: "Subject type unknown",
-      attr_no_value: "Attribute had no value",
-      attr_datatype: "Value did not match the datatype",
-      low_confidence: "Below the confidence threshold",
       object_missing: "Relation had no object",
       malformed_item: "The model's item did not fit the schema",
       truncated_reply: "The model's reply was cut off",
-      domain_mismatch:
-        "The subject does not fit the relation, and swapping would not help",
-      not_an_entity_name: "That name is a sentence, not a thing",
-      clause_suspect: "Kept, but the name reads like a clause: a sample for the guard",
-      direction_corrected:
-        "Subject and object were swapped to match the signature",
+      quote_not_in_chunk: "Kept, but the quoted sentence is not in the text verbatim",
+      time_not_in_quote: "A time mention's words are not in the text",
+      unknown_ref: "The item points at nothing in the reply",
+      chunk_unextracted: "A passage the endpoint could not answer for",
+      phrase_is_value: "Kept, but the phrase is the value itself",
+      phrase_is_subject: "Kept, but the phrase is the subject's own name",
     } as Record<string, string>,
     // 来源级重抽：不危险，只是费时费钱——轻确认，文案直说成本与保留项
     reExtractSource: "Re-extract",
@@ -805,6 +804,7 @@ export const en = {
        「采购了」出来是 purchases——说"原文说的是 purchases"是假的。
        逐字原句就在旁边的证据引文里，没丢。 */
     proposedPredicate: (p: string) => `read from the text as “${p}”`,
+    saidAs: (words: string) => `the documents say it “${words}”`,
     inferredPredicate:
       "not a relation in the ontology, this is the source's wording",
     unknownPredicate: "no relation stated",
@@ -926,6 +926,10 @@ export const en = {
     shownName: "shown name",
     nameUntil: (d: string) => `until ${d}`,
     removeName: "Remove",
+    // 问一句再移除：名字是事实，界面上没有再加回来的地方
+    removeNameAsk: "Remove this name?",
+    removeNameCancel: "Keep",
+    removeNameGo: "Remove",
     nameRemoved: "Name removed",
     timelineEmpty: "No dated facts yet.",
     lastConfirmed: (d: string) => `confirmed ${d}`,
@@ -986,6 +990,18 @@ export const en = {
     nowBtn: "Now",
     play: "Play timeline",
     pause: "Pause",
+  },
+  origin: {
+    ocr: (page: number | null) => (page === null ? "OCR" : `OCR · p. ${page}`),
+    transcribed: (span: string | null, speakers: string[]) =>
+      ["Transcribed", span, speakers.length > 0 ? speakers.join(", ") : null]
+        .filter(Boolean)
+        .join(" · "),
+    described: "Described by a model",
+    ocrHint: "Read from a scan or image. A character or digit may be misread.",
+    transcribedHint: "Transcribed from a recording. A name may be misheard.",
+    describedHint: "A model's description of an image. Nobody wrote or said these words.",
+    readBy: (model: string) => `Read by ${model}.`,
   },
   doc: {
     backToLibrary: "← Back to Library",
@@ -1155,6 +1171,21 @@ export const en = {
     ok: (reply: string) => `Reachable and authenticated (${reply})`,
     okDim: (dim: number) => `Reachable and authenticated (dim ${dim})`,
     unsaved: "Unsaved changes. Save this card to test them.",
+    readersTitle: "Reading scans and recordings",
+    readersIntro:
+      "Scanned PDFs, images and recordings have no text to parse, so each needs its own reader. They are set apart from chat so that sensitive files can stay on your own servers. A file that arrives before its reader waits, and the message center says so; saving the reader reads it.",
+    ocrService: "Document reading (OCR)",
+    ocrHint:
+      "A MinerU service (mineru-api). It reads each page's layout first, so every passage keeps its page and position.",
+    serviceUrl: "Service URL",
+    backend: "Backend (optional)",
+    transcribeModel: "Transcription",
+    transcribeHint:
+      "An OpenAI-compatible endpoint that labels speakers (diarized_json), such as gpt-4o-transcribe-diarize. A transcript that cannot say who spoke is not used.",
+    okVersion: (version: string) => `Reachable (MinerU ${version})`,
+    okReachable: "Reachable and authenticated",
+    savedRequeued: (n: number) =>
+      `Saved. ${n} waiting ${n === 1 ? "file is" : "files are"} being read.`,
   },
   ontology: {
     title: "Ontology",
@@ -1721,6 +1752,7 @@ export const en = {
     railMappings: "Data mapping",
     railViolations: "Axioms",
     railDefects: "Ontology",
+    railAlignment: "Alignment",
     railDecisions: "Decisions",
     railMerges: "Merges",
     railAgent: "Agent",
@@ -1867,6 +1899,21 @@ export const en = {
           : `${ok} pairs decided`
         : `${ok} decided, ${failed} could not be — they stay in the queue`,
     lowConfidence: "Low-confidence facts",
+    // 对齐队列（#725）
+    alignment: "The aligner could not settle these",
+    alignmentHint:
+      "A phrase between two kinds of thing, or a kind word, where the aligner's two votes disagreed. Pick the property or class the documents' words mean, or say none fits: the statements then stay in the open graph. Your decision stands; the aligner never overrides a person.",
+    alignmentValue: "a value",
+    alignmentNone: "none fits",
+    alignmentForward: "as written",
+    alignmentReverse: "reversed",
+    alignmentBind: "Bind",
+    alignmentLeaveOpen: "Leave open",
+    alignmentStatements: (n: number) => (n === 1 ? "1 statement" : `${n} statements`),
+    alignmentEntities: (n: number) => (n === 1 ? "1 thing" : `${n} things`),
+    alignmentVotes: (first: string, second: string) => `Votes: ${first} · ${second}`,
+    alignmentTyped: (kept: number, retired: number) =>
+      `Typed graph recomputed: ${kept} statements typed, ${retired} rows retired`,
     defects: "Ontology contradicts itself",
     defectsHint:
       "Problems in the definitions themselves — no facts involved. These come first: while a definition contradicts itself, every fact-level finding that rests on it is suspect.",
@@ -1962,6 +2009,7 @@ export const en = {
       "the sentence is kept, the facts wait for your nod. Confirm to add with the sentence as evidence; " +
       "reject and it will not be proposed again.",
     pendingNoPredicate: "The ontology has no relation for this; the word is the model's own.",
+    pendingOwnWords: "In the document's own words; binding to the ontology comes with alignment.",
     pendingNoPredicateChip: "no relation in ontology",
     pendingSaidBy: (name: string) => `said by ${name}`,
     /* 同一个人可以挂着好几个 agent，只写人名分不出是哪一个记的 */
@@ -1988,7 +2036,8 @@ export const en = {
     conflictReason: {
       no_time: "new fact has no date",
       simultaneous: "same start date",
-      low_confidence: "low confidence",
+      described_evidence: "the newer fact was read off a picture",
+      low_confidence: "the newer fact was not sure enough",
     } as Record<string, string>,
     conflictVs: "vs",
     conflictSince: (d: string) => `since ${d}`,

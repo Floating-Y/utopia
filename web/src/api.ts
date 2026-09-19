@@ -175,6 +175,8 @@ export interface Doc {
   deleted_at: string | null;
   /** 真删过：内容没了，回不来 */
   purged_at: string | null;
+  /** 这份文件的字要靠哪一种模型读、而那种模型没配（0040）：ocr / transcribe；文档此时是 failed */
+  reader_needed: "ocr" | "transcribe" | null;
   created_at: string;
 }
 
@@ -260,6 +262,12 @@ export interface LlmSettingsView {
   embed_model?: string | null;
   embed_dim?: number | null;
   has_embed_key?: boolean;
+  ocr_base_url?: string | null;
+  ocr_backend?: string | null;
+  has_ocr_key?: boolean;
+  transcribe_base_url?: string | null;
+  transcribe_model?: string | null;
+  has_transcribe_key?: boolean;
 }
 
 export interface Member {
@@ -459,6 +467,8 @@ export type ReviewQueue =
   | "mappings"
   | "violations"
   | "defects"
+  // 对齐器两票不一致的签名与类别词（#725，0044 决定 3）
+  | "alignment"
   | "merges"
   // agent 的每一笔（0025）：建议、自动裁决与人的回答
   | "agent";
@@ -480,6 +490,8 @@ export interface ReviewCounts {
   mappings: number;
   violations: number;
   defects: number;
+  /** 对齐器拿不定的签名与类别词（#725） */
+  alignment: number;
   merges: number;
   /** agent 写下、等人回答的建议（0025） */
   agent: number;
@@ -686,6 +698,35 @@ export interface AxiomViolation {
 }
 /** 本体自己的一处自相矛盾。**与 AxiomViolation 不是一回事**：那个说
  *  「事实与定义抵触」，这个说「定义自己站不住」，后者更根本 */
+/** 对齐队列里的一条（#725）：一条短语签名，或一个类别词，都是对齐器两票不一致、等人定的 */
+export type AlignmentItem =
+  | {
+      kind: "phrase";
+      id: string;
+      phrase: string;
+      subject_class: string | null;
+      object_class: string | null;
+      object_is_value: boolean;
+      statement_count: number;
+      examples: string[];
+      votes: { first?: AlignmentVote | null; second?: AlignmentVote | null } | null;
+      decided_at: string;
+    }
+  | {
+      kind: "kind_word";
+      kind_word: string;
+      words: string[];
+      examples: string[];
+      phrases: string[];
+      entity_count: number;
+      votes: { first?: string | null; second?: string | null } | null;
+      decided_at: string;
+    };
+export interface AlignmentVote {
+  property: string;
+  direction: "forward" | "reverse";
+}
+
 export interface OntologyDefect {
   id: string;
   kind:
@@ -741,6 +782,12 @@ export interface PendingFactItem {
   /** 本体里的关系名；为空时显示 `proposed_predicate`（斜体，标明是原话） */
   predicate_label: string | null;
   proposed_predicate: string | null;
+  /** 开放陈述（0044）：文档自己的关系短语；有它就没有 predicate，那不是缺陷 */
+  phrase: string | null;
+  /** 按文档角色词记的限定：值或实体 */
+  qualifiers: { role: string; value?: unknown; entity_id?: string; entity_name?: string }[] | null;
+  /** 照抄的时间词，不是算出来的日期 */
+  time_words: { text: string; char_start: number }[] | null;
   object_id: string | null;
   object_name: string | null;
   object_value: { value?: unknown; unit?: string; summary?: string } | null;
@@ -815,7 +862,14 @@ export interface ReviewSummary {
   /** agent 在这个库里做过什么（0025） */
   agent: { running: boolean; queue: number; open: number; last_7d: AgentWindow; last_30d: AgentWindow };
   waiting: Record<
-    "pending" | "duplicates" | "conflicts" | "unconfirmed" | "lowconf" | "violations" | "defects",
+    | "pending"
+    | "duplicates"
+    | "conflicts"
+    | "unconfirmed"
+    | "lowconf"
+    | "violations"
+    | "defects"
+    | "alignment",
     QueueWait
   >;
   decided: {
@@ -859,6 +913,9 @@ export interface GraphEdge {
   /** 本体没认下这条关系时是原文说法；两者都拿不出时为 null（0052 之前的老数据） */
   predicate: string | null;
   label: string | null;
+  /** 这条边是从哪条开放陈述算出来的，那条陈述的原话（0044 决定 1）：
+   *  画布一条陈述只画一条边，有类型化行就画它，原话跟在这里不丢 */
+  said_as: string | null;
   /** true = 这条边的名字来自原文，不是本体认下的关系 */
   inferred: boolean;
   /** true = 这条边是**推出来的**，不是任何人断言的（R1）。
@@ -908,6 +965,9 @@ export interface EntityFact {
   /** 同 GraphEdge：本体外的关系回落到原文说法，两者都没有时为 null */
   predicate_key: string | null;
   predicate_label: string | null;
+  /** 这条边是从哪条开放陈述算出来的，那条陈述的原话（0044 决定 1）：
+   *  画布一条陈述只画一条边，有类型化行就画它，原话跟在这里不丢 */
+  said_as: string | null;
   /** true = 名字来自原文，不是本体认下的关系 */
   inferred: boolean;
   /** 关系的时态类别。没有谓词就无从谈起，为 null */
@@ -999,12 +1059,21 @@ export interface Evidence {
   stale: boolean;
   /** 这条证据的文档已被删除；事实还活着是因为另有出处（#268） */
   document_deleted: boolean;
+  /** 这块文字从哪来（0040）；证明链那条路不带，缺席即原文 */
+  origin?: "stated" | "ocr" | "transcribed" | "described";
+  origin_model?: string | null;
+  anchor?: Record<string, unknown> | null;
 }
 
 export interface ChunkFull {
   id: string;
   seq: number;
   text: string;
+  /** 这块文字从哪来（0040） */
+  origin: "stated" | "ocr" | "transcribed" | "described";
+  origin_model: string | null;
+  /** ocr: {page, bbox?}；transcribed: {start_ms, end_ms, speaker} */
+  anchor: Record<string, unknown> | null;
 }
 
 export interface EntityTypeView {
@@ -2229,6 +2298,23 @@ export const api = {
       defects_found: number;
       defects_new: number;
     }>(`/api/v1/kbs/${kbId}/consistency/check`, { method: "POST" }),
+  /** 人定一条短语签名：属性与方向，或没有（陈述留在开放图谱）。类型化图谱立刻重算 */
+  decideAlignmentPhrase: (
+    kbId: string,
+    bindingId: string,
+    property: string | null,
+    direction: "forward" | "reverse",
+  ) =>
+    request<{ ok: boolean; typed: { added: number; merged: number; retired: number } }>(
+      `/api/v1/kbs/${kbId}/review/alignment/phrases/${bindingId}`,
+      { method: "POST", body: JSON.stringify({ property, direction }) },
+    ),
+  /** 人定一个类别词：类，或没有。它名下的实体换类，短语签名跟着重判 */
+  decideAlignmentKindWord: (kbId: string, kindWord: string, cls: string | null) =>
+    request<{ ok: boolean }>(
+      `/api/v1/kbs/${kbId}/review/alignment/kind-words/${encodeURIComponent(kindWord)}`,
+      { method: "POST", body: JSON.stringify({ class: cls }) },
+    ),
   /** 对一处本体缺陷表态。**两个出路**——它压根没看数据，没有「数据错了」这条 */
   decideDefect: (
     kbId: string,
@@ -2360,7 +2446,27 @@ export const api = {
     request<{
       chat: { ok: boolean; reply?: string; error?: string };
       embed: { ok: boolean; dim?: number; error?: string };
+      ocr?: { ok: boolean; version?: string | null; error?: string };
+      transcribe?: { ok: boolean; error?: string };
     }>(`/api/v1/workspaces/${workspaceId}/settings/test`, { method: "POST" }),
+  /** 读扫描件的服务、转写模型各自一个保存：存它们不碰对话与嵌入那几列。
+   *  `requeued`：因为缺它而等着的文件，这一存重新排进了处理队列几份 */
+  saveOcrSettings: (
+    workspaceId: string,
+    body: { base_url: string; api_key: string; backend: string },
+  ) =>
+    request<{ ok: boolean; requeued: number }>(
+      `/api/v1/workspaces/${workspaceId}/settings/ocr`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
+  saveTranscribeSettings: (
+    workspaceId: string,
+    body: { base_url: string; api_key: string; model: string },
+  ) =>
+    request<{ ok: boolean; requeued: number }>(
+      `/api/v1/workspaces/${workspaceId}/settings/transcribe`,
+      { method: "PUT", body: JSON.stringify(body) },
+    ),
 
   /** 是否配置了单点登录（0056）。四项环境变量缺一个都是 false——
    *  登录页据此决定要不要露出那个按钮 */

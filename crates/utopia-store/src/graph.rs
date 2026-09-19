@@ -201,6 +201,91 @@ pub async fn fact_qualifiers_for(
     Ok(out)
 }
 
+/// 开放陈述上的一个属性（0044 第一刀）：按文档的角色词记，不按本体属性。
+/// 值或实体二选一；实体那一格带上它的显示名
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StatementQualifier {
+    /// 文档自己的角色词（"amount"、"buyer"）
+    pub role: String,
+    pub value: Option<serde_json::Value>,
+    pub entity_id: Option<Uuid>,
+    pub entity_name: Option<String>,
+}
+
+/// 往一条开放陈述上写一个按角色词记的属性。**先写者留着**：同一条陈述同一个角色词
+/// 再听到一次不覆盖（与 [`upsert_fact_qualifier`] 的 Conflict 一条规矩——两次观察
+/// 不一致该另立一行加一条冲突，这一刀还没走到那一步）。值与实体必须恰好给一个
+pub async fn add_statement_qualifier(
+    pool: &PgPool,
+    fact_id: Uuid,
+    role: &str,
+    value: Option<&serde_json::Value>,
+    entity_id: Option<Uuid>,
+) -> AppResult<()> {
+    if value.is_some() == entity_id.is_some() {
+        return Err(AppError::invalid(
+            "qualifier_shape",
+            "a statement qualifier carries exactly one of a value or an entity",
+        ));
+    }
+    let role = role.trim();
+    if role.is_empty() {
+        return Err(AppError::invalid(
+            "qualifier_role",
+            "a statement qualifier needs the document's role word",
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO statement_qualifiers (fact_id, role, value, entity_id)
+         VALUES ($1, $2, $3, $4) ON CONFLICT (fact_id, role) DO NOTHING",
+    )
+    .bind(fact_id)
+    .bind(role)
+    .bind(value)
+    .bind(entity_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// 一批开放陈述各自的角色词属性，按事实 id 取回；实体那一格连上显示名
+pub async fn statement_qualifiers_for(
+    pool: &PgPool,
+    fact_ids: &[Uuid],
+) -> AppResult<HashMap<Uuid, Vec<StatementQualifier>>> {
+    let mut out: HashMap<Uuid, Vec<StatementQualifier>> = HashMap::new();
+    if fact_ids.is_empty() {
+        return Ok(out);
+    }
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        fact_id: Uuid,
+        role: String,
+        value: Option<serde_json::Value>,
+        entity_id: Option<Uuid>,
+        entity_name: Option<String>,
+    }
+    let rows: Vec<Row> = sqlx::query_as(
+        "SELECT q.fact_id, q.role, q.value, q.entity_id, e.canonical_name AS entity_name
+         FROM statement_qualifiers q
+         LEFT JOIN entities e ON e.id = q.entity_id
+         WHERE q.fact_id = ANY($1)
+         ORDER BY q.fact_id, q.role",
+    )
+    .bind(fact_ids)
+    .fetch_all(pool)
+    .await?;
+    for r in rows {
+        out.entry(r.fact_id).or_default().push(StatementQualifier {
+            role: r.role,
+            value: r.value,
+            entity_id: r.entity_id,
+            entity_name: r.entity_name,
+        });
+    }
+    Ok(out)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_fact(
     pool: &PgPool,
@@ -253,6 +338,10 @@ pub struct Validity<'a> {
     /// 没有起点的事实从它起成立，结束了不知哪天的到它为止——**它不是起点**，所以
     /// 不写进 `from`（0003 拒绝过把文档日期填进日期列）
     pub attested_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// 起点是怎么来的（0045 第 3 刀）：`A` 文档写明、`B` 按文档自己的锚点算出、
+    /// `C` 有时间词但锚不到。`None` = 没经过时间解析（人写的、规则算的），按 A 算。
+    /// 时态引擎读它决定这一行能不能关上前任
+    pub from_grade: Option<&'a str>,
 }
 
 /// `valid_to_precision` 表示「结束了，但不知道是哪天」。
@@ -367,6 +456,7 @@ impl<'a> Validity<'a> {
             to: None,
             to_precision: None,
             attested_at: None,
+            from_grade: None,
         }
     }
 
@@ -647,17 +737,17 @@ async fn insert_fact_inner(
             "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_id,
                                 valid_from, valid_from_precision,
                                 valid_to, valid_to_precision, confidence,
-                                attested_from, attested_to)
+                                attested_from, attested_to, valid_from_grade)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, now()),
-                     CASE WHEN $9::text = 'unknown' THEN COALESCE($11, now()) END)"
+                     CASE WHEN $9::text = 'unknown' THEN COALESCE($11, now()) END, $12)"
         }
         FactObject::Value(_) => {
             "INSERT INTO facts (id, kb_id, subject_id, predicate_id, object_value,
                                 valid_from, valid_from_precision,
                                 valid_to, valid_to_precision, confidence,
-                                attested_from, attested_to)
+                                attested_from, attested_to, valid_from_grade)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, COALESCE($11, now()),
-                     CASE WHEN $9::text = 'unknown' THEN COALESCE($11, now()) END)"
+                     CASE WHEN $9::text = 'unknown' THEN COALESCE($11, now()) END, $12)"
         }
     };
     let mut ins = sqlx::query(insert_sql)
@@ -675,6 +765,7 @@ async fn insert_fact_inner(
         .bind(validity.to_precision)
         .bind(confidence)
         .bind(validity.attested_at)
+        .bind(validity.from_grade)
         .execute(pool)
         .await?;
 
@@ -690,9 +781,11 @@ async fn insert_fact_inner(
             .execute(pool)
             .await?;
         sqlx::query(
-            // 表层谓词随证据一起搬：精化的是时间，不是原文说了什么
-            "INSERT INTO fact_evidence (fact_id, chunk_id, quote, proposed_predicate, document_id, doc_version)
-             SELECT $1, chunk_id, quote, proposed_predicate, document_id, doc_version
+            // 表层谓词随证据一起搬：精化的是时间，不是原文说了什么。引文的偏移一起搬
+            "INSERT INTO fact_evidence (fact_id, chunk_id, quote, proposed_predicate, document_id, doc_version,
+                                        quote_start, quote_end)
+             SELECT $1, chunk_id, quote, proposed_predicate, document_id, doc_version,
+                    quote_start, quote_end
              FROM fact_evidence WHERE fact_id = $2
              ON CONFLICT DO NOTHING",
         )
@@ -768,6 +861,143 @@ pub async fn insert_value_fact(
     .await
 }
 
+/// 一条开放陈述（0044 第一刀，#729）：文档说了什么，用它自己的话。
+/// 返回 (事实 id, 是否新建)。
+///
+/// 落的是 `facts` 里 `layer = 'open'` 的一行：短语照写在 `phrase` 上、`predicate_id`
+/// 为空（`facts_open_statement_shape` 在挡）。去重按 (库, 主语, 短语, 宾语) 在活着的
+/// 开放行里找——今天空谓词的行按 (主, 谓, 宾) 去重、谓词是 NULL 就永远撞不上，每次
+/// 观察都插一行；短语进了键之后同一句话再听到一次就是同一行，证据累积到它上面。
+/// 撞上了只把 `attested_from` 往早挪（[`attest_earlier`]）。
+///
+/// **不走 [`insert_fact_inner`] 那道门**：不问 `predicate_temporal`，不过
+/// `Validity::under`，不写任何 `valid_*`，也不碰时间线。一条开放陈述在世界轴上还
+/// 没有位置——它提到的时间是照抄的字（`time_mentions`），把字读成日期是 0045
+/// 后面那几刀的事。这里只有记录轴：`attested_from` 是文档日期（调用方只在
+/// `doc_time_source IN ('content', 'source')` 时传，#714）或此刻。
+///
+/// 调用方随后要把 `proposed_predicate = phrase` 写到证据上（[`add_evidence_located`]），
+/// 于是所有已经容得下空谓词的读路径（`fact_surface_predicate`）不改一字就按短语显示它
+pub async fn insert_open_statement(
+    pool: &PgPool,
+    kb_id: Uuid,
+    subject_id: Uuid,
+    phrase: &str,
+    object: FactObject<'_>,
+    attested_at: Option<chrono::DateTime<chrono::Utc>>,
+    confidence: f32,
+) -> AppResult<(Uuid, bool)> {
+    let phrase = phrase.trim();
+    if phrase.is_empty() {
+        return Err(AppError::invalid(
+            "phrase_missing",
+            "an open statement keeps the document's relation phrase",
+        ));
+    }
+    let same_sql = match object {
+        FactObject::Entity(_) => {
+            "SELECT id FROM facts
+             WHERE layer = 'open' AND kb_id = $1 AND subject_id = $2 AND phrase = $3
+               AND object_id = $4 AND invalidated_at IS NULL
+             ORDER BY recorded_at LIMIT 1"
+        }
+        FactObject::Value(_) => {
+            "SELECT id FROM facts
+             WHERE layer = 'open' AND kb_id = $1 AND subject_id = $2 AND phrase = $3
+               AND object_value = $4 AND object_id IS NULL AND invalidated_at IS NULL
+             ORDER BY recorded_at LIMIT 1"
+        }
+    };
+    let mut q = sqlx::query_scalar(same_sql)
+        .bind(kb_id)
+        .bind(subject_id)
+        .bind(phrase);
+    q = match object {
+        FactObject::Entity(id) => q.bind(id),
+        FactObject::Value(v) => q.bind(v),
+    };
+    let same: Option<Uuid> = q.fetch_optional(pool).await?;
+    if let Some(existing) = same {
+        attest_earlier(pool, existing, attested_at).await?;
+        return Ok((existing, false));
+    }
+
+    let id = Uuid::now_v7();
+    let insert_sql = match object {
+        FactObject::Entity(_) => {
+            "INSERT INTO facts (id, kb_id, subject_id, layer, phrase, object_id,
+                                confidence, attested_from)
+             VALUES ($1, $2, $3, 'open', $4, $5, $6, COALESCE($7, now()))"
+        }
+        FactObject::Value(_) => {
+            "INSERT INTO facts (id, kb_id, subject_id, layer, phrase, object_value,
+                                confidence, attested_from)
+             VALUES ($1, $2, $3, 'open', $4, $5, $6, COALESCE($7, now()))"
+        }
+    };
+    let mut ins = sqlx::query(insert_sql)
+        .bind(id)
+        .bind(kb_id)
+        .bind(subject_id)
+        .bind(phrase);
+    ins = match object {
+        FactObject::Entity(oid) => ins.bind(oid),
+        FactObject::Value(v) => ins.bind(v),
+    };
+    ins.bind(confidence).bind(attested_at).execute(pool).await?;
+    Ok((id, true))
+}
+
+/// 把解算结果写到一条开放陈述的世界轴上（0045 决定 2：模型读，代码算）。
+///
+/// 只改 `layer = 'open'` 且活着的行——WHERE 里写死，不靠调用方检查；类型化的行照旧走
+/// [`insert_fact_inner`] 那道门（谓词的时间语义、去重、时间线），作废的行是历史，不改。
+/// 值先按精度截断（[`truncate_to`]），存的值与精度说同一句话，数据库的 CHECK 才放行。
+/// 结束端的三种状态与 [`Validity`] 同一张表：`(None, None)` 仍在持续、
+/// `(None, Some("unknown"))` 结束了不知哪天、`(Some(t), Some(精度))` 某时结束。
+/// 结束了不知哪天的要有自己的锚点（`facts_ended_unknown_has_anchor`，#393）：说出结束的
+/// 就是这条陈述自己的文档，锚点取 `attested_from`；其余两种状态把 `attested_to` 清空
+///
+/// 没有这一行、它不是开放行、或它已作废：一行不改，返回 `not_an_open_statement`
+pub async fn set_open_validity(
+    pool: &PgPool,
+    fact_id: Uuid,
+    from: Option<chrono::DateTime<chrono::Utc>>,
+    from_precision: Option<&str>,
+    to: Option<chrono::DateTime<chrono::Utc>>,
+    to_precision: Option<&str>,
+    // 起点是怎么来的（0045 第 3 刀）。**锚不到（`C`）也要写**：那时两端都是空，
+    // 只有这一列说得出「这句话有时间词、我们没能把它放到轴上」，物化把它带给
+    // 类型化的行，时态引擎才不会让一个猜出来的位置改写前任的历史
+    grade: Option<&str>,
+) -> AppResult<()> {
+    let from = from.map(|t| truncate_to(t, from_precision));
+    let to = to.map(|t| truncate_to(t, to_precision));
+    let done = sqlx::query(
+        "UPDATE facts
+            SET valid_from = $2, valid_from_precision = $3,
+                valid_to = $4, valid_to_precision = $5, valid_from_grade = $6,
+                attested_to = CASE WHEN $4 IS NULL AND $5 = 'unknown'
+                                   THEN COALESCE(attested_to, attested_from) END
+          WHERE id = $1 AND layer = 'open' AND invalidated_at IS NULL",
+    )
+    .bind(fact_id)
+    .bind(from)
+    .bind(from_precision)
+    .bind(to)
+    .bind(to_precision)
+    .bind(grade)
+    .execute(pool)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Err(AppError::invalid(
+            "not_an_open_statement",
+            "only a live open statement takes its valid time from resolution",
+        ));
+    }
+    Ok(())
+}
+
 /// `proposed`：模型在这一块里实际提议的谓词。命中本体时它等于 key，
 /// 本体外的谓词不落到关系上时，它是唯一还留着原意的东西——事实行上只剩
 /// "有关联"，原文说的"runs on"就靠这里活下来。
@@ -777,6 +1007,22 @@ pub async fn add_evidence(
     chunk_id: Uuid,
     quote: Option<&str>,
     proposed: Option<&str>,
+) -> AppResult<()> {
+    add_evidence_located(pool, fact_id, chunk_id, quote, proposed, None).await
+}
+
+/// [`add_evidence`]，外加引文在 `chunks.text` 里的位置（0044 第一刀）。
+///
+/// `span` 是字符偏移（不是字节）的 `(start, end)`，**由服务端搜文本算出来，从不取
+/// 模型报的数**；没定位到就传 `None`，两列留空。同一对 (事实, 分块) 再写一次只在
+/// 原值为空时补上偏移，与表层谓词一条规矩：第一次记下的就是它的
+pub async fn add_evidence_located(
+    pool: &PgPool,
+    fact_id: Uuid,
+    chunk_id: Uuid,
+    quote: Option<&str>,
+    proposed: Option<&str>,
+    span: Option<(i32, i32)>,
 ) -> AppResult<()> {
     // 证据落笔即记版本：出自哪份文档的第几版（S3 版本对账与"证据过期"判定的依据）
     // 冲突时补写表层谓词而非整行跳过：重抽命中的多是已有的 (事实, 分块) 对，
@@ -811,15 +1057,21 @@ pub async fn add_evidence(
         }
     }
     sqlx::query(
-        "INSERT INTO fact_evidence (fact_id, chunk_id, quote, proposed_predicate, document_id, doc_version)
-         SELECT $1, $2, $3, left($4, 120), c.document_id, c.doc_version FROM chunks c WHERE c.id = $2
+        "INSERT INTO fact_evidence (fact_id, chunk_id, quote, proposed_predicate, document_id, doc_version,
+                                    quote_start, quote_end)
+         SELECT $1, $2, $3, left($4, 120), c.document_id, c.doc_version, $5, $6
+         FROM chunks c WHERE c.id = $2
          ON CONFLICT (fact_id, chunk_id) DO UPDATE
-           SET proposed_predicate = COALESCE(fact_evidence.proposed_predicate, EXCLUDED.proposed_predicate)",
+           SET proposed_predicate = COALESCE(fact_evidence.proposed_predicate, EXCLUDED.proposed_predicate),
+               quote_start = COALESCE(fact_evidence.quote_start, EXCLUDED.quote_start),
+               quote_end = COALESCE(fact_evidence.quote_end, EXCLUDED.quote_end)",
     )
     .bind(target)
     .bind(chunk_id)
     .bind(quote)
     .bind(proposed)
+    .bind(span.map(|(s, _)| s))
+    .bind(span.map(|(_, e)| e))
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -927,6 +1179,27 @@ pub async fn overview(
     Ok((nodes, edges, total_nodes, total_edges))
 }
 
+/// 这条开放陈述已经被一条活着的类型化行代表（0044 决定 1：类型化图谱是开放图谱按
+/// 绑定算出来的视图）。画布与实体面板据此一条陈述只画一条边——有类型化行就画它，
+/// 标签是属性的名字；没有才画原话。**账本两条都留着**，这里只管画面。
+/// `$f` 换成调用处的表别名
+const REPRESENTED_BY_TYPED: &str = "EXISTS (SELECT 1 FROM typed_fact_sources src
+                    JOIN facts ty ON ty.id = src.fact_id
+                   WHERE src.statement_id = $f.id AND ty.invalidated_at IS NULL)";
+
+fn represented_by_typed(alias: &str) -> String {
+    REPRESENTED_BY_TYPED.replace("$f", alias)
+}
+
+/// 一条类型化行背后那些陈述的原话，去重拼起来（几条陈述可能算出同一行，见 0068）。
+fn said_as(alias: &str) -> String {
+    format!(
+        "(SELECT string_agg(DISTINCT st.phrase, ' · ')
+            FROM typed_fact_sources src JOIN facts st ON st.id = src.statement_id
+           WHERE src.fact_id = {alias}.id)"
+    )
+}
+
 async fn edges_among(
     pool: &PgPool,
     kb_id: Uuid,
@@ -954,6 +1227,7 @@ async fn edges_among(
         "SELECT f.id, {subject} AS source, {object} AS target,
                 COALESCE(r.key, fact_surface_predicate(f.id)) AS predicate,
                 COALESCE(r.label, fact_surface_predicate(f.id)) AS label,
+                {said_as} AS said_as,
                 r.id IS NULL AS inferred, FALSE AS derived, NULL::text AS rule,
                 ARRAY[]::uuid[] AS premises,
                 f.valid_from, f.valid_to,
@@ -971,9 +1245,10 @@ async fn edges_among(
          WHERE f.kb_id = $1 AND {facts_held} AND f.object_id IS NOT NULL
            AND {subject} = ANY($2) AND {object} = ANY($2)
            AND {facts_hold}
+           AND NOT {represented}
          UNION ALL
          SELECT d.id, d.subject_id AS source, d.object_id AS target,
-                r.key AS predicate, r.label AS label,
+                r.key AS predicate, r.label AS label, NULL::text AS said_as,
                 FALSE AS inferred, TRUE AS derived, ru.kind AS rule,
                 ARRAY(SELECT fd.premise_fact_id FROM fact_derivations fd
                        WHERE fd.derived_fact_id = d.id
@@ -992,6 +1267,7 @@ async fn edges_among(
                 (v.detail->>'subject_id')::uuid AS source,
                 (v.detail->>'object_id')::uuid AS target,
                 v.detail->>'predicate' AS predicate, v.detail->>'predicate' AS label,
+                NULL::text AS said_as,
                 FALSE AS inferred, TRUE AS derived, v.detail->>'rule' AS rule,
                 v.path AS premises,
                 (v.detail->>'valid_from')::timestamptz AS valid_from,
@@ -1007,6 +1283,8 @@ async fn edges_among(
            AND {ghost_hold}",
         // 世界轴（0022）：三段都从 world_axis 拼，读点上不再手写 NULL 的含义
         facts_hold = crate::world_axis::facts_hold_at("f", 3),
+        said_as = said_as("f"),
+        represented = represented_by_typed("f"),
         derived_hold = crate::world_axis::derived_hold_at("d", 3),
         ghost_hold = crate::world_axis::interval_holds_at(
             "(v.detail->>'valid_from')::timestamptz",
@@ -1200,7 +1478,7 @@ pub async fn entity_detail(
     .ok_or(AppError::NotFound)?;
 
     let mut facts: Vec<EntityFact> = sqlx::query_as(&format!(
-        "SELECT f.id, f.recorded_at, f.invalidated_at, f.supersedes,
+        "SELECT f.id, {said_as} AS said_as, f.recorded_at, f.invalidated_at, f.supersedes,
                 ARRAY(SELECT DISTINCT fe.document_id FROM fact_evidence fe
                       WHERE fe.fact_id = f.id AND fe.document_id IS NOT NULL
                       ORDER BY fe.document_id) AS document_ids,
@@ -1246,10 +1524,13 @@ pub async fn entity_detail(
            ON o.id = CASE WHEN {subject} = $2 THEN {object} ELSE {subject} END
          LEFT JOIN entity_types ot ON ot.id = o.type_id
          WHERE f.kb_id = $1 AND {facts_held} AND {facts_hold}
+           AND NOT {represented}
            AND ({subject} = $2 OR {object} = $2)
            AND {not_name}
          ORDER BY f.valid_from NULLS LAST, f.recorded_at",
         not_name = crate::names::not_a_name("f"),
+        said_as = said_as("f"),
+        represented = represented_by_typed("f"),
         facts_held = crate::record_axis::facts_held_at("f", 3),
         facts_hold = crate::world_axis::facts_hold_at("f", 4),
         holds_from = crate::world_axis::facts_holds_from("f"),
@@ -1455,6 +1736,10 @@ pub async fn low_confidence_facts(
 /// "证据全部停留在旧版"的现行事实（S3 第三刀：文档新版没再确认的知识）。
 /// 判定纯派生自 chunk 存活性——认领机制保证未变段落的证据不被误伤；
 /// 绝不自动删除（没再提 ≠ 不成立），删除/闭合权在 Review 的人手里。
+///
+/// **「现行」这一条不能少。** 闭合是作废+改写，修正行带着原证据（`temporal::close_superseded`），
+/// 只看证据存活性的话，刚闭合的行立刻回到这一档——那个出路等于不存在。
+/// WHERE 与 `review::UNCONFIRMED_FACT` 同一套（0022：「结束不知哪天」不是开放）。
 pub async fn stale_facts(
     pool: &PgPool,
     kb_id: Uuid,
@@ -1473,6 +1758,7 @@ pub async fn stale_facts(
          LEFT JOIN relation_types r ON r.id = f.predicate_id
          LEFT JOIN entities o ON o.id = f.object_id
          WHERE f.kb_id = $1 AND f.invalidated_at IS NULL
+           AND f.valid_to IS NULL AND f.valid_to_precision IS NULL
            AND EXISTS (SELECT 1 FROM fact_evidence fe WHERE fe.fact_id = f.id)
            AND NOT EXISTS (SELECT 1 FROM fact_evidence fe
                            JOIN chunks c ON c.id = fe.chunk_id
@@ -1523,7 +1809,10 @@ pub async fn document_extractions(
                 f.subject_id, s.canonical_name AS subject,
                 COALESCE(r.label, fact_surface_predicate(f.id)) AS predicate,
                 r.id IS NULL AS inferred,
-                f.object_id, o.canonical_name AS object,
+                -- 宾语是一样东西就用它的名字，是字面值（名字、金额、百分比）就用那个值。
+                -- 只取 canonical_name 的话，每一条值宾语的陈述在阅读页右栏都是主语加短语、
+                -- 后面空着一片——「Hugging Face, Inc. known as」后面什么都没有
+                f.object_id, COALESCE(o.canonical_name, f.object_value #>> '{value}') AS object,
                 f.valid_from, f.valid_to, f.confidence
          FROM fact_evidence fe
          JOIN chunks c ON c.id = fe.chunk_id AND c.document_id = $1
@@ -1549,7 +1838,8 @@ pub async fn fact_evidence(pool: &PgPool, fact_id: Uuid) -> AppResult<Vec<Eviden
                 c.doc_version < COALESCE(
                     (SELECT MAX(version) FROM document_versions dv
                      WHERE dv.document_id = c.document_id), 1) AS stale,
-                d.deleted_at IS NOT NULL AS document_deleted
+                d.deleted_at IS NOT NULL AS document_deleted,
+                c.origin, c.origin_model, c.anchor
          FROM fact_evidence fe
          JOIN chunks c ON c.id = fe.chunk_id
          JOIN documents d ON d.id = c.document_id
@@ -1839,13 +2129,13 @@ pub async fn graph_changes(
                 COALESCE(r.label, fact_surface_predicate(ev.id)) AS predicate_label, o.canonical_name AS object_name,
                 ev.object_value, ev.valid_from, ev.valid_from_precision,
                 ev.valid_to, ev.valid_to_precision,
-                ev.confidence, src.document_id, src.filename, src.quote
+                ev.confidence, src.document_id, src.filename, src.quote, src.quote_origin
          FROM ev
          LEFT JOIN relation_types r ON r.id = ev.predicate_id
          JOIN entities s ON s.id = ev.subject_id
          LEFT JOIN entities o ON o.id = ev.object_id
          LEFT JOIN LATERAL (
-             SELECT d.id AS document_id, d.filename, fe.quote
+             SELECT d.id AS document_id, d.filename, fe.quote, c.origin AS quote_origin
              FROM fact_evidence fe
              JOIN chunks c ON c.id = fe.chunk_id
              JOIN documents d ON d.id = c.document_id
@@ -1896,12 +2186,15 @@ pub async fn proposed_predicates(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Pr
         //
         // 走 CTE 而不是相关子查询：后者每组重扫一遍证据表，同一份数据上
         // 360ms 对 7ms。这个函数每次 Suggest 和每次自动扩本体都要跑。
+        // **只看类型化那一层。** 开放陈述（0044）的短语也写在证据的 proposed_predicate
+        // 上，好让读路径按它显示；但它不是等着被采纳的说法——把一个开放短语自动
+        // 采纳成关系类型，正是那一刀说不做的事（对齐与绑定是第二刀）
         "WITH spread AS (
              SELECT e.proposed_predicate AS form,
                     count(DISTINCT e.document_id) AS doc_count
              FROM fact_evidence e
              JOIN facts ff ON ff.id = e.fact_id
-             WHERE ff.kb_id = $1 AND e.proposed_predicate IS NOT NULL
+             WHERE ff.kb_id = $1 AND ff.layer = 'typed' AND e.proposed_predicate IS NOT NULL
              GROUP BY 1
          )
          SELECT fe.proposed_predicate AS form,
@@ -1913,12 +2206,13 @@ pub async fn proposed_predicates(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Pr
                  JOIN entities s ON s.id = f2.subject_id
                  JOIN entities o ON o.id = f2.object_id
                  WHERE e2.proposed_predicate = fe.proposed_predicate
-                   AND f2.kb_id = $1 AND f2.predicate_id IS NULL AND f2.invalidated_at IS NULL
+                   AND f2.kb_id = $1 AND f2.layer = 'typed'
+                   AND f2.predicate_id IS NULL AND f2.invalidated_at IS NULL
                  LIMIT 1) AS example
          FROM fact_evidence fe
          JOIN facts f ON f.id = fe.fact_id
          JOIN spread sp ON sp.form = fe.proposed_predicate
-         WHERE f.kb_id = $1 AND f.predicate_id IS NULL
+         WHERE f.kb_id = $1 AND f.layer = 'typed' AND f.predicate_id IS NULL
            AND f.invalidated_at IS NULL AND fe.proposed_predicate IS NOT NULL
            -- 字面值宾语的不算：它们同样没有谓词、也带原文说法，但要的是
            -- 一个属性而不是一个关系。混进来提案就会照着建关系，然后
@@ -1959,7 +2253,7 @@ pub async fn proposed_predicate_documents(
         "SELECT DISTINCT fe.proposed_predicate, fe.document_id
          FROM fact_evidence fe
          JOIN facts f ON f.id = fe.fact_id
-         WHERE f.kb_id = $1
+         WHERE f.kb_id = $1 AND f.layer = 'typed'
            AND fe.proposed_predicate IS NOT NULL
            AND fe.document_id IS NOT NULL
            AND NOT EXISTS (SELECT 1 FROM ontology_misses m
@@ -2055,6 +2349,8 @@ async fn adopt(
                 "SELECT f.id, f.subject_id, f.object_id, f.object_value
                  FROM facts f
                  WHERE f.kb_id = $1 AND f.predicate_id IS NULL AND f.invalidated_at IS NULL
+                   -- 开放陈述（0044）不采纳：短语挂上谓词是第二刀的对齐做的事
+                   AND f.layer = 'typed'
                    -- **只碰宾语是实体的。** 同一个说法可能既有指向实体的事实
                    -- 又有带字面值的（location 两种都用），后者归属性那条路：
                    -- 把它改挂到一条关系上，那个值就再也不是值了
@@ -2080,7 +2376,8 @@ async fn adopt(
             let ids: Vec<Uuid> = items.iter().map(|(id, _)| *id).collect();
             let live: Vec<(Uuid, Uuid)> = sqlx::query_as(
                 "SELECT id, subject_id FROM facts
-                 WHERE kb_id = $1 AND id = ANY($2) AND invalidated_at IS NULL",
+                 WHERE kb_id = $1 AND id = ANY($2) AND invalidated_at IS NULL
+                   AND layer = 'typed'",
             )
             .bind(kb_id)
             .bind(&ids)
@@ -2191,8 +2488,10 @@ async fn adopt(
 
         // 证据整体搬过去，表层谓词一并保留——它是这次改写的依据，不该在改写中丢失
         sqlx::query(
-            "INSERT INTO fact_evidence (fact_id, chunk_id, quote, proposed_predicate, document_id, doc_version)
-             SELECT $1, chunk_id, quote, proposed_predicate, document_id, doc_version
+            "INSERT INTO fact_evidence (fact_id, chunk_id, quote, proposed_predicate, document_id, doc_version,
+                                        quote_start, quote_end)
+             SELECT $1, chunk_id, quote, proposed_predicate, document_id, doc_version,
+                    quote_start, quote_end
              FROM fact_evidence WHERE fact_id = $2
              ON CONFLICT DO NOTHING",
         )
@@ -2316,12 +2615,13 @@ pub async fn proposed_attributes(
     Ok(sqlx::query_as(
         // 同 proposed_predicates：普遍程度从全量证据数，改写量从积压数；
         // 走 CTE 而不是相关子查询，后者每组重扫一遍证据表
+        // 同 proposed_predicates：开放陈述（0044）的短语不是等着被采纳的说法
         "WITH spread AS (
              SELECT e.proposed_predicate AS form,
                     count(DISTINCT e.document_id) AS doc_count
              FROM fact_evidence e
              JOIN facts ff ON ff.id = e.fact_id
-             WHERE ff.kb_id = $1 AND e.proposed_predicate IS NOT NULL
+             WHERE ff.kb_id = $1 AND ff.layer = 'typed' AND e.proposed_predicate IS NOT NULL
              GROUP BY 1
          )
          SELECT fe.proposed_predicate AS form,
@@ -2331,7 +2631,7 @@ pub async fn proposed_attributes(
                  FROM fact_evidence e2
                  JOIN facts f2 ON f2.id = e2.fact_id
                  WHERE e2.proposed_predicate = fe.proposed_predicate
-                   AND f2.kb_id = $1 AND f2.predicate_id IS NULL
+                   AND f2.kb_id = $1 AND f2.layer = 'typed' AND f2.predicate_id IS NULL
                    AND f2.object_id IS NULL AND f2.invalidated_at IS NULL
                  LIMIT 1) AS example,
                 -- 主语实际是什么类：属性的 domain 从这里来，不靠猜
@@ -2341,12 +2641,12 @@ pub async fn proposed_attributes(
                       JOIN entities s ON s.id = f3.subject_id
                       JOIN entity_types t ON t.id = s.type_id
                       WHERE e3.proposed_predicate = fe.proposed_predicate
-                        AND f3.kb_id = $1 AND f3.predicate_id IS NULL
+                        AND f3.kb_id = $1 AND f3.layer = 'typed' AND f3.predicate_id IS NULL
                         AND f3.object_id IS NULL AND f3.invalidated_at IS NULL) AS domain_keys
          FROM fact_evidence fe
          JOIN facts f ON f.id = fe.fact_id
          JOIN spread sp ON sp.form = fe.proposed_predicate
-         WHERE f.kb_id = $1 AND f.predicate_id IS NULL
+         WHERE f.kb_id = $1 AND f.layer = 'typed' AND f.predicate_id IS NULL
            AND f.invalidated_at IS NULL AND fe.proposed_predicate IS NOT NULL
            AND f.object_id IS NULL
            -- 拒绝过的说法不再出现在候选里
@@ -2385,7 +2685,8 @@ pub async fn value_facts_for_forms(
         "SELECT DISTINCT f.id, s.type_id, f.object_value
          FROM facts f
          JOIN entities s ON s.id = f.subject_id
-         WHERE f.kb_id = $1 AND f.predicate_id IS NULL AND f.invalidated_at IS NULL
+         WHERE f.kb_id = $1 AND f.layer = 'typed'
+           AND f.predicate_id IS NULL AND f.invalidated_at IS NULL
            AND f.object_id IS NULL AND f.object_value IS NOT NULL
            AND EXISTS (SELECT 1 FROM fact_evidence e
                        WHERE e.fact_id = f.id AND e.proposed_predicate = ANY($2))",
@@ -2460,6 +2761,7 @@ mod temporal_shape_tests {
             to: Some(at("2025-01-01T00:00:00Z")),
             to_precision: Some("day"),
             attested_at: None,
+            from_grade: None,
         }
         .under(Temporal::Event);
         assert_eq!(span.from, Some(at("2024-03-15T00:00:00Z")));
@@ -2475,6 +2777,7 @@ mod temporal_shape_tests {
             to: Some(at("2024-05-01T00:00:00Z")),
             to_precision: Some("month"),
             attested_at: None,
+            from_grade: None,
         }
         .under(Temporal::Event);
         assert_eq!(end_only.from, Some(at("2024-05-01T00:00:00Z")));

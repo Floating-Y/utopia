@@ -1,5 +1,7 @@
 # Decision records
 
+The current design, condensed per domain, is in [../design/](../design/README.md); this directory holds the reasons behind it.
+
 Code records what was built and git records when it changed. Neither records why it was built this way and which roads turned out to be dead ends. This directory does.
 
 The test for writing one: if someone (including us) looks at a piece of code in six months and asks "why not simply…", and the answer is not in the code, there should be a record.
@@ -63,9 +65,59 @@ The test for writing one: if someone (including us) looks at a piece of code in 
 | 0037 | [A relation carries its own attributes](0037-a-relation-carries-its-own-attributes.md) | Written · cut 1 in progress: qualifier tables (0049), declaration, extraction, panel, export · entity-valued qualifier reserved, conflict-as-two-rows and the canvas label next |
 | 0038 | [The interface has a light side](0038-the-interface-has-a-light-side.md) | Implemented (#599) · `data-theme` on `<html>`, chosen by the reader and stored in the browser, `system` resolved to one of the two before first paint · a second token block in `styles.css` and not one rule rewritten: alpha stays, the triplet swaps · the canvas reads its colours from the tokens through one reader file and rebuilds on a switch; edges are flattened over the ground on light because the WebGL shader can only brighten · a `raw-colour` guard rule over `.ts` and `.tsx` · the entity palette is the same in both themes; a paper-tuned set is open |
 | 0039 | [A chunk is what extraction sees](0039-a-chunk-is-what-extraction-sees.md) | Implemented, cut 1 · the parser's Markdown is read into blocks and packed by a token budget (1000, cl100k) · a table travels with its caption and header and a continuation repeats both · headings become a breadcrumb and fill `chunks.heading` · a page-break rule is not a boundary and a table it split is joined back · not measured on its own: the budget · cut 2: an external parser behind the block model, evidence that names a cell or a region |
-| 0040 | [A chunk says where its words came from](0040-a-chunk-says-where-its-words-came-from.md) | Proposed · nothing built · a chunk carries an **origin** (`stated`, `ocr`, `transcribed`, `described`) and the model that produced it, and an **anchor** back into the original bytes (a page and region, a time range, an image inside the file) — decided before any media reader, because a transcript stored without its times can never be tied to the recording again · the packer never mixes origins in a chunk · facts from a description enter below `AUTO_CLOSE_MIN_CONFIDENCE`, so a misread chart opens a conflict instead of closing a correct fact · per-modality model settings, media reading as a resumable job, origin and anchor in the API, MCP and RDF · cuts: ledger shape, scans via Docling, recordings, descriptions, video |
+| 0040 | [A chunk says where its words came from](0040-a-chunk-says-where-its-words-came-from.md) | Cuts 1–3 implemented (the ledger shape, and a file that needs a reader degrades with an alert instead of becoming garbage text; scans and images read by a workspace's MinerU service, one segment per page, waiting on the service without spending retries; recordings read by a diarizing transcription model, speakers in the text and times in the anchor, an unlabelled transcript degrades) · scans and images through a MinerU service, recordings only with speaker labels (revised 2026-09-15) · a chunk carries an **origin** (`stated`, `ocr`, `transcribed`, `described`) and the model that produced it, and an **anchor** back into the original bytes (a page and region, a time range, an image inside the file) — decided before any media reader, because a transcript stored without its times can never be tied to the recording again · the packer never mixes origins in a chunk · facts from a description enter below `AUTO_CLOSE_MIN_CONFIDENCE`, so a misread chart opens a conflict instead of closing a correct fact · per-modality model settings, media reading as a resumable job, origin and anchor in the API, MCP and RDF · cuts: ledger shape, scans via MinerU, recordings, descriptions, video |
 | 0041 | [A name is a claim about an entity](0041-a-name-is-a-claim-about-an-entity.md) | Cut 0 built (identity bench) · cut 1 implemented (#670): names are value facts on `known_as`, the extractor reports other names, a shared name goes to the adjudicator; forward/reverse F1 0.43/0.54 → 0.68/0.68 · cuts 2–4 (name vectors and neighbours, evidence decides, re-evaluation) not started |
 | 0042 | [The chat loop is a runner with hooks](0042-the-chat-loop-is-a-runner-with-hooks.md) | Implemented (#548) · the loop is rig's runner and every policy is a hook with a typed result · the wire stays `LlmClient` behind `RigModel` · a turn cannot end before a tool has run, `no_evidence_needed` is the exit for questions not about the base · RAG fallback only on a 400/422 to the first request with tools · an empty reply is asked again once · the skip rate is the model's (DeepSeek-V3 1–3 of 12, Qwen2.5-72B 0) and recorded, not prevented |
+| 0044 | [The ontology is a view over what documents say](0044-the-ontology-is-a-view-over-what-documents-say.md) | Accepted · cut 1 built (#731, #735, #736, #741, #743–#745): extraction writes open statements, memory documents take the same path, the typed path is deleted, kind words bind to classes · cut 2 (alignment producing typed facts, identity profiles, the errata agent) not built · three layers: extraction writes an open graph in the documents' words (0 of 333 statements unstated in the prototype, against 4–9% of facts bound at write time), a small ontology proposed by an agent and approved by people, and a typed graph computed from the open graph on cached signatures · time mentions resolved against a document time context by code · identity across documents on deterministic evidence before the adjudicator · an errata agent reviews the typed graph |
+| 0045 | [A time mention is resolved against its document](0045-a-time-mention-is-resolved-against-its-document.md) | Accepted · cuts 1 and 2 built (#740): a document is dated from its own text, each mention is interpreted by the model and computed by code, upload time is used nowhere · cuts 3 and 4 (grades replace the confidence gate, re-resolution and the anchor queue) not built · a time expression is a mention with its words and place; the model returns shape, anchor, offset and granularity and code computes the interval; a document carries its own date, calendars and anchors across chunks, never its upload time; unresolved mentions wait for an anchor; timelines close on resolution grade instead of confidence |
+| | Record | Domain | Status |
+|---|---|---|---|
+| 0001 | [Ontology import and governance](0001-ontology-import-and-governance.md) | ontology | partly superseded (by 0009, 0010, 0012, 0044) |
+| 0002 | [Reasoning engine](0002-reasoning-engine.md) | rules | current |
+| 0003 | [The ontology grows out of the corpus](0003-ontology-growth-loop.md) | ontology | partly superseded (by 0007, 0010, 0044) |
+| 0004 | [Language follows the reader of each text](0004-language-and-localization.md) | interface | partly superseded (by 0044) |
+| 0005 | [The alert center](0005-alert-center.md) | interface | current |
+| 0006 | [Ontology scale and the extraction prompt](0006-ontology-scale-and-the-prompt.md) | extraction | superseded (by 0044) |
+| 0007 | [Counting decides what becomes a relation](0007-who-decides-what-becomes-a-relation.md) | ontology | partly superseded (by 0044) |
+| 0008 | [Ontology packs as the cold start](0008-ontology-packs-as-cold-start.md) | ontology | current |
+| 0009 | [An undecided type stays empty](0009-no-type-is-a-type.md) | ontology | current |
+| 0010 | [An unnamed relation stays empty](0010-no-relation-is-no-relation.md) | ledger | partly superseded (by 0044) |
+| 0011 | [A mapping is configuration](0011-a-mapping-is-not-a-fact.md) | lakehouse-and-actions | partly superseded (by 0036, 0044) |
+| 0012 | [The ontology is a contract](0012-the-ontology-is-a-contract-not-a-suggestion.md) | ontology | partly superseded (by 0044) |
+| 0013 | [A source hands over its history](0013-a-source-should-hand-over-its-history.md) | sources | current |
+| 0014 | [Identity from the person, scope from the token](0014-identity-from-the-person-scope-from-the-token.md) | access-and-audit | current |
+| 0015 | [A recorded sentence waits for a nod](0015-recording-a-sentence-is-not-asserting-a-fact.md) | governance | current |
+| 0016 | [Close the open seams before cutting new ones](0016-close-the-open-seams-before-cutting-new-ones.md) | process | partly superseded (by 0036) |
+| 0017 | [A contradiction points at an error upstream](0017-a-contradiction-points-upstream.md) | governance | current |
+| 0018 | [The lakehouse is one protocol away](0018-the-lakehouse-is-one-protocol-away.md) | lakehouse-and-actions | current |
+| 0019 | [The second clock can be rewound](0019-the-second-clock-can-be-rewound.md) | time | current |
+| 0020 | [An auditor reads it without us](0020-an-auditor-reads-it-without-us.md) | access-and-audit | current |
+| 0021 | [A rule reads attributes and concludes a type](0021-a-rule-reads-attributes-and-concludes-a-type.md) | rules | current |
+| 0022 | [An unknown date is not an open one](0022-an-unknown-date-is-not-an-open-one.md) | time | partly superseded (by 0045) |
+| 0023 | [RSS observations are not documents](0023-rss-observations-are-not-documents.md) | sources | current |
+| 0024 | [The world axis reaches the second](0024-the-world-axis-reaches-the-second.md) | time | current |
+| 0025 | [Governance reads the ledger before it decides](0025-governance-reads-the-ledger-before-it-decides.md) | governance | current |
+| 0026 | [A decision records why](0026-a-decision-records-why.md) | governance | current |
+| 0027 | [An automatic merge is gated by what it can undo](0027-an-automatic-merge-is-gated-by-what-it-can-undo.md) | governance | current |
+| 0028 | [The adjudicator looks before it asks](0028-the-adjudicator-looks-before-it-asks.md) | governance | current |
+| 0029 | [A rule may say "or", once](0029-a-rule-may-say-or-once.md) | rules | current |
+| 0030 | [A rule may read what a rule concluded](0030-a-rule-may-read-what-a-rule-concluded.md) | rules | current |
+| 0031 | [An event holds at the moment it names](0031-an-event-holds-at-the-moment-it-names.md) | time | current |
+| 0032 | [A rule computes what it concludes](0032-a-rule-computes-what-it-concludes.md) | rules | current |
+| 0033 | [RSS summaries are scoped to the source being listed](0033-rss-source-summaries-are-source-scoped.md) | sources | current |
+| 0034 | [An action is a declared call](0034-an-action-is-a-declared-call.md) | lakehouse-and-actions | proposed |
+| 0035 | [A vector index is built by a job](0035-a-vector-index-is-built-by-a-job.md) | sources | current |
+| 0036 | [Exploration aligns a schema to the ontology](0036-exploration-aligns-a-schema-to-the-ontology.md) | lakehouse-and-actions | current |
+| 0037 | [A relation carries its own attributes](0037-a-relation-carries-its-own-attributes.md) | ledger | partly superseded (by 0044) |
+| 0038 | [The interface has a light side](0038-the-interface-has-a-light-side.md) | interface | current |
+| 0039 | [A chunk is what extraction sees](0039-a-chunk-is-what-extraction-sees.md) | sources | current |
+| 0040 | [A chunk says where its words came from](0040-a-chunk-says-where-its-words-came-from.md) | sources | current |
+| 0041 | [A name is a claim about an entity](0041-a-name-is-a-claim-about-an-entity.md) | identity | current |
+| 0042 | [The chat loop is a runner with hooks](0042-the-chat-loop-is-a-runner-with-hooks.md) | chat-and-mcp | current |
+| 0044 | [The ontology is a view over what documents say](0044-the-ontology-is-a-view-over-what-documents-say.md) | ontology | current |
+| 0045 | [A time mention is resolved against its document](0045-a-time-mention-is-resolved-against-its-document.md) | time | current |
+
+The status word is whether a later record has overtaken this one; what is built is in the record's own status line. Domains are the files of [../design/](../design/README.md), where every record is dated and the status words are defined.
 
 ## Not a decision record
 
@@ -73,4 +125,4 @@ The test for writing one: if someone (including us) looks at a piece of code in 
 
 ## What does not belong here
 
-The `docs/` root is a local scratch area (`/docs/*` is git-ignored except `/docs/decisions/`). Research notes, temporary checklists and test output live there and stay out of the repository. When a draft settles into a judgment worth keeping, it moves here as a record.
+The `docs/` root is a local scratch area (`/docs/*` is git-ignored except `/docs/decisions/`, `/docs/design/` and `/docs/pipeline.md`). Research notes, temporary checklists and test output live there and stay out of the repository. When a draft settles into a judgment worth keeping, it moves here as a record.
