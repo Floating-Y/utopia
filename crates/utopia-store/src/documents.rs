@@ -1289,7 +1289,51 @@ pub async fn replace_chunks(
     document_id: Uuid,
     pieces: &[ChunkPiece],
 ) -> AppResult<Vec<(String, String)>> {
+    Ok(
+        replace_chunks_for_snapshot(pool, kb_id, document_id, pieces, None)
+            .await?
+            .unwrap_or_default(),
+    )
+}
+
+/// 慢读取不能覆盖新版本分块，也不能重新填入已删除文档。
+/// 返回 None 表示输入已过期，调用方应结束本次处理。
+pub async fn replace_chunks_if_current(
+    pool: &PgPool,
+    kb_id: Uuid,
+    document_id: Uuid,
+    pieces: &[ChunkPiece],
+    sha256: &str,
+) -> AppResult<Option<Vec<(String, String)>>> {
+    replace_chunks_for_snapshot(pool, kb_id, document_id, pieces, Some(sha256)).await
+}
+
+async fn replace_chunks_for_snapshot(
+    pool: &PgPool,
+    kb_id: Uuid,
+    document_id: Uuid,
+    pieces: &[ChunkPiece],
+    sha256: Option<&str>,
+) -> AppResult<Option<Vec<(String, String)>>> {
     let mut tx = pool.begin().await?;
+    // 两个任务可能同时处理同一文档。先锁父记录，即使还没有分块，
+    // 后一个任务也能认领前一个任务写入的行，避免重复插入。
+    //
+    // **`FOR NO KEY UPDATE`，不是 `FOR UPDATE`**：后者与外键检查要的 `FOR KEY SHARE`
+    // 冲突，于是这个事务活着的时候，这份文档所有子表的插入都被挡住（chunks、
+    // document_versions、memory::append），而这个事务是每个分块一个来回——四千块的
+    // 文档要锁四秒。两者对另一个 `replace_chunks` 的互斥是一样的
+    let current: Option<(String, bool)> = sqlx::query_as(
+        "SELECT sha256, deleted_at IS NOT NULL FROM documents WHERE id = $1 FOR NO KEY UPDATE",
+    )
+    .bind(document_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(expected) = sha256 {
+        if !matches!(current, Some((ref sha, false)) if sha == expected) {
+            return Ok(None);
+        }
+    }
     let (version,): (i32,) = sqlx::query_as(
         "SELECT COALESCE(MAX(version), 1) FROM document_versions WHERE document_id = $1",
     )
@@ -1412,7 +1456,7 @@ pub async fn replace_chunks(
         .await?;
     }
     tx.commit().await?;
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// 抽取完成一个分块即打标（认领的块携带标记跳过重抽；也让中断的抽取可续跑）。
