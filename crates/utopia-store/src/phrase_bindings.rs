@@ -50,6 +50,8 @@ pub struct PhraseSignature {
 
 /// 库里每条 distinct 的签名：活着的开放陈述，按短语、两端的类、宾语是不是字面值分组。
 pub async fn signatures(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<PhraseSignature>> {
+    // 一条陈述可以有多条证据。计数、取例句前先为每条陈述选一条稳定的引用，
+    // 优先有完整位置的证据，避免证据多的陈述挤掉其他陈述。
     let sql = format!(
         "WITH live AS (
              SELECT f.id, {phrase} AS phrase,
@@ -61,7 +63,12 @@ pub async fn signatures(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<PhraseSigna
              FROM facts f
              JOIN entities s ON s.id = f.subject_id
              LEFT JOIN entities o ON o.id = f.object_id
-             LEFT JOIN fact_evidence fe ON fe.fact_id = f.id
+             LEFT JOIN LATERAL (
+                 SELECT chunk_id, quote_start, quote_end FROM fact_evidence
+                 WHERE fact_id = f.id
+                 ORDER BY (quote_start IS NULL OR quote_end IS NULL), chunk_id
+                 LIMIT 1
+             ) fe ON true
              WHERE f.kb_id = $1 AND f.layer = 'open' AND f.invalidated_at IS NULL
                AND f.phrase IS NOT NULL AND btrim(f.phrase) <> ''
          ),
