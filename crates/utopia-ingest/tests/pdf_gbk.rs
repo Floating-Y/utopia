@@ -78,8 +78,32 @@ fn gbk_pdf(text: &str) -> Vec<u8> {
     bytes
 }
 
+/// 回退用的 `pdftotext` 是不是 Poppler。同名的程序有两个实现——Git for Windows 带的是
+/// Xpdf 4.00，它对这份文件退出码 0、输出为空——只有 Poppler 连着 `poppler-data` 的 CJK
+/// CMap 表读得了 `GBK-EUC-H`。
+fn fallback_is_poppler() -> bool {
+    let Ok(out) = std::process::Command::new("pdftotext").arg("-v").output() else {
+        return false;
+    };
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    said.to_lowercase().contains("poppler")
+}
+
 #[test]
 fn gbk_euc_h_pdf_extracts_chinese_text() {
+    if !fallback_is_poppler() {
+        // CI 装了 Poppler 并设了这个变量：那里不许跳过，否则绿色是假的
+        assert!(
+            std::env::var("UTOPIA_TEST_REQUIRE_PDFTOTEXT").is_err(),
+            "this run requires Poppler: install poppler-utils and poppler-data"
+        );
+        eprintln!("skipped: pdftotext on PATH is not Poppler");
+        return;
+    }
     let expected = "中文测试";
     let bytes = gbk_pdf(expected);
     let parsed = utopia_ingest::parse("sample.pdf", &bytes).unwrap();
