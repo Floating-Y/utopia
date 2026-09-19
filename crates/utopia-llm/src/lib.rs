@@ -477,7 +477,9 @@ impl LlmClient {
         // 端点开口了又半路没了：拼到一半的回复长得像成功，不做成错误就会被当成
         // 模型给的全部答案
         if !ended {
-            return Err(anyhow::Error::new(Interrupted { got: answer.len() }));
+            return Err(anyhow::Error::new(Interrupted {
+                got: answer.chars().count(),
+            }));
         }
         Ok(strip_reasoning(&answer).to_string())
     }
@@ -651,6 +653,9 @@ impl LlmClient {
                         let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
                             continue;
                         };
+                        if v["choices"][0]["finish_reason"].is_string() {
+                            done = true;
+                        }
                         let delta = &v["choices"][0]["delta"];
                         if let Some(text) = delta["content"].as_str() {
                             if !text.is_empty() {
@@ -683,7 +688,11 @@ impl LlmClient {
                     }
                 }
             }
-            let _ = done;
+            // HTTP 正常结束也可能只送到半个模型回合，不能把没收完的工具调用
+            // 当作完整回合交给 agent。
+            if !done {
+                Err(Interrupted { got: content.chars().count() })?;
+            }
             calls.retain(|c| !c.name.is_empty());
             let content = if content.is_empty() { None } else { Some(content) };
             yield ToolStreamItem::Turn(AssistantTurn { content, tool_calls: calls });
@@ -723,6 +732,8 @@ impl LlmClient {
         let mut bytes = resp.bytes_stream();
         let stream = async_stream::try_stream! {
             let mut buf = Vec::new();
+            let mut ended = false;
+            let mut got = 0;
             while let Some(part) = bytes.next().await {
                 let part = part?;
                 // 网络片段可能断在 UTF-8 字符中间，等完整 SSE 帧到齐再解码。
@@ -739,14 +750,21 @@ impl LlmClient {
                             return;
                         }
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
+                            if v["choices"][0]["finish_reason"].is_string() {
+                                ended = true;
+                            }
                             if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
                                 if !delta.is_empty() {
+                                    got += delta.chars().count();
                                     yield delta.to_string();
                                 }
                             }
                         }
                     }
                 }
+            }
+            if !ended {
+                Err(Interrupted { got })?;
             }
         };
         Ok(stream)
@@ -1053,6 +1071,113 @@ mod tests {
         };
         assert!(!is_unreachable(&error));
         assert!(error.to_string().contains(diagnosis), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn an_interruption_counts_characters_in_all_three_readers() {
+        use futures_util::TryStreamExt;
+        let sse = format!(
+            "data: {}\n\n",
+            json!({ "choices": [{"delta": {"content": "你好🦀"}}] })
+        );
+        for reader in ["collected", "raw", "tools"] {
+            let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+            let client = client_at(addr);
+            let error = match reader {
+                "collected" => client.chat_at_streaming(&[], None).await.unwrap_err(),
+                "raw" => client
+                    .chat_stream_raw(&[])
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap_err(),
+                _ => client
+                    .chat_tools_stream_with(&[], None, None)
+                    .await
+                    .unwrap()
+                    .try_collect::<Vec<_>>()
+                    .await
+                    .unwrap_err(),
+            };
+            server.await.unwrap();
+            assert_eq!(
+                error.downcast_ref::<Interrupted>().unwrap().got,
+                3,
+                "{reader}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_raw_stream_cut_before_its_finish_is_an_error() {
+        use futures_util::TryStreamExt;
+        let sse = format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{"delta": {"content": "partial answer"}}]
+            })
+        );
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+        let stream = client_at(addr).chat_stream_raw(&[]).await.unwrap();
+        let error = stream.try_collect::<Vec<_>>().await.unwrap_err();
+        server.await.unwrap();
+        assert!(error.downcast_ref::<Interrupted>().is_some(), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn a_tool_stream_cut_before_its_finish_is_an_error() {
+        use futures_util::TryStreamExt;
+        let sse = format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{"delta": {"tool_calls": [{
+                    "index": 0, "id": "call_1", "function": {
+                        "name": "lookup", "arguments": "{\"name\":"
+                    }
+                }]}}]
+            })
+        );
+        let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+        let stream = client_at(addr)
+            .chat_tools_stream_with(&[], None, None)
+            .await
+            .unwrap();
+        let error = stream.try_collect::<Vec<_>>().await.unwrap_err();
+        server.await.unwrap();
+        assert!(error.downcast_ref::<Interrupted>().is_some(), "{error:#}");
+    }
+
+    #[tokio::test]
+    async fn either_finish_signal_completes_raw_and_tool_streams() {
+        use futures_util::TryStreamExt;
+        for ending in [
+            "data: [DONE]\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        ] {
+            let sse = format!(
+                "data: {}\n\n{ending}",
+                json!({
+                    "choices": [{"delta": {"content": "whole answer"}}]
+                })
+            );
+            let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+            let stream = client_at(addr).chat_stream_raw(&[]).await.unwrap();
+            let chunks: Vec<String> = stream.try_collect().await.unwrap();
+            server.await.unwrap();
+            assert_eq!(chunks.concat(), "whole answer");
+            let (addr, server) = an_http_response("200 OK", "text/event-stream", &sse).await;
+            let stream = client_at(addr)
+                .chat_tools_stream_with(&[], None, None)
+                .await
+                .unwrap();
+            let items: Vec<ToolStreamItem> = stream.try_collect().await.unwrap();
+            server.await.unwrap();
+            let Some(ToolStreamItem::Turn(turn)) = items.last() else {
+                panic!("missing completed turn")
+            };
+            assert_eq!(turn.content.as_deref(), Some("whole answer"));
+        }
     }
 
     /// 流式的一次问答收成整段：只要 `delta.content`，推理的增量不进返回值，
