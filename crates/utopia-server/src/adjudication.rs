@@ -56,6 +56,35 @@ fn wants_another_look(
     unsettled && !ruled && p.reverts.is_empty()
 }
 
+/// 名字向量召回提的对（0041 第 2 刀）：两个**不同的字符串**因相近而被放到一起。
+/// 「因相似而提议」和「因同名而提议」是两种证据强度，不该用同一根线自动合：批量裁决只看
+/// 名字和几条事实，测量台上它把「张伟」并进了「财务部总监张伟」（0.85，过了线）。所以这类
+/// 对的 same 一律走带工具的第二眼——它能读两边的事实与原文再定；different 与 unsure
+/// 照旧，分开是安全的方向。不看 `ruled` 与撤回：那两条是「再看也改不了」的省事，这里要的
+/// 恰恰是再看
+fn similarity_proposed(item: &ReviewItem) -> bool {
+    utopia_core::review_reasons::similarity_proposed(item.reason.as_deref())
+}
+
+fn needs_second_look(
+    item: &ReviewItem,
+    p: &gov::Precedents,
+    same: Option<bool>,
+    conf: f32,
+) -> bool {
+    wants_another_look(item, p, same, conf) || !batch_verdict_may_apply(item, same)
+}
+
+/// 攒批那一眼的看法能不能不经第二眼就落地。名字向量提的对说 same 不能：第二眼没跑成
+/// （预算用完、模型出错）就上交给人，不照攒批的看法合，也不把那个看法记进缓存——记了
+/// 之后这一对每次再来都从缓存直接合，第二眼永远轮不到（#889 评审）
+pub(crate) fn batch_verdict_may_apply(item: &ReviewItem, same: Option<bool>) -> bool {
+    !(similarity_proposed(item) && same == Some(true))
+}
+
+/// 第二眼没跑成时上交的理由
+pub(crate) const SECOND_LOOK_UNAVAILABLE: &str = "escalate_unsure|second_look_unavailable";
+
 /// 一次裁决落地成了什么：第二层的行按它记 applied 还是 proposed
 enum Outcome {
     Merged(Uuid),
@@ -201,6 +230,9 @@ pub async fn adjudicate_entities(state: &AppState, kb_id: Uuid) -> anyhow::Resul
                         facts: item.right.top_facts.clone(),
                     },
                     precedents: precedents.clone(),
+                    proposed_because: utopia_extract::proposed_because(
+                        utopia_core::review_reasons::name_vector_cosine(item.reason.as_deref()),
+                    ),
                 },
             )
             .collect();
@@ -227,7 +259,7 @@ pub async fn adjudicate_entities(state: &AppState, kb_id: Uuid) -> anyhow::Resul
                     let conf = v.confidence.unwrap_or(0.5).clamp(0.0, 1.0);
                     // 第二层（0028）：攒批没定的，带工具再看一遍再落地。预算用完或
                     // 循环没跑成就照攒批的看法办
-                    if wants_another_look(item, p, same, conf) {
+                    if needs_second_look(item, p, same, conf) {
                         let earlier = Look::from_batch(same, conf, v.why.clone());
                         if let Some(look) = look_again(
                             state,
@@ -271,6 +303,16 @@ pub async fn adjudicate_entities(state: &AppState, kb_id: Uuid) -> anyhow::Resul
                                 Outcome::Escalated
                             };
                             record_look(state, kb_id, run_id, item, p, &look, &outcome).await?;
+                            continue;
+                        }
+                        // 第二眼没跑成：相似提的 same 不能照攒批的看法合，也不进缓存
+                        if !batch_verdict_may_apply(item, same) {
+                            utopia_store::resolution::escalate_review(
+                                &state.pool,
+                                item.id,
+                                SECOND_LOOK_UNAVAILABLE,
+                            )
+                            .await?;
                             continue;
                         }
                     }
@@ -431,4 +473,77 @@ async fn apply_verdict(
         }
     };
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use utopia_core::models::{ReviewItem, ReviewSide};
+
+    fn item(reason: &str) -> ReviewItem {
+        let side = |name: &str| ReviewSide {
+            id: Uuid::now_v7(),
+            name: name.into(),
+            type_label: Some("person".into()),
+            color: String::new(),
+            disambiguator: None,
+            degree: 0,
+            top_facts: vec![],
+        };
+        ReviewItem {
+            id: Uuid::now_v7(),
+            score: 0.78,
+            reason: Some(reason.into()),
+            stage: "adjudicating".into(),
+            created_at: chrono::Utc::now(),
+            left: side("张伟"),
+            right: side("财务部总监张伟"),
+            proposal: None,
+        }
+    }
+
+    /// 名字向量提的对：批量说 same 再有把握也要第二眼；说 different / unsure 照旧
+    #[test]
+    fn a_similarity_proposed_same_always_gets_the_second_look() {
+        let p = gov::Precedents::default();
+        let it = item("name_vector|0.78");
+        assert!(needs_second_look(&it, &p, Some(true), 0.99));
+        assert!(needs_second_look(&it, &p, Some(true), 0.85));
+        assert!(
+            !needs_second_look(&it, &p, Some(false), 0.9),
+            "分开是安全方向，照旧落地"
+        );
+        assert!(needs_second_look(&it, &p, None, 0.5), "没定的本来就要再看");
+    }
+
+    /// 第二眼没跑成时：相似提的 same 不落地也不进缓存；其余照攒批的看法办
+    #[test]
+    fn a_similarity_proposed_same_never_applies_on_the_batch_verdict_alone() {
+        assert!(!batch_verdict_may_apply(
+            &item("name_vector|0.78"),
+            Some(true)
+        ));
+        assert!(batch_verdict_may_apply(
+            &item("name_vector|0.78"),
+            Some(false)
+        ));
+        assert!(batch_verdict_may_apply(&item("name_vector|0.78"), None));
+        assert!(batch_verdict_may_apply(
+            &item("ambiguous_name|0.41"),
+            Some(true)
+        ));
+        assert!(batch_verdict_may_apply(
+            &item("shared_name|张伟"),
+            Some(true)
+        ));
+    }
+
+    /// 同名家族的对不受影响：够线就照旧自动落地
+    #[test]
+    fn a_same_name_pair_keeps_the_old_rule() {
+        let p = gov::Precedents::default();
+        let it = item("ambiguous_name|0.41");
+        assert!(!needs_second_look(&it, &p, Some(true), 0.9));
+        assert!(needs_second_look(&it, &p, Some(true), 0.6), "不到线才再看");
+    }
 }
