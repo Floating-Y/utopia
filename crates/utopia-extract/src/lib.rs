@@ -10,7 +10,9 @@ use serde::Deserialize;
 use utopia_llm::ChatMessage;
 
 pub mod align;
+pub mod errata;
 pub mod governor;
+pub mod implication;
 pub mod open;
 pub mod phrase_align;
 pub mod time;
@@ -144,6 +146,23 @@ pub struct AdjudicationPair {
     pub right: AdjudicationSide,
     /// 这个库里的人对这一对、这个名字、这种类型对做过什么（0025）。空就不提
     pub precedents: Vec<String>,
+    /// 这一对是**怎么**被提出来的，只在提议依据不是「同名」时写：名字向量召回（0041 第 2 刀）
+    /// 提的是两个**不同的字符串**，裁决器不知道这一点就会把「张伟」当成「财务部总监张伟」
+    /// 去掉限定词后的同一个人——测量台上那次错合就是这么来的。空就不提，同名对照旧
+    pub proposed_because: Option<String>,
+}
+
+/// 名字向量召回提的对，写成裁决器读得懂的一句提议依据；`cosine` 是召回记下的余弦文本
+/// （`utopia_core::review_reasons::name_vector_cosine` 从审核对的 reason 里取）。其余原因
+/// （同名灰区、同名并列、包含）都是「同一个字符串」的家族，裁决器的规则本来就是为它们写的，
+/// 传 None
+pub fn proposed_because(cosine: Option<&str>) -> Option<String> {
+    let cosine = cosine?;
+    Some(format!(
+        "the names are similar but NOT the same string (name-vector cosine {cosine}): this may be a \
+         short form, another script, or a different thing with a similar name; a dropped qualifier is \
+         not evidence here, the facts are"
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -289,8 +308,13 @@ pub fn build_adjudication_messages(pairs: &[AdjudicationPair]) -> Vec<ChatMessag
                 .join("\n");
             format!("Precedents (decided by people in this base):\n{lines}\n")
         };
+        let why_paired = p
+            .proposed_because
+            .as_deref()
+            .map(|w| format!("Why paired: {w}\n"))
+            .unwrap_or_default();
         user.push_str(&format!(
-            "Pair {i}:\nRecord A: {}\nRecord B: {}\n{precedents}\n",
+            "Pair {i}:\nRecord A: {}\nRecord B: {}\n{why_paired}{precedents}\n",
             fmt(&p.left),
             fmt(&p.right)
         ));
@@ -371,16 +395,16 @@ pub(crate) fn currency_unit(tok: &str) -> Option<&'static str> {
     )
 }
 
-/// 量级词：英文全写，中文千/万/亿。**不认单字母**（`3M` 是一家公司）。
-fn magnitude(tok: &str) -> Option<f64> {
+/// 量级词对应的十进制指数：英文全写，中文千/万/亿。**不认单字母**（`3M` 是一家公司）。
+fn magnitude(tok: &str) -> Option<u8> {
     Some(match tok {
-        "thousand" | "千" => 1e3,
-        "万" => 1e4,
-        "million" | "百万" => 1e6,
-        "千万" => 1e7,
-        "亿" => 1e8,
-        "billion" | "十亿" => 1e9,
-        "trillion" | "万亿" => 1e12,
+        "thousand" | "千" => 3,
+        "万" => 4,
+        "million" | "百万" => 6,
+        "千万" => 7,
+        "亿" => 8,
+        "billion" | "十亿" => 9,
+        "trillion" | "万亿" => 12,
         _ => return None,
     })
 }
@@ -435,7 +459,10 @@ fn scan_quantity(s: &str, strict: bool) -> Option<(f64, Option<String>)> {
         let (tok, next) = next_token(tail);
         if !ate_magnitude {
             if let Some(m) = magnitude(tok) {
-                n *= m;
+                // Parse the written decimal with its scale in one conversion. Multiplying
+                // an already rounded f64 needs an epsilon that can erase real fractions.
+                // The suffix is at most three bytes (e12), so allocation stays O(num.len()).
+                n = format!("{cleaned}e{m}").parse().ok()?;
                 ate_magnitude = true;
                 tail = next.trim_start();
                 continue;
@@ -455,10 +482,6 @@ fn scan_quantity(s: &str, strict: bool) -> Option<(f64, Option<String>)> {
     }
     if !n.is_finite() {
         return None;
-    }
-    // 9.2 × 1e8 在二进制浮点里是 919999999.9999999；乘过量级词的数本来就是整数，收回去
-    if ate_magnitude && (n - n.round()).abs() < 1e-6 * n.abs().max(1.0) {
-        n = n.round();
     }
     let unit = if percent {
         Some("%".to_string())
@@ -759,6 +782,97 @@ mod tests {
     }
 
     #[test]
+    fn written_magnitudes_preserve_fractional_values() {
+        for (input, expected) in [
+            ("1.00000025 million", 1000000.25),
+            ("100.000025万", 1000000.25),
+            ("-1.00000025 million", -1000000.25),
+            ("+100.000025万", 1000000.25),
+            ("9.2亿", 920000000.0),
+            ("0.00000000025 thousand", 0.00000025),
+            ("0 million", 0.0),
+            ("1,000.00025 thousand", 1000000.25),
+        ] {
+            assert_eq!(parse_quantity(input), Some((expected, None)), "{input}");
+            assert_eq!(
+                parse_leading_quantity(input),
+                Some((expected, None)),
+                "{input}"
+            );
+            assert_eq!(
+                normalize_attr_value("number", &serde_json::json!(input)),
+                Some(serde_json::json!(expected)),
+                "{input}"
+            );
+        }
+        assert_eq!(
+            parse_quantity("$1.00000025 million"),
+            Some((1000000.25, Some("$".into())))
+        );
+        assert_eq!(
+            parse_leading_quantity("1.00000025 million people worldwide"),
+            Some((1000000.25, Some("people".into())))
+        );
+        for rejected in [
+            "3M",
+            "5k",
+            "1e3 million",
+            "1.2.3 million",
+            "--1 million",
+            "1 million people",
+        ] {
+            assert_eq!(parse_quantity(rejected), None, "{rejected}");
+        }
+        assert_eq!(
+            parse_quantity(&format!("{} trillion", "9".repeat(400))),
+            None
+        );
+        assert_eq!(
+            parse_quantity(&format!("{}1.00000025 million", "0".repeat(20_000))),
+            Some((1000000.25, None))
+        );
+    }
+
+    #[test]
+    fn written_magnitudes_match_integer_decimal_oracles() {
+        // The oracle shifts exact u128 integers, then parses an ordinary decimal.
+        // No float multiplication or epsilon can erase a meaningful remainder.
+        for (word, exponent) in [
+            ("thousand", 3),
+            ("万", 4),
+            ("million", 6),
+            ("千万", 7),
+            ("亿", 8),
+            ("billion", 9),
+            ("trillion", 12),
+        ] {
+            for coefficient in [0u128, 1, 25, 100000025, 9200000000, 9007199254740991] {
+                for places in 0..=15u32 {
+                    let divisor = 10u128.pow(places);
+                    let expanded = coefficient * 10u128.pow(exponent);
+                    let decimal = |n: u128| {
+                        if places == 0 {
+                            n.to_string()
+                        } else {
+                            format!(
+                                "{}.{:0width$}",
+                                n / divisor,
+                                n % divisor,
+                                width = places as usize
+                            )
+                        }
+                    };
+                    for sign in ["", "-"] {
+                        let input = format!("{sign}{} {word}", decimal(coefficient));
+                        let expected: f64 = format!("{sign}{}", decimal(expanded)).parse().unwrap();
+                        assert_eq!(parse_quantity(&input), Some((expected, None)), "{input}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn a_quantity_is_the_whole_string_or_nothing() {
         // 整体就是一个量：符号、量级词、千分位都读得动
         assert_eq!(parse_quantity("$5 billion"), Some((5e9, Some("$".into()))));
@@ -973,6 +1087,46 @@ mod tests {
             read_time("17 Mar 2020").map(|(t, p)| (t.date_naive().to_string(), p)),
             Some(("2020-03-17".to_string(), "day"))
         );
+    }
+
+    #[test]
+    fn a_similarity_proposed_pair_says_so_in_the_prompt() {
+        let side = |name: &str| AdjudicationSide {
+            name: name.into(),
+            type_label: "person".into(),
+            facts: vec![],
+        };
+        let pairs = vec![
+            AdjudicationPair {
+                left: side("张伟"),
+                right: side("财务部总监张伟"),
+                precedents: vec![],
+                proposed_because: proposed_because(Some("0.78")),
+            },
+            AdjudicationPair {
+                left: side("张伟"),
+                right: side("张伟"),
+                precedents: vec![],
+                proposed_because: proposed_because(None),
+            },
+        ];
+        let user = &build_adjudication_messages(&pairs)[1].content;
+        let first = &user[..user.find("Pair 1:").unwrap()];
+        let second = &user[user.find("Pair 1:").unwrap()..];
+        assert!(
+            first.contains("Why paired:") && first.contains("cosine 0.78"),
+            "{first}"
+        );
+        assert!(
+            !second.contains("Why paired:"),
+            "同名对不该带这一行：{second}"
+        );
+    }
+
+    #[test]
+    fn a_proposal_note_needs_a_cosine() {
+        assert!(proposed_because(Some("0.62")).is_some());
+        assert!(proposed_because(None).is_none());
     }
 
     #[test]

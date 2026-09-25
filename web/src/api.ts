@@ -1,5 +1,6 @@
 import type { SourceKind } from "./sourceKinds";
 import { S, lang } from "./i18n";
+import { createParser } from "eventsource-parser";
 
 export class ApiError extends Error {
   status: number;
@@ -257,6 +258,8 @@ export interface Readiness {
 export interface LlmSettingsView {
   chat_base_url?: string | null;
   chat_model?: string | null;
+  /** 推理强度：minimal | low | medium | high；空 = 端点默认 */
+  chat_reasoning_effort?: string | null;
   has_chat_key?: boolean;
   embed_base_url?: string | null;
   embed_model?: string | null;
@@ -356,16 +359,19 @@ export interface RuleCondition {
   /** 数字 / [lo,hi] / 字符串数组；present 不带 */
   operand?: unknown;
   predicate_label?: string;
+  /** x = rule subject (default); y = the entity reached by the one declared join */
+  side?: "x" | "y";
 }
 
 export interface RuleInput {
   name: string;
   description?: string;
   subject_type_id: string;
-  /** typing = 推出一个类；attribute = 推出一个属性值 */
-  conclusion: "typing" | "attribute";
+  /** typing = class; attribute = value; relation = an edge to the joined Y */
+  conclusion: "typing" | "attribute" | "relation";
   conclude_type_id?: string;
   conclude_predicate_id?: string;
+  join_predicate_id?: string;
   conclude_value?: unknown;
   conditions: RuleCondition[];
 }
@@ -378,20 +384,51 @@ export interface RuleMatch {
   concluded: string | null;
   valid_from: string | null;
   valid_to: string | null;
+  object_id?: string | null;
+  object_entity?: string | null;
+  relation_predicate?: string | null;
   /** 「全烃 = 12.3」这种可读形态，按前提顺序 */
   premises: string[];
 }
 
-export interface BusinessRule extends RuleInput {
+export interface BusinessRule extends Omit<RuleInput, "conclusion" | "join_predicate_id"> {
+  conclusion: "typing" | "attribute" | "computed" | "relation";
+  /** Raw server tree; unsupported nodes must remain read-only. */
+  conclude_expr?: unknown;
   id: string;
   enabled: boolean;
   subject_label: string;
   conclude_type_label: string | null;
   conclude_predicate_label: string | null;
+  join_predicate_id?: string | null;
+  join_predicate_label?: string | null;
   /** 此刻凭它成立的结论条数 */
   derived_count: number;
   /** 上次跑的时候有几个实体的读数组合没展开完。**大于零就意味着少推了** */
   capped: number;
+  /** 当前定义是第几版。改判据或结论就加一，改名不算。老的夹具没有它，界面按第 1 版读 */
+  version?: number;
+}
+
+/** 规则定义史的一版：说了什么、从什么时候到什么时候、此刻凭它成立几条 */
+export interface RuleVersion {
+  id: string;
+  seq: number;
+  definition: {
+    subject_type_id: string;
+    conclusion: BusinessRule["conclusion"];
+    conclude_type_id: string | null;
+    conclude_predicate_id: string | null;
+    conclude_value: unknown;
+    conclude_expr: unknown;
+    join_predicate_id: string | null;
+    conditions: { group: number; seq: number; side: string; predicate_id: string; op: string; operand: unknown }[];
+  };
+  recorded_at: string;
+  superseded_at: string | null;
+  derived_count: number;
+  /** 定义里提到的类与谓词现在叫什么；改名或删掉的查不到，界面就显示 id */
+  labels: Record<string, string>;
 }
 
 export interface DerivedFact {
@@ -407,6 +444,8 @@ export interface DerivedFact {
   rule: "transitive" | "symmetric" | "inverse" | "sub_property" | "business";
   /** 业务规则的名字。公理推的为 null——公理没有名字 */
   rule_name?: string | null;
+  /** 凭业务规则定义的哪一版推出的。公理推的为 null */
+  rule_version?: number | null;
   valid_from: string | null;
   valid_to: string | null;
   confidence: number;
@@ -433,7 +472,12 @@ export interface BlockedDerivation {
   premises: string[];
 }
 
-/** 证明的一步：一条断言前提，带它的证据。前提一律是断言，所以证明是链不是树 */
+/** 证明的一步：一条前提，连同它的证据（0002 R2）。
+ *
+ * 那一步自己的前提在 `premises` 里再往下一层。所以证明是一棵树，
+ * 深度与推理同一条上限。断言那一步 `premises` 是空的——它的叶子是
+ * `evidence` 里的原句，不必再往下问
+ */
 export interface ProofStep {
   seq: number;
   fact_id: string;
@@ -449,6 +493,8 @@ export interface ProofStep {
   /** 这条前提后来被撤了；派生随之失效，证明仍要读得出当时靠的是什么 */
   retracted: boolean;
   evidence: Evidence[];
+  /** 这一步自己的前提（0030）：按 seq 展开的子证明。叶子的 premises 为空 */
+  premises: ProofStep[];
 }
 
 export interface Proof {
@@ -469,6 +515,8 @@ export type ReviewQueue =
   | "defects"
   // 对齐器两票不一致的签名与类别词（#725，0044 决定 3）
   | "alignment"
+  // 勘误 agent 被闸门拦下、等人答的动作（0044 决定 7）
+  | "errata"
   | "merges"
   // agent 的每一笔（0025）：建议、自动裁决与人的回答
   | "agent";
@@ -492,6 +540,8 @@ export interface ReviewCounts {
   defects: number;
   /** 对齐器拿不定的签名与类别词（#725） */
   alignment: number;
+  /** 勘误 agent 留给人的动作（0044 决定 7） */
+  errata: number;
   merges: number;
   /** agent 写下、等人回答的建议（0025） */
   agent: number;
@@ -709,7 +759,13 @@ export type AlignmentItem =
       object_is_value: boolean;
       statement_count: number;
       examples: string[];
-      votes: { first?: AlignmentVote | null; second?: AlignmentVote | null } | null;
+      /** 两票；候选多到没问模型时两票为空、`reason` 说明（0053） */
+      votes: {
+        first?: AlignmentVote | null;
+        second?: AlignmentVote | null;
+        reason?: string;
+        candidates?: number;
+      } | null;
       decided_at: string;
     }
   | {
@@ -721,7 +777,41 @@ export type AlignmentItem =
       entity_count: number;
       votes: { first?: string | null; second?: string | null } | null;
       decided_at: string;
+    }
+  | {
+      /** 对齐器提的一条蕴含规则（0044 决定 3 第五片） */
+      kind: "rule";
+      id: string;
+      trigger: "phrase" | "kind_word";
+      phrase: string;
+      subject_class: string | null;
+      object_class: string | null;
+      object_is_value: boolean;
+      property: string;
+      property_label: string;
+      reading: string | null;
+      statement_count: number;
+      examples: string[];
+      votes: { agent?: { property: string; reading: string | null } | null } | null;
+      decided_at: string;
     };
+/** 勘误 agent 被闸门拦下的一笔（0044 决定 7）：它想撤、改或加什么，凭哪句原话，为什么留给人 */
+export interface ErrataItem {
+  id: string;
+  document_id: string;
+  document: string;
+  action: "retract" | "revise" | "add";
+  /** 结构报的理由；空 = 抽样看到的 */
+  flag: "domain" | "range" | "name_absent" | "no_date" | null;
+  fact_id: string | null;
+  /** 动作指向的那条事实：撤的就是看的那条，改的是改成的，加的是加的 */
+  proposed: { subject: string; property: string; object: string } | null;
+  reason: string;
+  quote: string | null;
+  /** 闸门的理由：`derived 2` / `answered 1` / `contradiction CEO of`（0027 的写法） */
+  detail: string | null;
+  created_at: string;
+}
 export interface AlignmentVote {
   property: string;
   direction: "forward" | "reverse";
@@ -869,7 +959,8 @@ export interface ReviewSummary {
     | "lowconf"
     | "violations"
     | "defects"
-    | "alignment",
+    | "alignment"
+    | "errata",
     QueueWait
   >;
   decided: {
@@ -1897,9 +1988,10 @@ export const api = {
       enabled?: boolean;
       conditions?: RuleCondition[];
       /** 结论整组替换：三格互相定义，只改一格会留下半截状态 */
-      conclusion?: "typing" | "attribute";
+      conclusion?: "typing" | "attribute" | "relation";
       conclude_type_id?: string;
       conclude_predicate_id?: string;
+      join_predicate_id?: string;
       conclude_value?: unknown;
     },
   ) =>
@@ -1912,6 +2004,9 @@ export const api = {
     request<{ matches: RuleMatch[]; total: number }>(
       `/api/v1/kbs/${kbId}/rules/${ruleId}/matches?page=${page}&per=${per}`,
     ),
+  /** 一条规则的定义史：改过几次、每一版怎么说 */
+  ruleVersions: (kbId: string, ruleId: string) =>
+    request<{ versions: RuleVersion[] }>(`/api/v1/kbs/${kbId}/rules/${ruleId}/versions`),
   deleteRule: (kbId: string, ruleId: string) =>
     request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/rules/${ruleId}`, {
       method: "DELETE",
@@ -2298,17 +2393,31 @@ export const api = {
       defects_found: number;
       defects_new: number;
     }>(`/api/v1/kbs/${kbId}/consistency/check`, { method: "POST" }),
-  /** 人定一条短语签名：属性与方向，或没有（陈述留在开放图谱）。类型化图谱立刻重算 */
+  /** 人定一条短语签名：属性与方向，或没有（陈述留在开放图谱）。判定和它的重算任务
+   *  一次提交，答 202 和 job id（0051）；类型化图谱在后台重算，`review` / `graph`
+   *  事件到了就是算完了，也可以拿 job id 去 `/kbs/{id}/jobs/{job_id}` 问 */
   decideAlignmentPhrase: (
     kbId: string,
     bindingId: string,
     property: string | null,
     direction: "forward" | "reverse",
   ) =>
-    request<{ ok: boolean; typed: { added: number; merged: number; retired: number } }>(
+    request<{ ok: boolean; job_id: number; status: "accepted" }>(
       `/api/v1/kbs/${kbId}/review/alignment/phrases/${bindingId}`,
       { method: "POST", body: JSON.stringify({ property, direction }) },
     ),
+  /** 人批或驳一条蕴含规则：答 202 和 job id，隐含事实在后台算（0044 决定 3 第五片） */
+  decideAlignmentRule: (kbId: string, ruleId: string, approve: boolean) =>
+    request<{ ok: boolean; job_id: number; status: "accepted" }>(
+      `/api/v1/kbs/${kbId}/review/alignment/rules/${ruleId}`,
+      { method: "POST", body: JSON.stringify({ approve }) },
+    ),
+  /** 人答勘误 agent 留下的一笔（0044 决定 7）：批了就执行，否了只记 */
+  decideErrata: (kbId: string, actionId: string, approve: boolean) =>
+    request<{ ok: boolean }>(`/api/v1/kbs/${kbId}/review/errata/${actionId}`, {
+      method: "POST",
+      body: JSON.stringify({ approve }),
+    }),
   /** 人定一个类别词：类，或没有。它名下的实体换类，短语签名跟着重判 */
   decideAlignmentKindWord: (kbId: string, kindWord: string, cls: string | null) =>
     request<{ ok: boolean }>(
@@ -2552,6 +2661,7 @@ export function reattachChat(
         signal,
       }),
     handlers,
+    true,
   );
 }
 
@@ -2577,57 +2687,73 @@ export function streamChat(
 function consumeChatStream(
   open: (signal: AbortSignal) => Promise<Response>,
   handlers: ChatHandlers,
+  allowIdle = false,
 ): () => void {
   const controller = new AbortController();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let terminal = false;
+  const fail = (message: string) => {
+    if (terminal || controller.signal.aborted) return;
+    terminal = true;
+    handlers.onError(message);
+  };
   (async () => {
     try {
       const res = await open(controller.signal);
+      if (controller.signal.aborted) {
+        await res.body?.cancel();
+        return;
+      }
       if (!res.ok || !res.body) {
         let message = res.statusText;
         try {
           const body = (await res.json()) as { error?: string };
           if (body.error) message = body.error;
-        } catch {
-          /* ignore */
-        }
-        handlers.onError(message);
+        } catch { /* keep the HTTP status */ }
+        fail(message);
         return;
       }
-      const reader = res.body.getReader();
+      reader = res.body.getReader();
       const decoder = new TextDecoder();
-      let buf = "";
-      for (;;) {
+      let trailingCr = false;
+      const parser = createParser({ onEvent: ({ event, data: value }) => {
+        if (terminal || controller.signal.aborted) return;
+        if (event === "done") { terminal = true; handlers.onDone(); }
+        else if (event === "error") fail(value);
+        else if (event === "idle") {
+          if (allowIdle) { terminal = true; handlers.onIdle?.(); }
+          else fail(S.ask.streamInterrupted);
+        } else if (event === "conversation") handlers.onConversation(JSON.parse(value).id);
+        else if (event === "sources") handlers.onSources(JSON.parse(value));
+        else if (event === "step") handlers.onStep(JSON.parse(value));
+        else if (event === "delta") handlers.onDelta(JSON.parse(value).text);
+        else if (event === "snapshot") handlers.onSnapshot?.(JSON.parse(value));
+      } });
+      while (!terminal && !controller.signal.aborted) {
         const { done, value } = await reader.read();
-        if (done) break;
-        buf += decoder.decode(value, { stream: true });
-        let idx: number;
-        while ((idx = buf.indexOf("\n\n")) >= 0) {
-          const frame = buf.slice(0, idx);
-          buf = buf.slice(idx + 2);
-          let event = "message";
-          let data = "";
-          for (const line of frame.split("\n")) {
-            if (line.startsWith("event:")) event = line.slice(6).trim();
-            else if (line.startsWith("data:")) data += line.slice(5).trim();
-          }
-          if (event === "conversation")
-            handlers.onConversation((JSON.parse(data) as { id: string }).id);
-          else if (event === "sources")
-            handlers.onSources(JSON.parse(data || "[]"));
-          else if (event === "step")
-            handlers.onStep(JSON.parse(data) as ChatStep);
-          else if (event === "delta")
-            handlers.onDelta((JSON.parse(data) as { text: string }).text);
-          else if (event === "snapshot") handlers.onSnapshot?.(JSON.parse(data));
-          else if (event === "idle") handlers.onIdle?.();
-          else if (event === "done") handlers.onDone();
-          else if (event === "error") handlers.onError(data);
+        if (done) {
+          // v3 holds a final CR until the next character confirms its line ending.
+          if (trailingCr) parser.feed("\n");
+          break;
         }
+        if (controller.signal.aborted) break;
+        const chunk = decoder.decode(value, { stream: true });
+        if (chunk) trailingCr = chunk.endsWith("\r");
+        parser.feed(chunk);
       }
-      handlers.onDone();
+      // EOF never dispatches an incomplete frame and is not an application done.
+      fail(S.ask.streamInterrupted);
     } catch (e) {
-      if (!controller.signal.aborted) handlers.onError(String(e));
+      fail(e instanceof SyntaxError ? S.ask.streamInterrupted : String(e));
+    } finally {
+      if (reader) {
+        try { await reader.cancel(); } catch { /* terminal/abort already decided */ }
+        reader.releaseLock();
+      }
     }
   })();
-  return () => controller.abort();
+  return () => {
+    controller.abort();
+    void reader?.cancel().catch(() => {});
+  };
 }

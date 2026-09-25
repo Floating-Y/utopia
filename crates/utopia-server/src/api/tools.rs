@@ -375,30 +375,88 @@ pub async fn list_rules(ctx: &ToolCtx<'_>) -> ToolResult {
             json!({ "kind": "tool", "label": "list_rules", "detail": "none" }),
         );
     }
+    let expressions: Vec<_> = rules
+        .iter()
+        .filter(|r| r["conclusion"] == "computed")
+        .map(|r| &r["conclude_expr"])
+        .collect();
+    let Ok(descriptions) = utopia_store::business_rules::describe_expressions(
+        &ctx.state.pool,
+        ctx.kb_id,
+        &expressions,
+    )
+    .await
+    else {
+        return ToolResult::new(
+            "Could not read the rules.".to_string(),
+            json!({ "kind": "tool", "label": "list_rules", "detail": "failed" }),
+        )
+        .error();
+    };
+    let mut descriptions = descriptions.into_iter();
     let text = rules
         .iter()
         .map(|r| {
             let conditions = r["conditions"]
                 .as_array()
                 .map(|cs| {
-                    cs.iter()
-                        .map(|c| {
-                            format!(
-                                "{} {} {}",
-                                c["predicate_label"].as_str().unwrap_or("?"),
-                                c["op"].as_str().unwrap_or("?"),
-                                c["operand"]
-                                    .as_str()
-                                    .map(str::to_string)
-                                    .unwrap_or_else(|| c["operand"].to_string()),
-                            )
+                    // The store orders conditions by group and sequence. Keep that
+                    // order while showing the same OR-of-ANDs the evaluator uses.
+                    let mut groups: Vec<(i64, Vec<String>)> = Vec::new();
+                    for c in cs {
+                        let group = c["group"].as_i64().unwrap_or(0);
+                        // Legacy conditions have no side and mean the subject;
+                        // keep their familiar unprefixed text while disambiguating Y.
+                        let side = if c["side"] == "y" { "Y." } else { "" };
+                        let condition = format!(
+                            "{side}{} {} {}",
+                            c["predicate_label"].as_str().unwrap_or("?"),
+                            c["op"].as_str().unwrap_or("?"),
+                            c["operand"]
+                                .as_str()
+                                .map(str::to_string)
+                                .unwrap_or_else(|| c["operand"].to_string()),
+                        );
+                        if let Some((_, conditions)) =
+                            groups.last_mut().filter(|(g, _)| *g == group)
+                        {
+                            conditions.push(condition);
+                        } else {
+                            groups.push((group, vec![condition]));
+                        }
+                    }
+                    let alternatives = groups.len() > 1;
+                    groups
+                        .into_iter()
+                        .map(|(_, conditions)| {
+                            let text = conditions.join(" AND ");
+                            if alternatives && conditions.len() > 1 {
+                                format!("({text})")
+                            } else {
+                                text
+                            }
                         })
                         .collect::<Vec<_>>()
-                        .join(" AND ")
+                        .join(" OR ")
                 })
                 .unwrap_or_default();
             let concludes = if r["conclusion"] == "typing" {
                 r["conclude_type_label"].as_str().unwrap_or("?").to_string()
+            } else if r["conclusion"] == "computed" {
+                format!(
+                    "{} = {}",
+                    r["conclude_predicate_label"].as_str().unwrap_or("?"),
+                    descriptions
+                        .next()
+                        .flatten()
+                        .unwrap_or_else(|| "(expression unavailable)".to_string()),
+                )
+            } else if r["conclusion"] == "relation" {
+                format!(
+                    "{} from X to the Y reached by {}",
+                    r["conclude_predicate_label"].as_str().unwrap_or("?"),
+                    r["join_predicate_label"].as_str().unwrap_or("?"),
+                )
             } else {
                 format!(
                     "{} = {}",
@@ -465,13 +523,34 @@ pub async fn rule_matches(ctx: &ToolCtx<'_>, args: &serde_json::Value) -> ToolRe
                         .join(", ")
                 })
                 .unwrap_or_default();
-            format!(
-                "{} ⇒ {} (because {}) [{}]",
-                m["entity"].as_str().unwrap_or("?"),
+            // This query includes historical conclusions. A missing bound does
+            // not establish that the conclusion holds now.
+            let bound = |key: &str, precision: &str, unknown: &str| {
+                m[key]
+                    .as_str()
+                    .and_then(|s| s.parse().ok())
+                    .map(|t| crate::time_text::world(t, m[precision].as_str()))
+                    .unwrap_or_else(|| unknown.to_string())
+            };
+            let from = bound("valid_from", "valid_from_precision", "unknown start");
+            let to = bound("valid_to", "valid_to_precision", "unknown end");
+            let concluded = if m["object_entity"].is_null() {
                 m["concluded"]
                     .as_str()
                     .map(str::to_string)
-                    .unwrap_or_else(|| m["concluded"].to_string()),
+                    .unwrap_or_else(|| m["concluded"].to_string())
+            } else {
+                format!(
+                    "{} {}",
+                    m["relation_predicate"]
+                        .as_str()
+                        .unwrap_or_else(|| m["concluded"].as_str().unwrap_or("?")),
+                    m["object_entity"].as_str().unwrap_or("?"),
+                )
+            };
+            format!(
+                "{} ⇒ {concluded} (because {}) [validity: {from} → {to}] [{}]",
+                m["entity"].as_str().unwrap_or("?"),
                 premises,
                 m["entity_id"].as_str().unwrap_or("?"),
             )
@@ -480,13 +559,13 @@ pub async fn rule_matches(ctx: &ToolCtx<'_>, args: &serde_json::Value) -> ToolRe
         .join("\n");
     // 截断要说出来：模型看到 50 条会当成全部，而库里可能有两百
     let text = if total > rows.len() as i64 {
-        format!("{text}\n(showing {} of {total})", rows.len())
+        format!("{text}\n(showing {} of {total} matches)", rows.len())
     } else {
         text
     };
     ToolResult::new(
         text,
-        json!({ "kind": "tool", "label": "rule_matches", "detail": format!("{total} entities") }),
+        json!({ "kind": "tool", "label": "rule_matches", "detail": format!("{total} matches") }),
     )
 }
 
@@ -615,7 +694,11 @@ pub async fn remember(ctx: &ToolCtx<'_>, args: &serde_json::Value) -> ToolResult
     let (occurred_at, occurred_text) = match args["occurred_at"].as_str().map(str::trim) {
         Some(s) if !s.is_empty() => match utopia_extract::parse_time(s) {
             Some((d, precision)) => (
-                d + chrono::Duration::hours(12),
+                if matches!(precision, "year" | "month" | "day") {
+                    d + chrono::Duration::hours(12)
+                } else {
+                    d
+                },
                 crate::time_text::world(d, Some(precision)),
             ),
             None => match parse_when(s) {
@@ -635,7 +718,8 @@ pub async fn remember(ctx: &ToolCtx<'_>, args: &serde_json::Value) -> ToolResult
         return ToolResult::new(
             "remember requires non-empty text.".to_string(),
             json!({ "kind": "tool", "label": "remember", "detail": "empty" }),
-        );
+        )
+        .error();
     }
     match utopia_store::memory::append_episode(&ctx.state.pool, ctx.kb_id, text, occurred_at).await
     {
@@ -674,7 +758,8 @@ pub async fn remember(ctx: &ToolCtx<'_>, args: &serde_json::Value) -> ToolResult
         Err(e) => ToolResult::new(
             format!("Failed to record: {e}"),
             json!({ "kind": "tool", "label": "remember", "detail": "failed" }),
-        ),
+        )
+        .error(),
     }
 }
 

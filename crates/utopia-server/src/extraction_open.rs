@@ -103,7 +103,78 @@ fn locate_time(chunk: &str, quote: Option<(&str, Option<(i32, i32)>)>, words: &s
 
 /// 名字的查找键：空白折叠、小写。陈述里写的名字和 `e` 里列的名字要一字不差，
 /// 差的只许是空白和大小写
-fn name_key(name: &str) -> String {
+/// 一次送去嵌入的名字数。嵌入端点按请求限批，与 `pipeline` 的 chunk 批同一档
+const NAME_EMBED_BATCH: usize = 16;
+/// 抽完一篇文档补多少条还没有向量的名字。一次一批，剩下的下一篇再补
+const NAME_VECTOR_PENDING: i64 = 256;
+
+/// 一批名字各算一条向量，键是 `name_key`。数量对不上整批放弃（配对按位置，错一条全体
+/// 错位，与 `pipeline::embed_pending` 同一条规矩）；任何失败只记日志、返回空——名字向量
+/// 是召回的辅助，抽取不因它失败
+async fn embed_names(
+    state: &AppState,
+    settings: &LlmSettings,
+    client: &utopia_llm::LlmClient,
+    names: &[(String, String)],
+) -> HashMap<String, Vec<f32>> {
+    let mut out: HashMap<String, Vec<f32>> = HashMap::new();
+    for batch in names.chunks(NAME_EMBED_BATCH) {
+        let texts: Vec<String> = batch.iter().map(|(_, t)| t.clone()).collect();
+        let _permit = crate::llm_util::acquire_embed(state, settings).await;
+        match client.embed(&texts).await {
+            Ok(vectors) if vectors.len() == batch.len() => {
+                out.extend(batch.iter().map(|(k, _)| k.clone()).zip(vectors));
+            }
+            Ok(vectors) => {
+                tracing::warn!(
+                    sent = batch.len(),
+                    got = vectors.len(),
+                    "名字向量数量对不上，这一批放弃"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "名字向量没算出来，这一批退回字面召回");
+            }
+        }
+    }
+    out
+}
+
+/// 抽完一篇文档，把这个库里还没有向量的名字事实补上一批（这篇新写的名字都在里面）。
+/// 消解时算过的那些这里会再算一次——消解拿不到名字事实的 id（本名在 `create_entity`
+/// 的一条语句里落下）；省的只是一次嵌入调用，不值得为它改消解的返回值
+async fn embed_pending_names(
+    state: &AppState,
+    settings: &LlmSettings,
+    client: &utopia_llm::LlmClient,
+    kb_id: Uuid,
+) -> anyhow::Result<usize> {
+    let pending =
+        utopia_store::name_vectors::pending(&state.pool, kb_id, NAME_VECTOR_PENDING).await?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+    let mut items: Vec<(Uuid, Uuid, Vec<f32>)> = Vec::with_capacity(pending.len());
+    for batch in pending.chunks(NAME_EMBED_BATCH) {
+        let texts: Vec<String> = batch.iter().map(|(_, _, n)| n.clone()).collect();
+        let _permit = crate::llm_util::acquire_embed(state, settings).await;
+        let vectors = client.embed(&texts).await?;
+        if vectors.len() != batch.len() {
+            anyhow::bail!("嵌入返回 {} 条，送去的是 {} 条", vectors.len(), batch.len());
+        }
+        items.extend(
+            batch
+                .iter()
+                .map(|(f, e, _)| (*f, *e))
+                .zip(vectors)
+                .map(|((f, e), v)| (f, e, v)),
+        );
+    }
+    utopia_store::name_vectors::set(&state.pool, kb_id, &items).await?;
+    Ok(items.len())
+}
+
+pub(crate) fn name_key(name: &str) -> String {
     name.split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -151,17 +222,20 @@ async fn place(
 }
 
 /// `await_nod`：这是记忆日志（0015）——陈述不直接落库，原样进待确认表，人点头时才成为开放陈述。
-/// `proposer`：那句话是谁、经哪枚令牌说的（0026），随待确认项一起记
+/// `proposer`：那句话是谁、经哪枚令牌说的（0026），随待确认项一起记。
+/// `pushed`：块本身就是契约（0054 的 `statements` 来源）——不建提示词、不问模型，直接解析；
+/// 这时 `client`（对话模型）为 None；`settings` 有就照传，名字向量的嵌入模型从它来。其余一步不变
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_open(
     state: &AppState,
     doc: &Document,
     kb: &KnowledgeBase,
-    settings: &LlmSettings,
-    client: &utopia_llm::LlmClient,
+    settings: Option<&LlmSettings>,
+    client: Option<&utopia_llm::LlmClient>,
     my_epoch: i32,
     proposer: Proposer,
     await_nod: bool,
+    pushed: bool,
 ) -> anyhow::Result<()> {
     let pool = &state.pool;
     let document_id = doc.id;
@@ -194,6 +268,9 @@ pub(crate) async fn run_open(
     let mut human_reviews_found = false;
     let mut statement_count = 0usize;
 
+    // 名字向量的嵌入客户端（0041 决定 3 通道 2）。没配嵌入模型就是 None：召回退回
+    // 字面相等，抽取照常
+    let embed = settings.and_then(crate::llm_util::embed_client);
     for chunk in chunks.iter() {
         // 被接管则安静退场（重抽自增 epoch）：检查放在调用模型之前
         if utopia_store::documents::extract_epoch(pool, document_id).await? != my_epoch {
@@ -214,39 +291,53 @@ pub(crate) async fn run_open(
             .as_ref()
             .filter(|(id, _)| *id != chunk.id)
             .map(|(_, text)| text.as_str());
-        let messages =
-            utopia_extract::open::build_open_messages(&doc.filename, &known, opening, &chunk.text);
-        // 温度 0：照抄原文的活不该靠采样。端点缺省 1.0 时同一块两次回复密度差三倍
-        let reply = match chat_retrying_rate_limits_at(
-            state,
-            settings,
-            client,
-            &messages,
-            Some(0.0),
-        )
-        .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!(%document_id, seq = chunk.seq, error = %e, "开放抽取调用失败，跳过该分块");
-                drop_signal(
-                    state,
-                    kb_id,
-                    document_id,
-                    reason::CHUNK_UNEXTRACTED,
-                    "调用失败，这一块没有进图",
-                    Some(&format!("#{}：{e}", chunk.seq)),
-                )
-                .await;
-                unextracted.push((chunk.seq, format!("调用失败：{e}")));
-                continue;
-            }
+        // 推送来的陈述：块就是契约，解析它而不是问模型（0054）。下面从解析起一步不变
+        let (reply_text, cut_by_ceiling) = if pushed {
+            (chunk.text.clone(), false)
+        } else {
+            let (settings, client) = match (settings, client) {
+                (Some(s), Some(c)) => (s, c),
+                _ => anyhow::bail!("Chat model not configured; cannot extract"),
+            };
+            let messages = utopia_extract::open::build_open_messages(
+                &doc.filename,
+                &known,
+                opening,
+                &chunk.text,
+            );
+            // 温度 0：照抄原文的活不该靠采样。端点缺省 1.0 时同一块两次回复密度差三倍
+            let reply = match chat_retrying_rate_limits_at(
+                state,
+                settings,
+                client,
+                &messages,
+                Some(0.0),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(%document_id, seq = chunk.seq, error = %e, "开放抽取调用失败，跳过该分块");
+                    drop_signal(
+                        state,
+                        kb_id,
+                        document_id,
+                        reason::CHUNK_UNEXTRACTED,
+                        "调用失败，这一块没有进图",
+                        Some(&format!("#{}：{e}", chunk.seq)),
+                    )
+                    .await;
+                    unextracted.push((chunk.seq, format!("调用失败：{e}")));
+                    continue;
+                }
+            };
+            tracing::debug!(%document_id, seq = chunk.seq, reply = %reply.text, "开放抽取的原始回复");
+            // 端点说它是撞上 token 上限停的。解析器只看得见 JSON 少了尾巴，看不见
+            // 少的原因，所以这句话得从回复里带过来（#760）
+            let cut_by_ceiling = reply.hit_token_ceiling();
+            (reply.text, cut_by_ceiling)
         };
-        tracing::debug!(%document_id, seq = chunk.seq, reply = %reply.text, "开放抽取的原始回复");
-        // 端点说它是撞上 token 上限停的。解析器只看得见 JSON 少了尾巴，看不见
-        // 少的原因，所以这句话得从回复里带过来（#760）
-        let cut_by_ceiling = reply.hit_token_ceiling();
-        let extraction = match utopia_extract::open::parse_open_response(&reply.text) {
+        let extraction = match utopia_extract::open::parse_open_response(&reply_text) {
             Ok(x) => x,
             Err(e) => {
                 tracing::warn!(%document_id, seq = chunk.seq, error = %e, hit_token_ceiling = cut_by_ceiling, "开放抽取回复解析失败，跳过该分块");
@@ -306,6 +397,24 @@ pub(crate) async fn run_open(
             .await;
         }
 
+        // 名字向量（0041 决定 3 通道 2）：这一块里有名字的东西，名字字符串各算一条，
+        // 消解时拿它在同库的名字向量里找近邻。一块一批；算不出来（端点抖了）不拦抽取，
+        // 只是这一块少一条召回通道
+        let name_vecs: HashMap<String, Vec<f32>> = match (settings, &embed) {
+            (Some(settings), Some(client)) => {
+                let mut wanted: Vec<(String, String)> = Vec::new();
+                let mut seen: HashSet<String> = HashSet::new();
+                for e in &extraction.entities {
+                    let n = e.name.trim();
+                    if e.named && !n.is_empty() && seen.insert(name_key(n)) {
+                        wanted.push((name_key(n), n.to_string()));
+                    }
+                }
+                embed_names(state, settings, client, &wanted).await
+            }
+            _ => HashMap::new(),
+        };
+
         // ---- 东西：有名字的走身份消解，被描述的建成没有名字事实的实体 ----
         let mut response_claims: HashMap<String, Vec<Uuid>> = HashMap::new();
         let mut local: HashMap<String, Uuid> = HashMap::new();
@@ -331,6 +440,7 @@ pub(crate) async fn run_open(
                     bound,
                     name,
                     ctx,
+                    name_vecs.get(&key).map(Vec::as_slice),
                     Some(&chunk.text),
                     &mut response_claims,
                     &mut handled_by_name,
@@ -565,7 +675,14 @@ pub(crate) async fn run_open(
                 .filter_map(|(role, words)| Some((role, words?.trim())))
                 .filter(|(_, w)| !w.is_empty())
             {
-                match locate_time(&chunk.text, quote, words) {
+                // 推送来的陈述没有引文：条目自己就是证据（0054 决定 4），这一块就是这一份
+                // 载荷，时间词在块里找。走 `locate_time` 会在 `quote?` 上退出，起止就都丢了
+                let located = if pushed {
+                    locate(&chunk.text, words).map(|(start, _)| start)
+                } else {
+                    locate_time(&chunk.text, quote, words)
+                };
+                match located {
                     Some(start) => time_words.push((words, start, role)),
                     None => {
                         drop_signal(
@@ -577,20 +694,6 @@ pub(crate) async fn run_open(
                             Some(words),
                         )
                         .await;
-                    }
-                }
-            }
-            // **表格单元的期间在它那一列的表头上**（#729）。模型自己说了时间就不动它——
-            // 它看得见整块原文，说得出的比一根列头多。这一条不是模型报的，所以不走
-            // `time_not_in_quote`：它的出处是位置（这个值在这一行的第几格），
-            // 而那一格的表头上写着期间。它是不是一个期间，由时间解析去判（0045：
-            // 模型读、代码算），这里一个字眼都不认
-            if !time_words.iter().any(|(_, _, role)| *role == "when") {
-                if let (Some(v), Some((q, _))) = (stated_value, quote) {
-                    if let Some((head, at)) = utopia_ingest::column_header(&chunk.text, q, v) {
-                        if let Ok(at) = i32::try_from(at) {
-                            time_words.push((head, at, "when"));
-                        }
                     }
                 }
             }
@@ -805,6 +908,16 @@ pub(crate) async fn run_open(
         tracing::info!(%document_id, pending_count, "记忆抽出的陈述进了待确认队列");
         state.emit_pending(kb_id);
         state.emit_review(kb_id);
+    }
+
+    // 名字向量：这篇新写的名字事实，向量补上（0041 决定 3 通道 2）。算不出来只记日志——
+    // 文档已经抽完了，不能因为召回的辅助数据没算而把它标成 failed
+    if let (Some(settings), Some(client)) = (settings, &embed) {
+        match embed_pending_names(state, settings, client, kb_id).await {
+            Ok(n) if n > 0 => tracing::info!(%document_id, names = n, "名字向量已补"),
+            Ok(_) => {}
+            Err(e) => tracing::warn!(%document_id, error = %e, "名字向量没补上，下一篇再补"),
+        }
     }
 
     // 灰区对进了审核队列 → 治理 / 裁决任务，同库已排着的不重复。

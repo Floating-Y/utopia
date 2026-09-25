@@ -563,8 +563,11 @@ function NewDataSourceDialog({
       onCreated();
     },
   });
+  // 对话框上一次只说一个结果：试连和新增各有自己的错误，两个都留着就是同一句话出现两次
+  // （#921）。改字段、换动作，前一个结果就不作数了
   const set = (key: string, v: string) => {
     probe.reset();
+    create.reset();
     setValues((prev) => ({ ...prev, [key]: v }));
   };
 
@@ -580,7 +583,10 @@ function NewDataSourceDialog({
           {/* 试连在左边：它不是"完成"，是完成之前的那一步 */}
           <Button variant="secondary" size="sm" className="mr-auto"
             disabled={!filled || probe.isPending}
-            onClick={() => probe.mutate()}
+            onClick={() => {
+              create.reset();
+              probe.mutate();
+            }}
           >
             {probe.isPending
               ? S.settings.datasources.testing
@@ -591,7 +597,10 @@ function NewDataSourceDialog({
           </Button>
           <Button variant="primary" size="sm"
             disabled={!ready || create.isPending}
-            onClick={() => create.mutate()}
+            onClick={() => {
+              probe.reset();
+              create.mutate();
+            }}
           >
             {S.settings.datasources.add}
           </Button>
@@ -615,6 +624,7 @@ function NewDataSourceDialog({
                 setEngineId(v);
                 setValues({});
                 probe.reset();
+                create.reset();
               }}
               options={specs.map((s) => ({ value: s.id, label: s.label }))}
             />
@@ -887,6 +897,7 @@ export function Settings() {
     chat_base_url: "",
     chat_api_key: "",
     chat_model: "",
+    chat_reasoning_effort: "",
     embed_base_url: "",
     embed_api_key: "",
     embed_model: "",
@@ -904,6 +915,7 @@ export function Settings() {
         ...f,
         chat_base_url: settings.data.chat_base_url ?? "",
         chat_model: settings.data.chat_model ?? "",
+        chat_reasoning_effort: settings.data.chat_reasoning_effort ?? "",
         embed_base_url: settings.data.embed_base_url ?? "",
         embed_model: settings.data.embed_model ?? "",
         ocr_base_url: settings.data.ocr_base_url ?? "",
@@ -1162,6 +1174,7 @@ export function Settings() {
                           chat_base_url: form.chat_base_url,
                           chat_model: form.chat_model,
                           chat_api_key: form.chat_api_key,
+                          chat_reasoning_effort: form.chat_reasoning_effort,
                         }),
                         { onSuccess: () => setDirty((d) => ({ ...d, chat: false })) },
                       );
@@ -1192,6 +1205,27 @@ export function Settings() {
                       value={form.chat_model}
                       onChange={set("chat_model")}
                     />
+                  </div>
+                  <div>
+                    <label className={label}>{S.settings.reasoningEffort}</label>
+                    {/* 推理模型默认边想边答，抽取一次调用九成的输出是思考；照原文写 JSON 的活用 minimal。
+                        小而有界的枚举：Dropdown（web/DESIGN.md 规矩 5，页面上没有原生 select） */}
+                    <Dropdown
+                      className="w-full"
+                      value={form.chat_reasoning_effort}
+                      onChange={(v) => {
+                        setForm((f) => ({ ...f, chat_reasoning_effort: v }));
+                        setDirty((d) => ({ ...d, chat: true }));
+                      }}
+                      options={[
+                        { value: "", label: S.settings.reasoningDefault },
+                        { value: "minimal", label: "minimal" },
+                        { value: "low", label: "low" },
+                        { value: "medium", label: "medium" },
+                        { value: "high", label: "high" },
+                      ]}
+                    />
+                    <div className="mt-1 text-small text-ink-2">{S.settings.reasoningHint}</div>
                   </div>
                   <div>
                     <label className={label}>

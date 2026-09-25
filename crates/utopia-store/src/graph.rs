@@ -433,7 +433,10 @@ impl Temporal {
 
 /// 谓词的时间语义。没有谓词（0010）按状态——三者里唯一不丢信息的那个，与导入本体时
 /// 的判断一致
-pub async fn predicate_temporal(pool: &PgPool, predicate_id: Option<Uuid>) -> AppResult<Temporal> {
+pub async fn predicate_temporal<'e>(
+    pool: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    predicate_id: Option<Uuid>,
+) -> AppResult<Temporal> {
     let Some(id) = predicate_id else {
         return Ok(Temporal::State);
     };
@@ -537,9 +540,35 @@ async fn insert_fact_inner(
     validity: Validity<'_>,
     confidence: f32,
 ) -> AppResult<(Uuid, bool)> {
+    let mut conn = pool.acquire().await?;
+    insert_fact_on(
+        &mut conn,
+        kb_id,
+        subject_id,
+        predicate_id,
+        object,
+        validity,
+        confidence,
+    )
+    .await
+}
+
+/// The same insertion semantics on a caller-owned connection/transaction.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_fact_on(
+    conn: &mut sqlx::PgConnection,
+    kb_id: Uuid,
+    subject_id: Uuid,
+    // None = 本体里没有对应的关系。原意不丢——它在证据的 proposed_predicate 里，
+    // 显示时由 fact_surface_predicate() 取回（见 `facts.predicate_id`）
+    predicate_id: Option<Uuid>,
+    object: FactObject<'_>,
+    validity: Validity<'_>,
+    confidence: f32,
+) -> AppResult<(Uuid, bool)> {
     // 按谓词的时间语义归一（0031）：事件两端同一刻，恒常无日期。写在这里而不是各个
     // 写入者那儿——抽取、点头、人自己写的事实都经过这一个门
-    let temporal = predicate_temporal(pool, predicate_id).await?;
+    let temporal = predicate_temporal(&mut *conn, predicate_id).await?;
     let validity = validity.under(temporal).truncated();
     let same_sql = match object {
         FactObject::Entity(_) => {
@@ -561,7 +590,7 @@ async fn insert_fact_inner(
         FactObject::Entity(id) => q.bind(id),
         FactObject::Value(v) => q.bind(v),
     };
-    let same: Vec<FactSpanRow> = q.fetch_all(pool).await?;
+    let same: Vec<FactSpanRow> = q.fetch_all(&mut *conn).await?;
     // 「结束了，不知哪天」的观察撞上同断言的**开放行**（0022 / #393）：关上它。
     // 不并进去——并进去等于把「它结束了」这唯一带来的信息丢掉（同 valid_from 那条
     // 精确重复的路会这么干）；也不另立一行——另立一行让两条各说各话，开放的那条
@@ -578,7 +607,8 @@ async fn insert_fact_inner(
             .max_by_key(|(_, vf, _, _)| *vf);
         if let Some((open, _, _, _)) = open {
             if let Some(closed) =
-                crate::temporal::close_with_unknown_end(pool, *open, validity.attested_at).await?
+                crate::temporal::close_with_unknown_end(&mut *conn, *open, validity.attested_at)
+                    .await?
             {
                 return Ok((closed, true));
             }
@@ -592,11 +622,12 @@ async fn insert_fact_inner(
                 && validity.from.is_none_or(|f| Some(f) == *vf)
         }) {
             if let Some(stated) =
-                crate::temporal::state_derived_end(pool, *ended, None, validity.attested_at).await?
+                crate::temporal::state_derived_end(&mut *conn, *ended, None, validity.attested_at)
+                    .await?
             {
                 return Ok((stated, true));
             }
-            attest_earlier(pool, *ended, validity.attested_at).await?;
+            attest_earlier(&mut *conn, *ended, validity.attested_at, true).await?;
             return Ok((*ended, false));
         }
     }
@@ -611,7 +642,7 @@ async fn insert_fact_inner(
             if let Some((ended, _, _, _)) = same.iter().find(|(_, _, vt, _)| *vt == Some(to)) {
                 let precision = validity.to_precision.unwrap_or("day");
                 if let Some(stated) = crate::temporal::state_derived_end(
-                    pool,
+                    &mut *conn,
                     *ended,
                     Some((to, precision)),
                     validity.attested_at,
@@ -620,7 +651,7 @@ async fn insert_fact_inner(
                 {
                     return Ok((stated, true));
                 }
-                attest_earlier(pool, *ended, validity.attested_at).await?;
+                attest_earlier(&mut *conn, *ended, validity.attested_at, true).await?;
                 return Ok((*ended, false));
             }
             let open = same
@@ -631,7 +662,7 @@ async fn insert_fact_inner(
                 .max_by_key(|(_, vf, _, _)| *vf);
             if let Some((open, _, _, _)) = open {
                 if let Some(closed) = crate::temporal::close_superseded(
-                    pool,
+                    &mut *conn,
                     *open,
                     to,
                     validity.to_precision.unwrap_or("day"),
@@ -649,7 +680,7 @@ async fn insert_fact_inner(
         if temporal == Temporal::State && vt.is_none() && vtp.is_none() {
             if let Some(to) = validity.to {
                 if let Some(closed) = crate::temporal::close_superseded(
-                    pool,
+                    &mut *conn,
                     *existing,
                     to,
                     validity.to_precision.unwrap_or("day"),
@@ -665,14 +696,24 @@ async fn insert_fact_inner(
             let stated_to = validity
                 .to
                 .map(|to| (to, validity.to_precision.unwrap_or("day")));
-            if let Some(stated) =
-                crate::temporal::state_derived_end(pool, *existing, stated_to, validity.attested_at)
-                    .await?
+            if let Some(stated) = crate::temporal::state_derived_end(
+                &mut *conn,
+                *existing,
+                stated_to,
+                validity.attested_at,
+            )
+            .await?
             {
                 return Ok((stated, true));
             }
         }
-        attest_earlier(pool, *existing, validity.attested_at).await?;
+        attest_earlier(
+            &mut *conn,
+            *existing,
+            validity.attested_at,
+            validity.has_ended(),
+        )
+        .await?;
         return Ok((*existing, false));
     }
     // 弱化陈述：新观察无时间，同断言已有开放行 → 并入（取起点最新的开放行）。
@@ -684,7 +725,7 @@ async fn insert_fact_inner(
             .filter(|(_, _, vt, _)| vt.is_none() || temporal == Temporal::Event)
             .max_by_key(|(_, vf, _, _)| *vf)
         {
-            attest_earlier(pool, *existing, validity.attested_at).await?;
+            attest_earlier(&mut *conn, *existing, validity.attested_at, false).await?;
             return Ok((*existing, false));
         }
         // 没有开放行，但这次观察的文档日期落在某条**已关上**的行里：说的是那一段，不是
@@ -696,7 +737,7 @@ async fn insert_fact_inner(
                 .iter()
                 .find(|(_, vf, vt, _)| vt.is_some_and(|t| at <= t) && vf.is_none_or(|f| f <= at))
             {
-                attest_earlier(pool, *existing, validity.attested_at).await?;
+                attest_earlier(&mut *conn, *existing, validity.attested_at, false).await?;
                 return Ok((*existing, false));
             }
         }
@@ -766,19 +807,19 @@ async fn insert_fact_inner(
         .bind(confidence)
         .bind(validity.attested_at)
         .bind(validity.from_grade)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
 
     // 时间精化：裸行（无时无终的同断言）被本次带时间的观察取代——作废+链上，证据随行
     if let Some(old_id) = refine_target {
         sqlx::query("UPDATE facts SET invalidated_at = now() WHERE id = $1")
             .bind(old_id)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
         sqlx::query("UPDATE facts SET supersedes = $2 WHERE id = $1")
             .bind(id)
             .bind(old_id)
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
         sqlx::query(
             // 表层谓词随证据一起搬：精化的是时间，不是原文说了什么。引文的偏移一起搬
@@ -791,7 +832,7 @@ async fn insert_fact_inner(
         )
         .bind(id)
         .bind(old_id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
         // 边上的属性也随行（0037）：裸行上已有的金额、职务不因为精化了时间而丢
         sqlx::query(
@@ -802,7 +843,7 @@ async fn insert_fact_inner(
         )
         .bind(id)
         .bind(old_id)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
     }
     Ok((id, true))
@@ -811,24 +852,29 @@ async fn insert_fact_inner(
 /// 同一断言又被观察到一次：锚点只往早挪（0022）。更早的文档是更早的证据；
 /// 更晚的什么也不改——一条事实从有证据的那一刻起成立，之后再被提到不会把它
 /// 往后推。`None`（此刻）也不动它：此刻不会早于任何已有的证据。
-async fn attest_earlier(
-    pool: &PgPool,
+///
+/// `ended`：这次观察说的是「它结束了」。只有它是结束得更早的证据，终点锚才跟着挪；
+/// 说它成立的观察只挪起点锚。从前两个一起挪，一条晚到的、日期更早的「成立」并进一行
+/// 「结束了，不知哪天」，终点锚就挪到了它自己身上，区间缩成空的（#875 的回放）
+async fn attest_earlier<'e>(
+    pool: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     fact_id: Uuid,
     at: Option<chrono::DateTime<chrono::Utc>>,
+    ended: bool,
 ) -> AppResult<()> {
     if let Some(at) = at {
-        // 两个锚点都只往早挪：更早的文档既是它成立的更早证据，若它说的是结束，也是
-        // 结束得更早的证据。attested_to 只在结束未知的行上有，NULL 的留 NULL
+        // attested_to 只在结束未知的行上有，NULL 的留 NULL
         sqlx::query(
             // LEAST 会跳过 NULL——开放行的 attested_to 是 NULL，直接 least 会给它凭空长出一个
             // 终点锚，撞上 CHECK。NULL 的留 NULL
             "UPDATE facts SET attested_from = least(attested_from, $2),
-                              attested_to = CASE WHEN attested_to IS NULL THEN NULL
+                              attested_to = CASE WHEN attested_to IS NULL OR NOT $3 THEN attested_to
                                                  ELSE least(attested_to, $2) END
               WHERE id = $1",
         )
         .bind(fact_id)
         .bind(at)
+        .bind(ended)
         .execute(pool)
         .await?;
     }
@@ -918,7 +964,9 @@ pub async fn insert_open_statement(
     };
     let same: Option<Uuid> = q.fetch_optional(pool).await?;
     if let Some(existing) = same {
-        attest_earlier(pool, existing, attested_at).await?;
+        // 开放陈述落库时还不知道这次提及说的是成立还是结束（时间词在 0045 的任务里才读），
+        // 这里照旧两个锚点一起挪
+        attest_earlier(pool, existing, attested_at, true).await?;
         return Ok((existing, false));
     }
 
@@ -1092,10 +1140,7 @@ pub async fn add_evidence_located(
 /// `owner`：**只在真的传了时刻时**才绑（#336）。`fact_owner_at` 包住列之后
 /// `facts` 上按主宾的索引就用不上了，而「现在」是每次画图都要走的那条路
 fn node_sql(as_of: Option<usize>, owner: Option<usize>) -> String {
-    let held = match as_of {
-        Some(param) => crate::record_axis::facts_held_at("f", param),
-        None => "f.invalidated_at IS NULL".to_string(),
-    };
+    let held = crate::record_axis::facts_held_at("f", as_of);
     // 主宾也跟着倒：三月被合并掉的实体，在二月身上还挂着它自己的那些事实（#336）
     let subject = crate::record_axis::owner_at("f", "subject_id", owner, false);
     let object = crate::record_axis::owner_at("f", "object_id", owner, true);
@@ -1134,8 +1179,8 @@ pub async fn overview(
 ) -> AppResult<(Vec<GraphNode>, Vec<GraphEdge>, i64, i64)> {
     let nodes: Vec<GraphNode> = sqlx::query_as(&format!(
         "{} WHERE e.kb_id = $1 AND {visible} ORDER BY degree DESC, e.created_at LIMIT $2",
-        node_sql(Some(3), as_of.map(|_| 3)),
-        visible = crate::record_axis::entity_visible_at("e", 3),
+        node_sql(as_of.map(|_| 3), as_of.map(|_| 3)),
+        visible = crate::record_axis::entity_visible_at("e", as_of.map(|_| 3)),
     ))
     .bind(kb_id)
     .bind(limit)
@@ -1155,7 +1200,7 @@ pub async fn overview(
     // 三月并掉的那个，在二月既该出现在画布上，也该数进这个总数里
     let total_nodes: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM entities e WHERE e.kb_id = $1 AND {visible}",
-        visible = crate::record_axis::entity_visible_at("e", 2),
+        visible = crate::record_axis::entity_visible_at("e", as_of.map(|_| 2)),
     ))
     .bind(kb_id)
     .bind(as_of)
@@ -1169,8 +1214,8 @@ pub async fn overview(
                   WHERE f.kb_id = $1 AND {facts_held} AND f.object_id IS NOT NULL)
               + (SELECT count(*) FROM derived_facts d
                   WHERE d.kb_id = $1 AND {derived_held} AND d.object_id IS NOT NULL)",
-        facts_held = crate::record_axis::facts_held_at("f", 2),
-        derived_held = crate::record_axis::derived_held_at("d", 2),
+        facts_held = crate::record_axis::facts_held_at("f", as_of.map(|_| 2)),
+        derived_held = crate::record_axis::derived_held_at("d", as_of.map(|_| 2)),
     ))
     .bind(kb_id)
     .bind(as_of)
@@ -1293,10 +1338,10 @@ async fn edges_among(
         ),
         holds_from = crate::world_axis::facts_holds_from("f"),
         holds_to = crate::world_axis::facts_holds_to("f"),
-        facts_held = crate::record_axis::facts_held_at("f", 4),
-        derived_held = crate::record_axis::derived_held_at("d", 4),
-        violation_open = crate::record_axis::violation_open_at("v", 4),
-        conflict_open = crate::record_axis::conflict_open_at("c", 4),
+        facts_held = crate::record_axis::facts_held_at("f", as_of.map(|_| 4)),
+        derived_held = crate::record_axis::derived_held_at("d", as_of.map(|_| 4)),
+        violation_open = crate::record_axis::violation_open_at("v", as_of.map(|_| 4)),
+        conflict_open = crate::record_axis::conflict_open_at("c", as_of.map(|_| 4)),
         // 派生边不跟着倒：它们由引擎按当时的断言推出，主宾从来没被合并改写过
         subject = crate::record_axis::owner_at("f", "subject_id", as_of.map(|_| 4), false),
         object = crate::record_axis::owner_at("f", "object_id", as_of.map(|_| 4), true),
@@ -1343,7 +1388,7 @@ pub async fn neighborhood(
             "SELECT {subject}, {object} FROM facts f
              WHERE f.kb_id = $1 AND {facts_held} AND f.object_id IS NOT NULL
                AND ({subject} = ANY($2) OR {object} = ANY($2))",
-            facts_held = crate::record_axis::facts_held_at("f", 3),
+            facts_held = crate::record_axis::facts_held_at("f", as_of.map(|_| 3)),
             subject = crate::record_axis::owner_at("f", "subject_id", as_of.map(|_| 3), false),
             object = crate::record_axis::owner_at("f", "object_id", as_of.map(|_| 3), true),
         ))
@@ -1370,8 +1415,8 @@ pub async fn neighborhood(
     let ids: Vec<Uuid> = seen.into_iter().collect();
     let nodes: Vec<GraphNode> = sqlx::query_as(&format!(
         "{} WHERE e.kb_id = $1 AND e.id = ANY($2) AND {visible}",
-        node_sql(Some(3), as_of.map(|_| 3)),
-        visible = crate::record_axis::entity_visible_at("e", 3),
+        node_sql(as_of.map(|_| 3), as_of.map(|_| 3)),
+        visible = crate::record_axis::entity_visible_at("e", as_of.map(|_| 3)),
     ))
     .bind(kb_id)
     .bind(&ids)
@@ -1421,10 +1466,7 @@ pub async fn search_entities(
     let pattern = format!("%{}%", text.trim());
     let named = crate::names::has_name_like("e", 2);
     // 不回放时 SQL 里没有时刻参数，与从前逐字相同；回放时才多绑一个
-    let visible = |param: usize| match as_of {
-        Some(_) => crate::record_axis::entity_visible_at("e", param),
-        None => "e.merged_into IS NULL".to_string(),
-    };
+    let visible = |param: usize| crate::record_axis::entity_visible_at("e", as_of.map(|_| param));
     let rewind = as_of.map(|_| 5);
     let sql = format!(
         "{} WHERE e.kb_id = $1 AND {visible}
@@ -1468,7 +1510,7 @@ pub async fn entity_detail(
 ) -> AppResult<(GraphNode, Vec<EntityFact>)> {
     let node: GraphNode = sqlx::query_as(&format!(
         "{} WHERE e.kb_id = $1 AND e.id = $2",
-        node_sql(Some(3), as_of.map(|_| 3))
+        node_sql(as_of.map(|_| 3), as_of.map(|_| 3))
     ))
     .bind(kb_id)
     .bind(entity_id)
@@ -1531,15 +1573,15 @@ pub async fn entity_detail(
         not_name = crate::names::not_a_name("f"),
         said_as = said_as("f"),
         represented = represented_by_typed("f"),
-        facts_held = crate::record_axis::facts_held_at("f", 3),
+        facts_held = crate::record_axis::facts_held_at("f", as_of.map(|_| 3)),
         facts_hold = crate::world_axis::facts_hold_at("f", 4),
         holds_from = crate::world_axis::facts_holds_from("f"),
         holds_to = crate::world_axis::facts_holds_to("f"),
         subject = crate::record_axis::owner_at("f", "subject_id", as_of.map(|_| 3), false),
         object = crate::record_axis::owner_at("f", "object_id", as_of.map(|_| 3), true),
-        chunk_live = crate::record_axis::chunk_live_at("c", 3),
-        violation_open = crate::record_axis::violation_open_at("v", 3),
-        conflict_open = crate::record_axis::conflict_open_at("c", 3),
+        chunk_live = crate::record_axis::chunk_live_at("c", as_of.map(|_| 3)),
+        violation_open = crate::record_axis::violation_open_at("v", as_of.map(|_| 3)),
+        conflict_open = crate::record_axis::conflict_open_at("c", as_of.map(|_| 3)),
     ))
     .bind(kb_id)
     .bind(entity_id)
@@ -1681,10 +1723,7 @@ pub async fn same_name_peers(
     entity_id: Uuid,
     as_of: Option<chrono::DateTime<chrono::Utc>>,
 ) -> AppResult<Vec<GraphNode>> {
-    let visible = match as_of {
-        Some(_) => crate::record_axis::entity_visible_at("e", 3),
-        None => "e.merged_into IS NULL".to_string(),
-    };
+    let visible = crate::record_axis::entity_visible_at("e", as_of.map(|_| 3));
     sqlx::query_as(&format!(
         "{} WHERE e.kb_id = $1 AND {visible} AND e.id <> $2
            AND lower(e.canonical_name) = (SELECT lower(canonical_name) FROM entities WHERE id = $2)

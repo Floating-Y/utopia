@@ -86,6 +86,33 @@ pub async fn enqueue_unless_queued(
     Ok(row.map(|(id,)| id))
 }
 
+/// 同 [`enqueue_unless_queued`]，但晚一点跑。挡的只是排着的，不挡在跑的——调用方
+/// 正是那个在跑的任务、想给自己之后再排一个的时候，用这个而不是 `enqueue_unless_pending`
+pub async fn enqueue_unless_queued_after(
+    pool: &PgPool,
+    kind: &str,
+    payload: serde_json::Value,
+    after: Duration,
+) -> AppResult<Option<i64>> {
+    let mut tx = pool.begin().await?;
+    let row: Option<(i64,)> = sqlx::query_as(
+        "INSERT INTO jobs (kind, payload, run_at)
+         SELECT $1, $2, now() + make_interval(secs => $3)
+          WHERE NOT EXISTS (SELECT 1 FROM jobs WHERE kind = $1 AND payload = $2 AND status = 'queued')
+         RETURNING id",
+    )
+    .bind(kind)
+    .bind(payload)
+    .bind(after.as_secs_f64())
+    .fetch_optional(&mut *tx)
+    .await?;
+    if row.is_some() {
+        notify_worker_tx(&mut tx).await?;
+    }
+    tx.commit().await?;
+    Ok(row.map(|(id,)| id))
+}
+
 pub async fn enqueue(pool: &PgPool, kind: &str, payload: serde_json::Value) -> AppResult<i64> {
     enqueue_with_max_attempts(pool, kind, payload, 3).await
 }
@@ -257,6 +284,34 @@ pub async fn failed_count(pool: &PgPool, kb_id: Option<Uuid>) -> AppResult<i64> 
         KB_SCOPE.replace("$KB", "$1")
     );
     Ok(sqlx::query_scalar(&sql).bind(kb_id).fetch_one(pool).await?)
+}
+
+/// 一个任务此刻的样子，给「我刚排下去的那件事跑完了没」这个问题用（0051）。
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct JobStatus {
+    pub id: i64,
+    pub kind: String,
+    pub status: String,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub last_error: Option<String>,
+    pub run_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// 按 id 读一个任务，**且只在它属于这个库时**。授权跟着库走：能看这个库的人能看
+/// 它的任务；别的库的任务 id 猜对了也只得到 None，与看不见的文档一样答 404。
+pub async fn status_in_kb(pool: &PgPool, kb_id: Uuid, id: i64) -> AppResult<Option<JobStatus>> {
+    let sql = format!(
+        "SELECT j.id, j.kind, j.status, j.attempts, j.max_attempts, j.last_error, j.run_at, j.updated_at
+           FROM jobs j WHERE j.id = $1 AND {}",
+        KB_SCOPE.replace("$KB", "$2")
+    );
+    Ok(sqlx::query_as(&sql)
+        .bind(id)
+        .bind(kb_id)
+        .fetch_optional(pool)
+        .await?)
 }
 
 /// 认领一个到期任务；没有则返回 None。

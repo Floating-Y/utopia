@@ -205,13 +205,15 @@ async fn resolve_uncached(
     type_id: Option<Uuid>,
     name: &str,
     ctx: Option<&[f32]>,
+    name_vec: Option<&[f32]>,
     text: Option<&str>,
     exclude: &[Uuid],
     needs_adjudication: &mut bool,
 ) -> anyhow::Result<Uuid> {
-    let r =
-        utopia_store::resolution::resolve_mention(pool, kb_id, type_id, name, ctx, text, exclude)
-            .await?;
+    let r = utopia_store::resolution::resolve_mention(
+        pool, kb_id, type_id, name, ctx, name_vec, text, exclude,
+    )
+    .await?;
     // 疑似重复对（画像灰区 / 类型漂移 / 同名并列）入审核队列。多数走批量裁决器，
     // 同名并列（`ReviewStage::Human`）分不出谁是谁，只能等人裁——它自己带着 stage。
     for review in &r.reviews {
@@ -263,6 +265,7 @@ pub(crate) async fn resolve_handle(
     type_id: Option<Uuid>,
     name: &str,
     ctx: Option<&[f32]>,
+    name_vec: Option<&[f32]>,
     text: Option<&str>,
     response_claims: &mut HashMap<String, Vec<Uuid>>,
     handled_by_name: &mut HashMap<String, Vec<Uuid>>,
@@ -302,6 +305,7 @@ pub(crate) async fn resolve_handle(
                 type_id,
                 name,
                 ctx,
+                name_vec,
                 text,
                 &excluded,
                 needs_adjudication,
@@ -337,11 +341,24 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
         return Ok(());
     }
     let kb = utopia_store::kbs::get(&state.pool, doc.kb_id).await?;
-    let settings = utopia_store::settings::get(&state.pool, kb.workspace_id)
+    // 推送来的陈述（0054）：块就是契约，抽取按契约解析、不问模型，没配对话模型也照抽
+    let pushed = crate::pipeline::source_kind(state, doc.source_id)
         .await?
-        .ok_or_else(|| anyhow::anyhow!("Chat model not configured; cannot extract"))?;
-    let client = llm_util::chat_client(&settings)
-        .ok_or_else(|| anyhow::anyhow!("Chat model not configured; cannot extract"))?;
+        .as_deref()
+        == Some("statements");
+    // settings 有就传：推送路径不问对话模型，但名字向量的嵌入模型（#877）仍从它来
+    let settings = utopia_store::settings::get(&state.pool, kb.workspace_id).await?;
+    let client = if pushed {
+        None
+    } else {
+        let settings = settings
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Chat model not configured; cannot extract"))?;
+        Some(
+            llm_util::chat_client(settings)
+                .ok_or_else(|| anyhow::anyhow!("Chat model not configured; cannot extract"))?,
+        )
+    };
 
     // 所有权凭证：重抽会自增 epoch，任务据此察觉自己已被接管（见 `run_open` 的分块循环）
     let my_epoch = utopia_store::documents::extract_epoch(&state.pool, document_id).await?;
@@ -349,7 +366,15 @@ async fn run(state: &AppState, document_id: Uuid, proposer: Proposer) -> anyhow:
     state.emit_document(doc.kb_id, document_id);
     let await_nod = utopia_store::memory::is_memory_document(&state.pool, document_id).await?;
     crate::extraction_open::run_open(
-        state, &doc, &kb, &settings, &client, my_epoch, proposer, await_nod,
+        state,
+        &doc,
+        &kb,
+        settings.as_ref(),
+        client.as_ref(),
+        my_epoch,
+        proposer,
+        await_nod,
+        pushed,
     )
     .await
 }
@@ -466,12 +491,12 @@ mod tests {
                 "Zhang Wei",
                 None,
                 None,
+                None,
                 &mut response_claims,
                 &mut document_claims,
                 &mut bare_cache,
                 &mut needs_adjudication,
-                &mut human_reviews,
-            )
+                &mut human_reviews)
             .await?;
             let b = resolve_handle(
                 &pool,
@@ -480,12 +505,12 @@ mod tests {
                 "Zhang Wei",
                 None,
                 None,
+                None,
                 &mut response_claims,
                 &mut document_claims,
                 &mut bare_cache,
                 &mut needs_adjudication,
-                &mut human_reviews,
-            )
+                &mut human_reviews)
             .await?;
             assert_ne!(a, b);
             assert!(human_reviews);
@@ -558,12 +583,12 @@ mod tests {
                 "Zhang Wei",
                 None,
                 None,
+                None,
                 &mut later_response_claims,
                 &mut document_claims,
                 &mut bare_cache,
                 &mut needs_adjudication,
-                &mut human_reviews,
-            )
+                &mut human_reviews)
             .await?;
             assert_ne!(c, a);
             assert_ne!(c, b);
@@ -586,12 +611,12 @@ mod tests {
                 "Zhang Wei",
                 None,
                 None,
+                None,
                 &mut another_response_claims,
                 &mut document_claims,
                 &mut bare_cache,
                 &mut needs_adjudication,
-                &mut human_reviews,
-            )
+                &mut human_reviews)
             .await?;
             assert_eq!(
                 c_again, c,
@@ -712,6 +737,7 @@ mod tests {
                 Some(person),
                 "Zhang Wei",
                 Some(&ctx),
+                None,
                 None,
                 &mut response_claims,
                 &mut document_claims,

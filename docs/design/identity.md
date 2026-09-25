@@ -16,9 +16,19 @@ the server keeps one only when it occurs verbatim in its quote and the quote in 
 another entity of the document already claims is dropped (`name_claimed_by_another`) [0041 d2]. A
 described thing gets no name fact and is never recalled by name [#731].
 
-**Resolution, one mention at a time, while extraction writes.** Recall is an exact match of the
-mention's name (and its generic-suffix-stripped keys) against the name facts of entities of the same
-type; a context vector (`profile_embedding`, the running mean of chunk vectors) attaches at cosine
+**Resolution, one mention at a time, while extraction writes.** Recall has two channels. The first
+is an exact match of the mention's name (and its generic-suffix-stripped keys) against the name
+facts of entities of the same type. The second is the mention's name vector against the name
+vectors of the base (`name_vectors`, one row per name fact, embedded after each document; migration
+0080): the nearest few within the same type family at cosine 0.60 or above are *proposed* as a
+`name_vector` pair for the adjudicator and never attached, so a short form or a name in another
+script meets its entity through a question rather than a silent second entity [0041 d3 channel 2,
+#709]. Such a pair says in the adjudicator's prompt that its names are similar, not the same
+string, and a batch verdict of *same* on it is never applied directly: it takes the tool-using
+second look first, whatever its confidence, and when that look cannot run (the daily loop budget
+is spent, the model fails) the pair goes to a person as `second_look_unavailable` instead, with the
+batch verdict left out of the verdict cache; the same rule holds with governance on. The identity
+bench showed the batch step merging 张伟 into 财务部总监张伟 on name alone. Only the first channel decides anything: a context vector (`profile_embedding`, the running mean of chunk vectors) attaches at cosine
 0.55 or above, makes a new entity below 0.35, and in between makes a new entity and a pair for the
 adjudicator; two same-name candidates within a tie margin go to a person unless a candidate's object
 name appears in the chunk [0041, #270, #331]. A name another entity of a compatible type already

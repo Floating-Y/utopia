@@ -30,6 +30,11 @@ impl Fixture {
             return Ok(None);
         };
         let pool = sqlx::PgPool::connect(&url).await?;
+        Self::with_pool(pool).await.map(Some)
+    }
+
+    /// 同一份种子，池子由调用方给——连池参数的测试（比如最小池）走这里
+    async fn with_pool(pool: sqlx::PgPool) -> anyhow::Result<Self> {
         utopia_store::db::migrate(&pool).await?;
         let dir = std::env::temp_dir().join(format!("utopia-mcp-{}", Uuid::now_v7()));
         let search = Arc::new(utopia_search::SearchIndex::open(&dir.join("search"))?);
@@ -148,7 +153,7 @@ impl Fixture {
             &f.document.to_string(),
             &[(f.chunk.to_string(), "orchard ".repeat(120))],
         )?;
-        Ok(Some(f))
+        Ok(f)
     }
 
     async fn request(
@@ -195,6 +200,192 @@ impl Fixture {
 
 fn uuid(value: &Value) -> Uuid {
     value.as_str().unwrap().parse().unwrap()
+}
+
+#[tokio::test]
+async fn record_axis_subseconds_survive_authenticated_rdf_export() -> anyhow::Result<()> {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use oxrdf::{vocab::xsd, Term};
+    use tower::ServiceExt;
+
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    async fn check(f: &Fixture) -> anyhow::Result<()> {
+        let generated: chrono::DateTime<chrono::Utc> = "2026-03-01T00:00:00.100001Z".parse()?;
+        let invalidated: chrono::DateTime<chrono::Utc> = "2026-03-01T00:00:00.100002Z".parse()?;
+        for (table, created, deleted, id) in [
+            ("facts", "recorded_at", "invalidated_at", f.fact),
+            ("derived_facts", "derived_at", "invalidated_at", f.derived),
+            ("documents", "created_at", "deleted_at", f.document),
+        ] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET {created}=$2,{deleted}=$3 WHERE id=$1"
+            ))
+            .bind(id)
+            .bind(generated)
+            .bind(invalidated)
+            .execute(&f.state.pool)
+            .await?;
+        }
+        let snapshot_sql = "SELECT jsonb_build_array(
+            (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM facts t WHERE kb_id=$1),
+            (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM documents t WHERE kb_id=$1),
+            (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM derived_facts t WHERE kb_id=$1))";
+        let before: Value = sqlx::query_scalar(snapshot_sql)
+            .bind(f.kb)
+            .fetch_one(&f.state.pool)
+            .await?;
+        let auth = utopia_store::tokens::authenticate(&f.state.pool, &f.token).await?;
+        let jwt = crate::auth::issue_token(&f.state, auth.user_id)?;
+        let app = crate::api::router(f.state.clone(), &Default::default());
+        let names = crate::rdf::Names::new(f.kb, None).map_err(anyhow::Error::msg)?;
+        let subjects = [
+            names.fact(f.fact),
+            names.derived(f.derived),
+            names.document(f.document),
+        ];
+        let mut exports = Vec::new();
+        for (format, parser_format) in [
+            ("turtle", oxrdfio::RdfFormat::Turtle),
+            (
+                "jsonld",
+                oxrdfio::RdfFormat::JsonLd {
+                    profile: oxrdfio::JsonLdProfileSet::empty(),
+                },
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/kbs/{}/export?format={format}", f.kb))
+                        .header("authorization", format!("Bearer {jwt}"))
+                        .body(Body::empty())?,
+                )
+                .await?;
+            anyhow::ensure!(response.status() == StatusCode::OK, "export rejected");
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
+            let quads = oxrdfio::RdfParser::from_format(parser_format)
+                .for_slice(&bytes)
+                .collect::<Result<std::collections::HashSet<_>, _>>()?;
+            for subject in &subjects {
+                for (predicate, expected) in [
+                    ("generatedAtTime", generated),
+                    ("invalidatedAtTime", invalidated),
+                ] {
+                    let q = quads
+                        .iter()
+                        .find(|q| {
+                            q.subject == subject.clone().into()
+                                && q.predicate.as_str()
+                                    == format!("http://www.w3.org/ns/prov#{predicate}")
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("missing {predicate} for {subject}"))?;
+                    let Term::Literal(literal) = &q.object else {
+                        anyhow::bail!("timestamp is not literal");
+                    };
+                    anyhow::ensure!(
+                        literal.datatype() == xsd::DATE_TIME,
+                        "timestamp type changed"
+                    );
+                    let actual: chrono::DateTime<chrono::Utc> = literal.value().parse()?;
+                    anyhow::ensure!(
+                        actual == expected,
+                        "record timestamp truncated: {actual} != {expected}"
+                    );
+                }
+            }
+            exports.push(quads);
+        }
+        anyhow::ensure!(exports[0] == exports[1], "formats disagree");
+        let after: Value = sqlx::query_scalar(snapshot_sql)
+            .bind(f.kb)
+            .fetch_one(&f.state.pool)
+            .await?;
+        anyhow::ensure!(before == after, "export changed records");
+        Ok(())
+    }
+    let result = check(&f).await;
+    let cleanup = f.clean().await;
+    result.and(cleanup)
+}
+
+/// 每个导出的快照事务活满整个流——它占住一条连接直到文件发完。台账如果排在
+/// 事务之后写，就是在「已经占了一条」的情况下再向池子要第二条：支持的最小池
+/// （2 条连接）上两个并发导出会互相把对方的审计饿死到超时。所以顺序必须是：
+/// 先写完台账、放掉连接，再开始占着不放的长事务。两个导出都该落得下一行
+/// kb.exported，而不是在等一条永远不会来的连接
+#[tokio::test]
+async fn concurrent_exports_on_a_minimum_pool_still_record_their_audits() -> anyhow::Result<()> {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let Some(url) = utopia_store::test_db::url() else {
+        return Ok(());
+    };
+    // 支持的最小池：两条连接。短的 acquire 超时只是为了不让失败的探测等太久——
+    // 断言不依赖时钟，依赖台账行在不在
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_millis(400))
+        .connect(&url)
+        .await?;
+    let f = Fixture::with_pool(pool).await?;
+
+    let auth = utopia_store::tokens::authenticate(&f.state.pool, &f.token).await?;
+    let jwt = crate::auth::issue_token(&f.state, auth.user_id)?;
+    let app = crate::api::router(f.state.clone(), &Default::default());
+    let uri = format!("/api/v1/kbs/{}/export?format=turtle", f.kb);
+
+    let export = |app: axum::Router| {
+        let uri = uri.clone();
+        let jwt = jwt.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header("authorization", format!("Bearer {jwt}"))
+                        .body(Body::empty())?,
+                )
+                .await?;
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 8 * 1024 * 1024).await?;
+            Ok::<(StatusCode, axum::body::Bytes), anyhow::Error>((status, bytes))
+        }
+    };
+    // 一次性失败上限：真饿死也只是多等几秒，不该挂着不走
+    let (a, b) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let (a, b) = tokio::join!(export(app.clone()), export(app));
+        (a.unwrap(), b.unwrap())
+    })
+    .await?;
+    anyhow::ensure!(a.0 == StatusCode::OK, "export A rejected: {}", a.0);
+    anyhow::ensure!(b.0 == StatusCode::OK, "export B rejected: {}", b.0);
+    anyhow::ensure!(!a.1.is_empty() && !b.1.is_empty(), "export body empty");
+
+    // 两份导出，两行台账——任何一份的审计被池子饿死这里都露馅
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE kb_id = $1 AND action = 'kb.exported'",
+    )
+    .bind(f.kb)
+    .fetch_one(&f.state.pool)
+    .await?;
+    anyhow::ensure!(
+        audits == 2,
+        "two exports must each record kb.exported, got {audits}"
+    );
+
+    // 两条流发完之后连接都得回家：接着借满整个池（两条）都该立刻拿到——
+    // 快照事务没放下的话，这里就会撞 acquire 超时
+    let c1 = f.state.pool.acquire().await?;
+    let c2 = f.state.pool.acquire().await?;
+    drop(c2);
+    drop(c1);
+    f.clean().await
 }
 
 #[tokio::test]
@@ -281,6 +472,68 @@ async fn find_entities_returns_ranked_ids_and_keeps_text() -> anyhow::Result<()>
 }
 
 #[tokio::test]
+async fn wrong_string_types_are_refused_and_audited_without_writing_memory() -> anyhow::Result<()> {
+    let Some(mut f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let auth = utopia_store::tokens::authenticate(&f.state.pool, &f.token).await?;
+    sqlx::query("UPDATE kb_members SET role='editor' WHERE kb_id=$1 AND user_id=$2")
+        .bind(f.kb)
+        .bind(auth.user_id)
+        .execute(&f.state.pool)
+        .await?;
+    f.token = utopia_store::tokens::issue(
+        &f.state.pool,
+        auth.user_id,
+        "argument types",
+        "write",
+        Some(&[f.kb]),
+        None,
+    )
+    .await?
+    .1;
+    let mut calls = 0_i64;
+    for (name, key) in [("search_chunks", "query"), ("remember", "text")] {
+        for value in [
+            json!(123),
+            json!(false),
+            json!(["pressure"]),
+            json!({"text":"pressure"}),
+        ] {
+            let response = f.call(name, json!({key:value})).await?;
+            assert_eq!(response["isError"], true, "{response}");
+            assert!(response["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("must be a string"));
+            assert!(response.get("structuredContent").is_none());
+            calls += 1;
+            let audited: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM audit_events WHERE kb_id=$1 AND action='mcp.tool_called'",
+            )
+            .bind(f.kb)
+            .fetch_one(&f.state.pool)
+            .await?;
+            assert_eq!(audited, calls);
+        }
+    }
+    let memories: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM documents WHERE kb_id=$1 AND external_key='memory:log'",
+    )
+    .bind(f.kb)
+    .fetch_one(&f.state.pool)
+    .await?;
+    assert_eq!(memories, 0);
+    let good = f.call("search_chunks", json!({"query":"orchard"})).await?;
+    assert_eq!(good["isError"], false);
+    assert!(!good["structuredContent"]["chunks"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    f.clean().await
+}
+
+#[tokio::test]
 async fn search_chunks_returns_chunk_and_document_ids_with_the_same_excerpt() -> anyhow::Result<()>
 {
     let Some(f) = Fixture::new().await? else {
@@ -343,6 +596,41 @@ async fn search_chunks_returns_chunk_and_document_ids_with_the_same_excerpt() ->
         assert_eq!(uuid(&chunk["document_id"]), f.document);
         assert!(indexed.iter().any(|(id, _)| chunk["chunk_id"] == *id));
     }
+    f.clean().await
+}
+
+#[tokio::test]
+async fn entity_fact_qualifier_text_preserves_the_stored_string() -> anyhow::Result<()> {
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let value = json!({"value":"等级 \"A\" / C:\\reports\\a.txt\n第二行\""});
+    sqlx::query("UPDATE fact_qualifiers SET value=$2 WHERE fact_id=$1")
+        .bind(f.corrected)
+        .bind(&value)
+        .execute(&f.state.pool)
+        .await?;
+    let result = f
+        .call("entity_facts", json!({"entity_id":f.subject}))
+        .await?;
+    assert_eq!(result["isError"], false);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains(&format!("[weight: {}]", value["value"].as_str().unwrap())),
+        "{text}"
+    );
+    let fact = result["structuredContent"]["facts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|fact| fact["id"] == f.corrected.to_string())
+        .unwrap();
+    assert_eq!(fact["qualifiers"][0]["value"], value);
+    let stored: Value = sqlx::query_scalar("SELECT value FROM fact_qualifiers WHERE fact_id=$1")
+        .bind(f.corrected)
+        .fetch_one(&f.state.pool)
+        .await?;
+    assert_eq!(stored, value);
     f.clean().await
 }
 
@@ -415,7 +703,8 @@ async fn entity_facts_keeps_identity_values_filters_and_both_clocks() -> anyhow:
     assert!(derived["rule_id"].is_null());
     uuid(&derived["attribute_rule_id"]);
     // The same UUID is the RDF statement's identity, not a newly minted response ID.
-    let exported = utopia_store::export::facts_page(&f.state.pool, f.kb, None).await?;
+    let exported =
+        utopia_store::export::facts_page(&mut f.state.pool.begin().await?, f.kb, None).await?;
     assert!(exported
         .iter()
         .any(|r| r.id == uuid(&corrected["id"]) && r.documents == vec![f.document]));
@@ -586,6 +875,83 @@ async fn changes_returns_fact_ids_and_a_reusable_correction_timestamp() -> anyho
 }
 
 #[tokio::test]
+async fn opposite_directions_reach_authenticated_path_output() -> anyhow::Result<()> {
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    async fn check(f: &Fixture) -> anyhow::Result<()> {
+        let (a, b, p) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        sqlx::query(
+            "INSERT INTO relation_types(id,kb_id,key,label) VALUES ($1,$2,'supplies','supplies')",
+        )
+        .bind(p)
+        .bind(f.kb)
+        .execute(&f.state.pool)
+        .await?;
+        for (id, name) in [(a, "A"), (b, "B")] {
+            sqlx::query("INSERT INTO entities(id,kb_id,canonical_name) VALUES ($1,$2,$3)")
+                .bind(id)
+                .bind(f.kb)
+                .bind(name)
+                .execute(&f.state.pool)
+                .await?;
+        }
+        for (s, o) in [(a, b), (b, a)] {
+            utopia_store::graph::insert_fact(
+                &f.state.pool,
+                f.kb,
+                s,
+                Some(p),
+                o,
+                utopia_store::graph::Validity::starting(
+                    Some("2026-01-01T00:00:00Z".parse()?),
+                    Some("day"),
+                ),
+                0.9,
+            )
+            .await?;
+        }
+        let snapshot_sql = "SELECT jsonb_build_array(
+            (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM facts t WHERE kb_id=$1),
+            (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM entities t WHERE kb_id=$1),
+            (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM relation_types t WHERE kb_id=$1),
+            (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM derived_facts t WHERE kb_id=$1),
+            (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM rules t WHERE kb_id=$1),
+            (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM jobs t WHERE payload->>'kb_id'=$1::text))";
+        let before: Value = sqlx::query_scalar(snapshot_sql)
+            .bind(f.kb)
+            .fetch_one(&f.state.pool)
+            .await?;
+        for (from, to, left, right) in [
+            (a, b, "A —supplies→ B", "A ←supplies— B"),
+            (b, a, "B —supplies→ A", "B ←supplies— A"),
+        ] {
+            let result = f
+                .call(
+                    "paths_between",
+                    json!({"from":from,"to":to,"max_hops":1,"at":"2026-06-01"}),
+                )
+                .await?;
+            let text = result["content"][0]["text"].as_str().unwrap_or_default();
+            anyhow::ensure!(
+                text.contains(left) && text.contains(right),
+                "opposite path lost: {text}"
+            );
+            anyhow::ensure!(text.contains("2 paths"), "unexpected path count: {text}");
+        }
+        let after: Value = sqlx::query_scalar(snapshot_sql)
+            .bind(f.kb)
+            .fetch_one(&f.state.pool)
+            .await?;
+        anyhow::ensure!(before == after, "path read changed business data");
+        Ok(())
+    }
+    let result = check(&f).await;
+    let cleanup = f.clean().await;
+    result.and(cleanup)
+}
+
+#[tokio::test]
 async fn missing_entities_and_empty_graph_reads_keep_their_results() -> anyhow::Result<()> {
     let Some(f) = Fixture::new().await? else {
         return Ok(());
@@ -657,6 +1023,375 @@ async fn missing_entities_and_empty_graph_reads_keep_their_results() -> anyhow::
         .starts_with("No path of up to 3 hops between "));
     assert!(empty.get("structuredContent").is_none());
     f.clean().await
+}
+
+#[tokio::test]
+async fn remembered_clock_times_do_not_receive_the_date_only_offset() -> anyhow::Result<()> {
+    let Some(mut f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let auth = utopia_store::tokens::authenticate(&f.state.pool, &f.token).await?;
+    sqlx::query("UPDATE kb_members SET role='editor' WHERE kb_id=$1 AND user_id=$2")
+        .bind(f.kb)
+        .bind(auth.user_id)
+        .execute(&f.state.pool)
+        .await?;
+    f.token = utopia_store::tokens::issue(
+        &f.state.pool,
+        auth.user_id,
+        "memory time test",
+        "write",
+        Some(&[f.kb]),
+        None,
+    )
+    .await?
+    .1;
+    for (input, stored, echoed) in [
+        ("2026", "2026-01-01 12:00", "2026"),
+        ("2026-09", "2026-09-01 12:00", "2026-09"),
+        ("2026-09-20", "2026-09-20 12:00", "2026-09-20"),
+        (
+            "2026-09-20T18:30:00Z",
+            "2026-09-20 18:30",
+            "2026-09-20T18:30:00Z",
+        ),
+        (
+            "2026-09-20T18:30:45.123Z",
+            "2026-09-20 18:30",
+            "2026-09-20T18:30:45Z",
+        ),
+        (
+            "2026-09-20T18:30:00+08:00",
+            "2026-09-20 10:30",
+            "2026-09-20T10:30:00Z",
+        ),
+        (
+            "2026-09-20T18:30:00-04:00",
+            "2026-09-20 22:30",
+            "2026-09-20T22:30:00Z",
+        ),
+        ("2026-09-20T23Z", "2026-09-20 23:00", "2026-09-20T23Z"),
+        ("2026-09-20T23:45Z", "2026-09-20 23:45", "2026-09-20T23:45Z"),
+        ("2026-09-20T23+02:00", "2026-09-20 21:00", "2026-09-20T21Z"),
+        (
+            "2026-09-20T23:45-02:00",
+            "2026-09-21 01:45",
+            "2026-09-21T01:45Z",
+        ),
+        // The shared parser deliberately falls back to day precision without a zone.
+        ("2026-09-20T18:30:00", "2026-09-20 12:00", "2026-09-20"),
+    ] {
+        let sentence = format!("inspection at {input}");
+        let result = f
+            .call("remember", json!({"text":sentence,"occurred_at":input}))
+            .await?;
+        assert_eq!(result["isError"], false);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("(effective {echoed})")));
+        let text: String = sqlx::query_scalar(
+            "SELECT text FROM chunks WHERE kb_id=$1 ORDER BY created_at DESC,seq DESC LIMIT 1",
+        )
+        .bind(f.kb)
+        .fetch_one(&f.state.pool)
+        .await?;
+        assert_eq!(text, format!("[{stored}] {sentence}"), "input: {input}");
+    }
+    // Missing/invalid input keeps the existing 'now' fallback.
+    for input in [Value::Null, json!(""), json!("not-a-date")] {
+        let before = chrono::Utc::now();
+        let result = f
+            .call("remember", json!({"text":"fallback","occurred_at":input}))
+            .await?;
+        let after = chrono::Utc::now();
+        assert_eq!(result["isError"], false);
+        let reply = result["content"][0]["text"].as_str().unwrap();
+        let echoed = reply
+            .split("(effective ")
+            .nth(1)
+            .unwrap()
+            .split(')')
+            .next()
+            .unwrap();
+        let time: chrono::DateTime<chrono::Utc> = echoed.parse()?;
+        assert!(before <= time && time <= after);
+        let text: String = sqlx::query_scalar(
+            "SELECT text FROM chunks WHERE kb_id=$1 ORDER BY created_at DESC,seq DESC LIMIT 1",
+        )
+        .bind(f.kb)
+        .fetch_one(&f.state.pool)
+        .await?;
+        assert_eq!(
+            text,
+            format!("[{}] fallback", time.format("%Y-%m-%d %H:%M"))
+        );
+    }
+    let queued: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind='memory_ingest' AND payload->>'document_id' IN (SELECT id::text FROM documents WHERE kb_id=$1)")
+        .bind(f.kb).fetch_one(&f.state.pool).await?;
+    assert_eq!(queued, 15);
+    sqlx::query("DELETE FROM jobs WHERE kind='memory_ingest' AND payload->>'document_id' IN (SELECT id::text FROM documents WHERE kb_id=$1)")
+        .bind(f.kb).execute(&f.state.pool).await?;
+    f.clean().await
+}
+
+#[tokio::test]
+async fn declared_property_links_survive_authenticated_rdf_export() -> anyhow::Result<()> {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    use utopia_core::models::RelationAxioms;
+    use utopia_store::ontology::{
+        create_relation_type, create_relation_with_iri, update_relation_type,
+    };
+
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    async fn check(f: &Fixture) -> anyhow::Result<()> {
+        const IMPORTED: &str = "https://example.test/worksFor";
+        let root = create_relation_with_iri(
+            &f.state.pool,
+            f.kb,
+            "employment",
+            "Employment",
+            "",
+            IMPORTED,
+            false,
+            false,
+            &[],
+            &[],
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("missing imported relation"))?;
+        let mut declared = Vec::new();
+        let mut parent = root;
+        for key in ["manages", "directs", "leads"] {
+            let ax = RelationAxioms {
+                sub_property_of: Some(parent),
+                ..Default::default()
+            };
+            let id = create_relation_type(
+                &f.state.pool,
+                f.kb,
+                key,
+                key,
+                "state",
+                ax,
+                "",
+                "relation",
+                &[],
+                &[],
+                None,
+                None,
+            )
+            .await?;
+            declared.push((id, key, parent));
+            parent = id;
+        }
+        let inverse = create_relation_type(
+            &f.state.pool,
+            f.kb,
+            "employs",
+            "Employs",
+            "state",
+            RelationAxioms {
+                inverse_of: Some(root),
+                ..Default::default()
+            },
+            "",
+            "relation",
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .await?;
+        // Store exactly the reciprocal declaration too; export must not manufacture it.
+        update_relation_type(
+            &f.state.pool,
+            f.kb,
+            root,
+            "Employment",
+            "state",
+            RelationAxioms {
+                inverse_of: Some(inverse),
+                ..Default::default()
+            },
+            "",
+            None,
+            None,
+            None,
+            None,
+        )
+        .await?;
+        let other = create_relation_type(
+            &f.state.pool,
+            f.other_kb,
+            "employment",
+            "Employment",
+            "state",
+            Default::default(),
+            "",
+            "relation",
+            &[],
+            &[],
+            None,
+            None,
+        )
+        .await?;
+        anyhow::ensure!(
+            create_relation_type(
+                &f.state.pool,
+                f.kb,
+                "bad_cross_base",
+                "Bad",
+                "state",
+                RelationAxioms {
+                    inverse_of: Some(other),
+                    ..Default::default()
+                },
+                "",
+                "relation",
+                &[],
+                &[],
+                None,
+                None
+            )
+            .await
+            .is_err(),
+            "cross-base input must be refused by the real write path"
+        );
+        let auth = utopia_store::tokens::authenticate(&f.state.pool, &f.token).await?;
+        let jwt = crate::auth::issue_token(&f.state, auth.user_id)?;
+        let app = crate::api::router(f.state.clone(), &Default::default());
+        let names = crate::rdf::Names::new(f.kb, None).map_err(anyhow::Error::msg)?;
+        let relation_iri = |key: &str| format!("<urn:utopia:kb:{}:relation:{key}>", f.kb);
+        let inverse_term = "<http://www.w3.org/2002/07/owl#inverseOf>".to_string();
+        let sub_term = "<http://www.w3.org/2000/01/rdf-schema#subPropertyOf>".to_string();
+        let expected: std::collections::HashSet<_> = [
+            (
+                relation_iri("employs"),
+                inverse_term.clone(),
+                format!("<{IMPORTED}>"),
+            ),
+            (
+                format!("<{IMPORTED}>"),
+                inverse_term.clone(),
+                relation_iri("employs"),
+            ),
+            (
+                relation_iri("manages"),
+                sub_term.clone(),
+                format!("<{IMPORTED}>"),
+            ),
+            (
+                relation_iri("directs"),
+                sub_term.clone(),
+                relation_iri("manages"),
+            ),
+            (
+                relation_iri("leads"),
+                sub_term.clone(),
+                relation_iri("directs"),
+            ),
+        ]
+        .into_iter()
+        .collect();
+        for renamed in [false, true] {
+            if renamed {
+                update_relation_type(
+                    &f.state.pool,
+                    f.kb,
+                    declared[0].0,
+                    "New label",
+                    "state",
+                    RelationAxioms {
+                        sub_property_of: Some(root),
+                        ..Default::default()
+                    },
+                    "",
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            }
+            let snapshot_sql = "SELECT jsonb_build_array(
+                (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM relation_types t WHERE kb_id=$1),
+                (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM facts t WHERE kb_id=$1),
+                (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM derived_facts t WHERE kb_id=$1),
+                (SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM jobs t WHERE payload->>'kb_id'=$1::text))";
+            let before: Value = sqlx::query_scalar(snapshot_sql)
+                .bind(f.kb)
+                .fetch_one(&f.state.pool)
+                .await?;
+            let mut exports = Vec::new();
+            for (format, parser_format) in [
+                ("turtle", oxrdfio::RdfFormat::Turtle),
+                (
+                    "jsonld",
+                    oxrdfio::RdfFormat::JsonLd {
+                        profile: oxrdfio::JsonLdProfileSet::empty(),
+                    },
+                ),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/api/v1/kbs/{}/export?format={format}", f.kb))
+                            .header("authorization", format!("Bearer {jwt}"))
+                            .body(Body::empty())?,
+                    )
+                    .await?;
+                anyhow::ensure!(response.status() == StatusCode::OK, "export rejected");
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
+                let quads = oxrdfio::RdfParser::from_format(parser_format)
+                    .for_slice(&bytes)
+                    .collect::<Result<std::collections::HashSet<_>, _>>()?;
+                let links: std::collections::HashSet<_> = quads
+                    .iter()
+                    .filter(|q| {
+                        [inverse_term.as_str(), sub_term.as_str()]
+                            .contains(&q.predicate.to_string().as_str())
+                    })
+                    .map(|q| {
+                        (
+                            q.subject.to_string(),
+                            q.predicate.to_string(),
+                            q.object.to_string(),
+                        )
+                    })
+                    .collect();
+                anyhow::ensure!(
+                    links == expected,
+                    "declared property links missing or invented: {links:?}"
+                );
+                anyhow::ensure!(
+                    quads
+                        .iter()
+                        .any(|q| q.subject == names.fact(f.corrected).into()),
+                    "lost existing facts"
+                );
+                exports.push(quads);
+            }
+            anyhow::ensure!(exports[0] == exports[1], "formats disagree");
+            let after: Value = sqlx::query_scalar(snapshot_sql)
+                .bind(f.kb)
+                .fetch_one(&f.state.pool)
+                .await?;
+            anyhow::ensure!(
+                before == after,
+                "export changed stored declarations/facts/jobs"
+            );
+        }
+        Ok(())
+    }
+    let result = check(&f).await;
+    let cleanup = f.clean().await;
+    result.and(cleanup)
 }
 
 #[tokio::test]
@@ -813,6 +1548,122 @@ async fn document_reads_preserve_text_empty_and_unavailable_results() -> anyhow:
 }
 
 #[tokio::test]
+async fn failed_memory_writes_are_tool_errors() -> anyhow::Result<()> {
+    let Some(mut f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let denied = f
+        .request(
+            f.kb,
+            "tools/call",
+            json!({"name":"remember","arguments":{"text":"denied"}}),
+        )
+        .await
+        .map_err(|e| e.0)?
+        .0;
+    assert_eq!(denied["error"]["code"], -32601);
+    let auth = utopia_store::tokens::authenticate(&f.state.pool, &f.token).await?;
+    sqlx::query("UPDATE kb_members SET role='editor' WHERE kb_id=$1 AND user_id=$2")
+        .bind(f.kb)
+        .bind(auth.user_id)
+        .execute(&f.state.pool)
+        .await?;
+    f.token = utopia_store::tokens::issue(
+        &f.state.pool,
+        auth.user_id,
+        "memory error test",
+        "write",
+        Some(&[f.kb]),
+        None,
+    )
+    .await?
+    .1;
+    let success = f.call("remember", json!({"text":"recorded"})).await?;
+    assert_eq!(success["isError"], false);
+    assert!(success["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("Recorded the sentence"));
+    sqlx::query("DELETE FROM jobs WHERE kind='memory_ingest' AND payload->>'document_id' IN (SELECT id::text FROM documents WHERE kb_id=$1)")
+        .bind(f.kb).execute(&f.state.pool).await?;
+    // As in failed_reads_do_not_become_successful_empty_results, close only this
+    // fixture's pool. append_episode fails before writing or enqueueing anything.
+    f.state.pool.close().await;
+    let ctx = ToolCtx {
+        state: &f.state,
+        kb_id: f.kb,
+        workspace_id: f.ws,
+        mounted_sources: &[],
+        can_write: true,
+        actor: Some(auth.user_id),
+        via_token: None,
+        question: None,
+    };
+    let failed = tool_result(
+        tools::dispatch(
+            &ctx,
+            &mut ToolSink::default(),
+            "remember",
+            &json!({"text":"not recorded"}),
+        )
+        .await,
+    );
+    f.state.pool = sqlx::PgPool::connect(&utopia_store::test_db::url().unwrap()).await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM chunks WHERE kb_id=$1 AND text LIKE '%not recorded%'",
+    )
+    .bind(f.kb)
+    .fetch_one(&f.state.pool)
+    .await?;
+    assert_eq!(count, 0);
+    f.clean().await?;
+    assert!(failed["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .starts_with("Failed to record:"));
+    assert_eq!(failed["isError"], true, "{failed}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn memory_text_empty_after_nul_removal_is_a_tool_error() -> anyhow::Result<()> {
+    let Some(mut f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let auth = utopia_store::tokens::authenticate(&f.state.pool, &f.token).await?;
+    sqlx::query("UPDATE kb_members SET role='editor' WHERE kb_id=$1 AND user_id=$2")
+        .bind(f.kb)
+        .bind(auth.user_id)
+        .execute(&f.state.pool)
+        .await?;
+    f.token = utopia_store::tokens::issue(
+        &f.state.pool,
+        auth.user_id,
+        "empty memory test",
+        "write",
+        Some(&[f.kb]),
+        None,
+    )
+    .await?
+    .1;
+    let result = f.call("remember", json!({"text":"\u{0} \u{0}"})).await?;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM documents WHERE kb_id=$1 AND external_key='memory:log'",
+    )
+    .bind(f.kb)
+    .fetch_one(&f.state.pool)
+    .await?;
+    assert_eq!(count, 0);
+    f.clean().await?;
+    assert_eq!(
+        result["content"][0]["text"],
+        "remember requires non-empty text."
+    );
+    assert_eq!(result["isError"], true);
+    Ok(())
+}
+
+#[tokio::test]
 async fn failed_document_chunks_do_not_become_a_successful_empty_document() -> anyhow::Result<()> {
     let Some(f) = Fixture::new().await? else {
         return Ok(());
@@ -878,6 +1729,241 @@ fn text_only_results_do_not_acquire_a_structured_payload() {
 }
 
 #[tokio::test]
+async fn computed_rule_descriptions_keep_the_expression_tree_and_identity() -> anyhow::Result<()> {
+    use utopia_store::business_rules::{self, ConditionInput};
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let ty: Uuid = sqlx::query_scalar("SELECT type_id FROM entities WHERE id=$1")
+        .bind(f.subject)
+        .fetch_one(&f.state.pool)
+        .await?;
+    let (revenue, cost, margin) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    for (id, key) in [(revenue, "revenue"), (cost, "cost"), (margin, "margin")] {
+        sqlx::query("INSERT INTO relation_types(id,kb_id,key,label,kind,datatype) VALUES ($1,$2,$3,$3,'attribute','number')")
+            .bind(id).bind(f.kb).bind(key).execute(&f.state.pool).await?;
+    }
+    let conditions = [ConditionInput {
+        group: 2,
+        side: "x".into(),
+        predicate_id: revenue,
+        op: "present".into(),
+        operand: None,
+    }];
+    let sub = json!({"op":"sub","l":{"attr":revenue},"r":{"attr":cost}});
+    for (name, expr, expected) in [
+        ("difference", sub.clone(), "(revenue - cost)"),
+        (
+            "ratio",
+            json!({"op":"div","l":sub,"r":{"attr":revenue}}),
+            "((revenue - cost) / revenue)",
+        ),
+        (
+            "nested",
+            json!({"op":"sub","l":{"attr":revenue},"r":{"op":"sub","l":{"attr":cost},"r":{"const":2}}}),
+            "(revenue - (cost - 2))",
+        ),
+        (
+            "zero",
+            json!({"op":"add","l":{"attr":revenue},"r":{"const":0}}),
+            "(revenue + 0)",
+        ),
+        (
+            "negative",
+            json!({"op":"mul","l":{"attr":revenue},"r":{"const":"-2.5"}}),
+            "(revenue * -2.5)",
+        ),
+    ] {
+        business_rules::create(
+            &f.state.pool,
+            f.kb,
+            name,
+            "",
+            ty,
+            "computed",
+            None,
+            Some(margin),
+            None,
+            Some(expr),
+            None,
+            &conditions,
+        )
+        .await?;
+        let before = business_rules::list(&f.state.pool, f.kb).await?;
+        let derived_before: Value=sqlx::query_scalar("SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY id),'[]') FROM derived_facts d WHERE kb_id=$1")
+            .bind(f.kb).fetch_one(&f.state.pool).await?;
+        let jobs_before: Value=sqlx::query_scalar("SELECT coalesce(jsonb_agg(to_jsonb(j) ORDER BY id),'[]') FROM jobs j WHERE payload->>'kb_id'=$1 OR payload->>'document_id' IN (SELECT id::text FROM documents WHERE kb_id=$2)")
+            .bind(f.kb.to_string()).bind(f.kb).fetch_one(&f.state.pool).await?;
+        let result = f.call("list_rules", json!({})).await?;
+        assert_eq!(result["isError"], false);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let line = text
+            .lines()
+            .find(|l| l.starts_with(&format!("{name} [")))
+            .unwrap();
+        assert!(line.contains(&format!("⇒ margin = {expected} ·")), "{line}");
+        assert!(text.contains("⇒ weight = {\"unit\":\"kg\",\"value\":8}"));
+        assert_eq!(business_rules::list(&f.state.pool, f.kb).await?, before);
+        let derived_after: Value=sqlx::query_scalar("SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY id),'[]') FROM derived_facts d WHERE kb_id=$1")
+            .bind(f.kb).fetch_one(&f.state.pool).await?;
+        assert_eq!(derived_before, derived_after);
+        let jobs_after: Value=sqlx::query_scalar("SELECT coalesce(jsonb_agg(to_jsonb(j) ORDER BY id),'[]') FROM jobs j WHERE payload->>'kb_id'=$1 OR payload->>'document_id' IN (SELECT id::text FROM documents WHERE kb_id=$2)")
+            .bind(f.kb.to_string()).bind(f.kb).fetch_one(&f.state.pool).await?;
+        assert_eq!(jobs_before, jobs_after);
+    }
+    business_rules::create(
+        &f.state.pool,
+        f.kb,
+        "typing control",
+        "",
+        ty,
+        "typing",
+        Some(ty),
+        None,
+        None,
+        None,
+        None,
+        &conditions,
+    )
+    .await?;
+    sqlx::query("UPDATE relation_types SET label='收入' WHERE id=ANY($1)")
+        .bind(vec![revenue, cost])
+        .execute(&f.state.pool)
+        .await?;
+    let result = f.call("list_rules", json!({})).await?;
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("(收入 [revenue] - 收入 [cost])"), "{text}");
+    assert!(text
+        .lines()
+        .find(|l| l.starts_with("typing control ["))
+        .unwrap()
+        .contains("⇒ Thing ·"));
+    // Corrupt/stale stored references must not expose another base's label or
+    // fabricate a formula. Creation itself continues to reject such inputs.
+    let foreign = Uuid::now_v7();
+    sqlx::query("INSERT INTO relation_types(id,kb_id,key,label,kind,datatype) VALUES ($1,$2,'hidden','Foreign secret','attribute','number')")
+        .bind(foreign).bind(f.other_kb).execute(&f.state.pool).await?;
+    for expr in [
+        json!({"attr":foreign}),
+        json!({"op":"unknown"}),
+        json!({"const":null}),
+    ] {
+        sqlx::query(
+            "UPDATE attribute_rules SET conclude_expr=$2 WHERE kb_id=$1 AND name='difference'",
+        )
+        .bind(f.kb)
+        .bind(expr)
+        .execute(&f.state.pool)
+        .await?;
+        let result = f.call("list_rules", json!({})).await?;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.lines()
+                .find(|l| l.starts_with("difference ["))
+                .unwrap()
+                .contains("margin = (expression unavailable)"),
+            "{text}"
+        );
+        assert!(!text.contains("Foreign secret"));
+    }
+    f.clean().await
+}
+
+#[tokio::test]
+async fn written_magnitudes_keep_fractions_through_authenticated_adoption() -> anyhow::Result<()> {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    async fn check(f: &Fixture) -> anyhow::Result<()> {
+        let auth = utopia_store::tokens::authenticate(&f.state.pool, &f.token).await?;
+        sqlx::query("UPDATE kb_members SET role='editor' WHERE kb_id=$1 AND user_id=$2")
+            .bind(f.kb)
+            .bind(auth.user_id)
+            .execute(&f.state.pool)
+            .await?;
+        let jwt = crate::auth::issue_token(&f.state, auth.user_id)?;
+        let app = crate::api::router(f.state.clone(), &Default::default());
+        for (index, input) in ["1.00000025 million", "100.000025万"]
+            .into_iter()
+            .enumerate()
+        {
+            let form = format!("fractional_amount_{index}");
+            let raw = json!({"value":input,"unit":"$"});
+            // This endpoint adopts unbound typed value facts. Open statements are
+            // intentionally not used: their alignment is a different write path.
+            let (old, _) = utopia_store::graph::insert_value_fact(
+                &f.state.pool,
+                f.kb,
+                f.subject,
+                None,
+                &raw,
+                utopia_store::graph::Validity::default(),
+                0.9,
+            )
+            .await?;
+            sqlx::query("INSERT INTO fact_evidence(fact_id,chunk_id,document_id,doc_version,quote,proposed_predicate)
+                         VALUES ($1,$2,$3,1,$4,$5)")
+                .bind(old).bind(f.chunk).bind(f.document).bind(input).bind(&form).execute(&f.state.pool).await?;
+            let waiting = utopia_store::graph::value_facts_for_forms(
+                &f.state.pool,
+                f.kb,
+                std::slice::from_ref(&form),
+            )
+            .await?;
+            anyhow::ensure!(
+                waiting.len() == 1 && waiting[0].0 == old,
+                "fixture is not supported by adoption"
+            );
+            let response = app.clone().oneshot(Request::builder().method("POST")
+                .uri(format!("/api/v1/kbs/{}/ontology/adopt-predicate",f.kb))
+                .header("authorization",format!("Bearer {jwt}"))
+                .header("content-type","application/json")
+                .body(Body::from(json!({"key":form,"label":form,"forms":[form],"kind":"attribute","datatype":"number"}).to_string()))?).await?;
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
+            anyhow::ensure!(
+                status == StatusCode::OK,
+                "adoption rejected: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+            let result: Value = serde_json::from_slice(&bytes)?;
+            anyhow::ensure!(result["remapped"] == 1, "no fact adopted: {result}");
+            let attribute = uuid(&result["id"]);
+            let (new, stored, supersedes): (Uuid,Value,Option<Uuid>) = sqlx::query_as(
+                "SELECT id,object_value,supersedes FROM facts WHERE kb_id=$1 AND predicate_id=$2 AND invalidated_at IS NULL")
+                .bind(f.kb).bind(attribute).fetch_one(&f.state.pool).await?;
+            anyhow::ensure!(
+                stored["value"].as_f64() == Some(1000000.25),
+                "adoption rounded away .25: {stored}"
+            );
+            anyhow::ensure!(
+                stored["unit"] == "$" && supersedes == Some(old),
+                "unit or history lost"
+            );
+            let original: Value = sqlx::query_scalar("SELECT object_value FROM facts WHERE id=$1")
+                .bind(old)
+                .fetch_one(&f.state.pool)
+                .await?;
+            anyhow::ensure!(original == raw, "historical value rewritten");
+            let evidence: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM fact_evidence WHERE fact_id=$1 AND quote=$2 AND document_id=$3)")
+                .bind(new).bind(input).bind(f.document).fetch_one(&f.state.pool).await?;
+            anyhow::ensure!(evidence, "adopted fact lost source evidence");
+            let audit: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE kb_id=$1 AND action='ontology.attribute_adopted' AND target_id=$2")
+                .bind(f.kb).bind(attribute).fetch_one(&f.state.pool).await?;
+            anyhow::ensure!(audit == 1, "missing adoption audit");
+        }
+        Ok(())
+    }
+    let result = check(&f).await;
+    let cleanup = f.clean().await;
+    result.and(cleanup)
+}
+
+#[tokio::test]
 async fn rule_reads_preserve_matches_and_empty_results() -> anyhow::Result<()> {
     let Some(f) = Fixture::new().await? else {
         return Ok(());
@@ -918,4 +2004,414 @@ async fn rule_reads_preserve_matches_and_empty_results() -> anyhow::Result<()> {
         "This base has no business rules."
     );
     f.clean().await
+}
+
+#[tokio::test]
+async fn rule_descriptions_preserve_condition_groups() -> anyhow::Result<()> {
+    use utopia_store::business_rules::{self, ConditionInput};
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let (ty, attr): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT subject_type_id, conclude_predicate_id FROM attribute_rules WHERE kb_id=$1",
+    )
+    .bind(f.kb)
+    .fetch_one(&f.state.pool)
+    .await?;
+    for (name, groups, expected) in [
+        (
+            "single",
+            [0, 0, 0],
+            "weight gt 1 AND weight lt 9 AND weight gte 7",
+        ),
+        (
+            "mixed",
+            [0, 0, 1],
+            "(weight gt 1 AND weight lt 9) OR weight gte 7",
+        ),
+        (
+            "sparse",
+            [2, 2, 9],
+            "(weight gt 1 AND weight lt 9) OR weight gte 7",
+        ),
+        (
+            "singletons",
+            [2, 9, 12],
+            "weight gt 1 OR weight lt 9 OR weight gte 7",
+        ),
+    ] {
+        let cs: Vec<_> = groups
+            .into_iter()
+            .zip([("gt", 1), ("lt", 9), ("gte", 7)])
+            .map(|(group, (op, n))| ConditionInput {
+                group,
+                side: "x".into(),
+                predicate_id: attr,
+                op: op.into(),
+                operand: Some(json!(n)),
+            })
+            .collect();
+        business_rules::create(
+            &f.state.pool,
+            f.kb,
+            name,
+            "",
+            ty,
+            "attribute",
+            None,
+            Some(attr),
+            Some(json!({"value":8})),
+            None,
+            None,
+            &cs,
+        )
+        .await?;
+        let before = business_rules::list(&f.state.pool, f.kb).await?;
+        let facts_before: Value = sqlx::query_scalar(
+            "SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY id),'[]') FROM derived_facts d WHERE kb_id=$1"
+        ).bind(f.kb).fetch_one(&f.state.pool).await?;
+        let response = f.call("list_rules", json!({})).await?;
+        assert_eq!(response["isError"], false);
+        let text = response["content"][0]["text"].as_str().unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.starts_with(&format!("{name} [")))
+            .unwrap();
+        assert!(line.contains(&format!("where {expected} ⇒")), "{line}");
+        assert_eq!(business_rules::list(&f.state.pool, f.kb).await?, before);
+        let facts_after: Value = sqlx::query_scalar(
+            "SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY id),'[]') FROM derived_facts d WHERE kb_id=$1"
+        ).bind(f.kb).fetch_one(&f.state.pool).await?;
+        assert_eq!(facts_after, facts_before);
+    }
+    f.clean().await
+}
+
+#[tokio::test]
+async fn rule_matches_keep_materialized_intervals_and_count_rows() -> anyhow::Result<()> {
+    use utopia_store::business_rules::{self, ConditionInput};
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    let ty: Uuid = sqlx::query_scalar("SELECT type_id FROM entities WHERE id=$1")
+        .bind(f.subject)
+        .fetch_one(&f.state.pool)
+        .await?;
+    let (reading, result, is_a, marked) = (
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+    );
+    for (id, key, datatype, builtin) in [
+        (reading, "reading", "number", false),
+        (result, "result", "number", false),
+        (is_a, "is_a", "text", true),
+    ] {
+        sqlx::query("INSERT INTO relation_types(id,kb_id,key,label,kind,datatype,builtin) VALUES ($1,$2,$3,$3,'attribute',$4,$5)")
+            .bind(id).bind(f.kb).bind(key).bind(datatype).bind(builtin).execute(&f.state.pool).await?;
+    }
+    sqlx::query("INSERT INTO entity_types(id,kb_id,key,label) VALUES ($1,$2,'marked','Marked')")
+        .bind(marked)
+        .bind(f.kb)
+        .execute(&f.state.pool)
+        .await?;
+    let conditions = [ConditionInput {
+        group: 0,
+        side: "x".into(),
+        predicate_id: reading,
+        op: "gt".into(),
+        operand: Some(json!(0)),
+    }];
+    let typing = business_rules::create(
+        &f.state.pool,
+        f.kb,
+        "historical typing",
+        "",
+        ty,
+        "typing",
+        Some(marked),
+        None,
+        None,
+        None,
+        None,
+        &conditions,
+    )
+    .await?;
+    let attribute = business_rules::create(
+        &f.state.pool,
+        f.kb,
+        "historical attribute",
+        "",
+        ty,
+        "attribute",
+        None,
+        Some(result),
+        Some(json!(8)),
+        None,
+        None,
+        &conditions,
+    )
+    .await?;
+    // Source readings use deliberately disjoint, fixed historical intervals.
+    // The derived rows and their precision are produced by the real materializer.
+    for (from, to, fp, tp) in [
+        (
+            "2020-01-01T00:00:00Z",
+            "2021-03-01T00:00:00Z",
+            "year",
+            "month",
+        ),
+        (
+            "2023-06-01T00:00:00Z",
+            "2024-07-15T00:00:00Z",
+            "month",
+            "day",
+        ),
+    ] {
+        sqlx::query("INSERT INTO facts(id,kb_id,subject_id,predicate_id,object_value,valid_from,valid_to,valid_from_precision,valid_to_precision) VALUES ($1,$2,$3,$4,'{\"value\":10}',$5,$6,$7,$8)")
+            .bind(Uuid::now_v7()).bind(f.kb).bind(f.subject).bind(reading)
+            .bind(from.parse::<chrono::DateTime<chrono::Utc>>()?).bind(to.parse::<chrono::DateTime<chrono::Utc>>()?)
+            .bind(fp).bind(tp).execute(&f.state.pool).await?;
+    }
+    utopia_store::reasoning::materialize(&f.state.pool, f.kb).await?;
+    let before: Value = sqlx::query_scalar("SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY id),'[]') FROM derived_facts d WHERE kb_id=$1")
+        .bind(f.kb).fetch_one(&f.state.pool).await?;
+    let rules_before = business_rules::list(&f.state.pool, f.kb).await?;
+    let jobs_before: Value=sqlx::query_scalar("SELECT coalesce(jsonb_agg(to_jsonb(j) ORDER BY id),'[]') FROM jobs j WHERE payload->>'kb_id'=$1 OR payload->>'document_id' IN (SELECT id::text FROM documents WHERE kb_id=$2)")
+        .bind(f.kb.to_string()).bind(f.kb).fetch_one(&f.state.pool).await?;
+    for (rule, conclusion) in [(typing, "Marked"), (attribute, "8")] {
+        let (rows, total) = business_rules::matches(&f.state.pool, f.kb, rule, 50, 0).await?;
+        assert_eq!(total, 2, "real materialization must retain both intervals");
+        assert!(rows.iter().all(|r| uuid(&r["entity_id"]) == f.subject));
+        let response = f.call("rule_matches", json!({"rule_id":rule})).await?;
+        assert_eq!(response["isError"], false);
+        let text = response["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("validity: 2020 → 2021-03"), "{text}");
+        assert!(text.contains("validity: 2023-06 → 2024-07-15"), "{text}");
+        assert_eq!(
+            text.matches(&format!("Alice ⇒ {conclusion} (because reading = 10)"))
+                .count(),
+            2,
+            "{text}"
+        );
+        let page = f
+            .call("rule_matches", json!({"rule_id":rule,"limit":1}))
+            .await?;
+        assert!(page["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .ends_with("(showing 1 of 2 matches)"));
+        let ctx = ToolCtx {
+            state: &f.state,
+            kb_id: f.kb,
+            workspace_id: f.ws,
+            mounted_sources: &[],
+            can_write: false,
+            actor: None,
+            via_token: None,
+            question: None,
+        };
+        let card = tools::rule_matches(&ctx, &json!({"rule_id":rule})).await;
+        assert_eq!(card.step["detail"], "2 matches");
+    }
+    let after: Value=sqlx::query_scalar("SELECT coalesce(jsonb_agg(to_jsonb(d) ORDER BY id),'[]') FROM derived_facts d WHERE kb_id=$1")
+        .bind(f.kb).fetch_one(&f.state.pool).await?;
+    assert_eq!(before, after);
+    assert_eq!(
+        rules_before,
+        business_rules::list(&f.state.pool, f.kb).await?
+    );
+    let jobs_after: Value=sqlx::query_scalar("SELECT coalesce(jsonb_agg(to_jsonb(j) ORDER BY id),'[]') FROM jobs j WHERE payload->>'kb_id'=$1 OR payload->>'document_id' IN (SELECT id::text FROM documents WHERE kb_id=$2)")
+        .bind(f.kb.to_string()).bind(f.kb).fetch_one(&f.state.pool).await?;
+    assert_eq!(jobs_before, jobs_after);
+    // Legacy/anchor-derived rows may have no stated precision or boundary.
+    let row = uuid(
+        &business_rules::matches(&f.state.pool, f.kb, typing, 50, 0)
+            .await?
+            .0[0]["derived_id"],
+    );
+    for (from, expected) in [
+        (
+            Some("2020-01-01T12:34:56.123456Z"),
+            "2020-01-01T12:34:56.123456Z → unknown end",
+        ),
+        (None, "unknown start → unknown end"),
+    ] {
+        let from = from
+            .map(str::parse::<chrono::DateTime<chrono::Utc>>)
+            .transpose()?;
+        sqlx::query("UPDATE derived_facts SET valid_from=$2,valid_to=NULL,valid_from_precision=NULL,valid_to_precision=NULL WHERE id=$1")
+            .bind(row).bind(from).execute(&f.state.pool).await?;
+        let response = f.call("rule_matches", json!({"rule_id":typing})).await?;
+        let text = response["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(expected), "{text}");
+        assert!(!text.contains("→ now"));
+    }
+    sqlx::query("UPDATE derived_facts SET invalidated_at=now() WHERE attribute_rule_id=$1 AND valid_from IS NULL")
+        .bind(typing).execute(&f.state.pool).await?;
+    let response = f.call("rule_matches", json!({"rule_id":typing})).await?;
+    let text = response["content"][0]["text"].as_str().unwrap();
+    assert_eq!(text.lines().count(), 1);
+    assert!(text.contains("2023-06 → 2024-07-15"));
+    assert_eq!(
+        business_rules::matches(&f.state.pool, f.other_kb, typing, 50, 0)
+            .await?
+            .1,
+        0
+    );
+    f.clean().await
+}
+
+// Reuse the authenticated ledger fixture so RDF exercises the same stored records
+// as structured MCP reads, including evidence and retracted history.
+#[tokio::test]
+async fn rdf_export_preserves_unbound_literal_objects() -> anyhow::Result<()> {
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use oxrdf::{vocab::rdf, Literal, Term};
+    use tower::ServiceExt;
+
+    let Some(f) = Fixture::new().await? else {
+        return Ok(());
+    };
+    async fn check(f: &Fixture) -> anyhow::Result<()> {
+        let value = json!({"value": "待复检"});
+        let (statement, _) = utopia_store::graph::insert_open_statement(
+            &f.state.pool,
+            f.kb,
+            f.subject,
+            "状态",
+            utopia_store::graph::FactObject::Value(&value),
+            Some("2026-01-01T00:00:00Z".parse()?),
+            0.9,
+        )
+        .await?;
+        sqlx::query("UPDATE facts SET recorded_at='2026-02-01' WHERE id=$1")
+            .bind(statement)
+            .execute(&f.state.pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO fact_evidence(fact_id,chunk_id,document_id,doc_version,quote)
+                     VALUES ($1,$2,$3,1,'设备 A 待复检')",
+        )
+        .bind(statement)
+        .bind(f.chunk)
+        .bind(f.document)
+        .execute(&f.state.pool)
+        .await?;
+        let auth = utopia_store::tokens::authenticate(&f.state.pool, &f.token).await?;
+        let jwt = crate::auth::issue_token(&f.state, auth.user_id)?;
+        let app = crate::api::router(f.state.clone(), &Default::default());
+        let names = crate::rdf::Names::new(f.kb, None).map_err(anyhow::Error::msg)?;
+        let stmt = names.fact(statement);
+        let mut formats = Vec::new();
+        for retracted in [false, true] {
+            if retracted {
+                sqlx::query("UPDATE facts SET invalidated_at='2026-03-01' WHERE id=$1")
+                    .bind(statement)
+                    .execute(&f.state.pool)
+                    .await?;
+            }
+            // Snapshot every KB-scoped business table, including queues and adoption
+            // records. Request audit is deliberately excluded from this read-only check.
+            let tables: Vec<String> = sqlx::query_scalar(
+                "SELECT table_name FROM information_schema.columns
+                 WHERE table_schema='public' AND column_name='kb_id'
+                   AND table_name <> 'audit_events' ORDER BY table_name",
+            )
+            .fetch_all(&f.state.pool)
+            .await?;
+            let snapshot = async {
+                let mut rows = Vec::new();
+                for table in &tables {
+                    let sql = format!("SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb) FROM \"{}\" t WHERE kb_id=$1", table.replace('"', "\"\""));
+                    rows.push(
+                        sqlx::query_scalar::<_, Value>(&sql)
+                            .bind(f.kb)
+                            .fetch_one(&f.state.pool)
+                            .await?,
+                    );
+                }
+                Ok::<_, anyhow::Error>(rows)
+            };
+            let before = snapshot.await?;
+            let extra_sql = "SELECT jsonb_build_array(
+                (SELECT COALESCE(jsonb_agg(to_jsonb(e) ORDER BY to_jsonb(e)::text), '[]')
+                 FROM fact_evidence e JOIN facts f ON f.id=e.fact_id WHERE f.kb_id=$1),
+                (SELECT COALESCE(jsonb_agg(to_jsonb(j) ORDER BY j.id), '[]') FROM jobs j
+                 WHERE payload->>'kb_id'=$1::text OR payload->>'document_id' IN
+                     (SELECT id::text FROM documents WHERE kb_id=$1)))";
+            let extra_before: Value = sqlx::query_scalar(extra_sql)
+                .bind(f.kb)
+                .fetch_one(&f.state.pool)
+                .await?;
+            for format in ["turtle", "jsonld"] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(format!("/api/v1/kbs/{}/export?format={format}", f.kb))
+                            .header("authorization", format!("Bearer {jwt}"))
+                            .body(Body::empty())?,
+                    )
+                    .await?;
+                anyhow::ensure!(response.status() == StatusCode::OK, "export rejected");
+                let bytes = to_bytes(response.into_body(), 1024 * 1024).await?;
+                let format = if format == "turtle" {
+                    oxrdfio::RdfFormat::Turtle
+                } else {
+                    oxrdfio::RdfFormat::JsonLd {
+                        profile: oxrdfio::JsonLdProfileSet::empty(),
+                    }
+                };
+                let quads = oxrdfio::RdfParser::from_format(format)
+                    .for_slice(&bytes)
+                    .collect::<Result<std::collections::HashSet<_>, _>>()?;
+                anyhow::ensure!(
+                    quads.iter().any(|q| q.subject == stmt.clone().into()
+                        && q.predicate == rdf::OBJECT
+                        && q.object == Term::Literal(Literal::new_simple_literal("待复检"))),
+                    "unbound statement lost its rdf:object in authenticated export"
+                );
+                anyhow::ensure!(
+                    !quads
+                        .iter()
+                        .any(|q| q.subject == stmt.clone().into() && q.predicate == rdf::PREDICATE),
+                    "invented a bound predicate"
+                );
+                anyhow::ensure!(
+                    quads.iter().any(|q| q.subject == stmt.clone().into()
+                        && q.predicate.as_str() == "http://www.w3.org/ns/prov#wasDerivedFrom"
+                        && q.object == names.document(f.document).into()),
+                    "lost evidence source"
+                );
+                formats.push(quads);
+            }
+            anyhow::ensure!(
+                formats[formats.len() - 1] == formats[formats.len() - 2],
+                "formats disagree"
+            );
+            let extra_after: Value = sqlx::query_scalar(extra_sql)
+                .bind(f.kb)
+                .fetch_one(&f.state.pool)
+                .await?;
+            anyhow::ensure!(
+                extra_before == extra_after,
+                "export changed evidence or jobs"
+            );
+            for (table, expected) in tables.iter().zip(before) {
+                let sql = format!("SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text), '[]'::jsonb) FROM \"{}\" t WHERE kb_id=$1", table.replace('"', "\"\""));
+                let actual: Value = sqlx::query_scalar(&sql)
+                    .bind(f.kb)
+                    .fetch_one(&f.state.pool)
+                    .await?;
+                anyhow::ensure!(actual == expected, "export changed {table}");
+            }
+        }
+        Ok(())
+    }
+    let result = check(&f).await;
+    let cleanup = f.clean().await;
+    result.and(cleanup)
 }

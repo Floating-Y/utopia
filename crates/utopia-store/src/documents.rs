@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use pgvector::Vector;
+use serde::Serialize;
 use sqlx::{PgPool, Postgres, Transaction};
 use utopia_core::models::{ChunkView, Document, DocumentPage};
 use utopia_core::{AppError, AppResult};
@@ -154,8 +155,8 @@ pub async fn create_with_version_and_processing(
         _ => AppError::Db(e),
     })?;
     sqlx::query(
-        "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes)
-         VALUES ($1, $2, 1, $3, $4)",
+        "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes, doc_time)
+         VALUES ($1, $2, 1, $3, $4, (SELECT doc_time FROM documents WHERE id = $2))",
     )
     .bind(Uuid::now_v7())
     .bind(document.id)
@@ -209,10 +210,10 @@ pub async fn replace_content_and_enqueue_processing(
     .execute(&mut *tx)
     .await?;
     sqlx::query(
-        "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes)
+        "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes, doc_time)
          VALUES ($1, $2,
                  (SELECT coalesce(max(version), 0) + 1 FROM document_versions WHERE document_id = $2),
-                 $3, $4)",
+                 $3, $4, (SELECT doc_time FROM documents WHERE id = $2))",
     )
     .bind(Uuid::now_v7())
     .bind(id)
@@ -284,10 +285,10 @@ pub async fn upsert_source_document_tx(
         .execute(&mut **tx)
         .await?;
         sqlx::query(
-            "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes)
+            "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes, doc_time)
              VALUES ($1, $2,
                      (SELECT coalesce(max(version), 0) + 1 FROM document_versions WHERE document_id = $2),
-                     $3, $4)",
+                     $3, $4, (SELECT doc_time FROM documents WHERE id = $2))",
         )
         .bind(Uuid::now_v7())
         .bind(document.id)
@@ -339,10 +340,10 @@ pub async fn upsert_source_document_tx(
             .execute(&mut **tx)
             .await?;
             sqlx::query(
-                "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes)
+                "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes, doc_time)
                  VALUES ($1, $2,
                          (SELECT coalesce(max(version), 0) + 1 FROM document_versions WHERE document_id = $2),
-                         $3, $4)",
+                         $3, $4, (SELECT doc_time FROM documents WHERE id = $2))",
             )
             .bind(Uuid::now_v7())
             .bind(document.id)
@@ -389,8 +390,8 @@ pub async fn upsert_source_document_tx(
         _ => AppError::Db(e),
     })?;
     sqlx::query(
-        "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes)
-         VALUES ($1, $2, 1, $3, $4)",
+        "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes, doc_time)
+         VALUES ($1, $2, 1, $3, $4, (SELECT doc_time FROM documents WHERE id = $2))",
     )
     .bind(Uuid::now_v7())
     .bind(document.id)
@@ -542,6 +543,29 @@ pub async fn get(pool: &PgPool, id: Uuid) -> AppResult<Document> {
         .fetch_optional(pool)
         .await?
         .ok_or(AppError::NotFound)
+}
+
+/// A recorded original, with only the facts the ingestion ledger guarantees.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct DocumentVersion {
+    pub version: i32,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub ingested_at: DateTime<Utc>,
+}
+
+/// Every retained original version, oldest first.
+///
+/// This deliberately includes soft-deleted documents: their bytes remain part
+/// of the auditable record until the separate purge action removes them.
+pub async fn versions(pool: &PgPool, id: Uuid) -> AppResult<Vec<DocumentVersion>> {
+    Ok(sqlx::query_as(
+        "SELECT version, sha256, size_bytes, ingested_at
+           FROM document_versions WHERE document_id = $1 ORDER BY version",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await?)
 }
 
 /// 按 kb 收窄的取文档。**id 由模型给出时只能走这一支**：`get` 只按 id 查，
@@ -703,10 +727,10 @@ pub async fn record_version(
     size_bytes: i64,
 ) -> AppResult<()> {
     sqlx::query(
-        "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes)
+        "INSERT INTO document_versions (id, document_id, version, sha256, size_bytes, doc_time)
          VALUES ($1, $2,
                  (SELECT coalesce(max(version), 0) + 1 FROM document_versions WHERE document_id = $2),
-                 $3, $4)",
+                 $3, $4, (SELECT doc_time FROM documents WHERE id = $2))",
     )
     .bind(Uuid::now_v7())
     .bind(document_id)
@@ -1078,7 +1102,8 @@ async fn lock_cited_timelines(
 
 /// 撤销一次删除：文档、这次打标的分块、这次作废的事实原路复活，形状照 `revert_merge`。
 ///
-/// 只救 `document_deletions` 名单上的——更早版本的旧分块、删除之前就作废的事实
+/// 只救 `document_deletions` 名单上的（包括最后一个共同出处删除时的名单）——
+/// 更早版本的旧分块、删除之前就作废的事实
 /// 都不在名单里。三条路都从这里走：人点撤销、同步撞见墓碑、同内容重传
 pub async fn restore(pool: &PgPool, kb_id: Uuid, id: Uuid) -> AppResult<Document> {
     let mut tx = pool.begin().await?;
@@ -1135,17 +1160,40 @@ async fn restore_tx(
         .bind(&chunk_ids)
         .execute(&mut **tx)
         .await?;
+    // 甲乙共同作证时，只有最后删除的乙会把事实记进作废名单。恢复甲也应救回它，
+    // 但只认删除事务留下的作废时间；后来另行撤回的事实不能借旧名单复活。
+    let shared: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+        "SELECT DISTINCT f.id, f.invalidated_at FROM facts f
+           JOIN fact_evidence fe ON fe.fact_id = f.id
+           JOIN chunks c ON c.id = fe.chunk_id
+          WHERE f.kb_id = $1 AND c.document_id = $2 AND f.invalidated_at IS NOT NULL
+            AND EXISTS (SELECT 1 FROM document_deletions dd
+                         JOIN documents d ON d.id = dd.document_id
+                        WHERE dd.kb_id = $1 AND dd.reverted_at IS NULL
+                          AND f.id = ANY(dd.invalidated_facts)
+                          AND f.invalidated_at = d.deleted_at)",
+    )
+    .bind(kb_id)
+    .bind(id)
+    .fetch_all(&mut **tx)
+    .await?;
+    let (shared_ids, shared_stamps): (Vec<_>, Vec<_>) = shared.into_iter().unzip();
+    let restored: Vec<Uuid> = fact_ids.iter().chain(&shared_ids).copied().collect();
     // 复活的事实回到各自的时间线上；一直引用着这篇文档的事实，排序用的日期也回来了。
-    // 先锁、再复活、再重算（同删除）
-    let (cited, timelines) = lock_cited_timelines(tx, kb_id, id, &fact_ids).await?;
+    // 先锁、再复活、再重算（同删除）；等锁期间若又作废，不覆盖新的决定。
+    let (cited, timelines) = lock_cited_timelines(tx, kb_id, id, &restored).await?;
     sqlx::query(
         "UPDATE facts SET invalidated_at = NULL
-          WHERE id = ANY($1) AND invalidated_at IS NOT NULL",
+          WHERE invalidated_at IS NOT NULL
+            AND (id = ANY($1) OR (id, invalidated_at) IN
+                 (SELECT * FROM unnest($2::uuid[], $3::timestamptz[])))",
     )
     .bind(&fact_ids)
+    .bind(&shared_ids)
+    .bind(&shared_stamps)
     .execute(&mut **tx)
     .await?;
-    let touched: Vec<Uuid> = cited.iter().chain(&fact_ids).copied().collect();
+    let touched: Vec<Uuid> = cited.iter().chain(&restored).copied().collect();
     reattest_tx(tx, &touched).await?;
     crate::temporal::tidy_timelines_tx(tx, kb_id, &timelines).await?;
     sqlx::query("UPDATE document_deletions SET reverted_at = now() WHERE id = $1")
@@ -1265,7 +1313,51 @@ pub async fn replace_chunks(
     document_id: Uuid,
     pieces: &[ChunkPiece],
 ) -> AppResult<Vec<(String, String)>> {
+    Ok(
+        replace_chunks_for_snapshot(pool, kb_id, document_id, pieces, None)
+            .await?
+            .unwrap_or_default(),
+    )
+}
+
+/// 慢读取不能覆盖新版本分块，也不能重新填入已删除文档。
+/// 返回 None 表示输入已过期，调用方应结束本次处理。
+pub async fn replace_chunks_if_current(
+    pool: &PgPool,
+    kb_id: Uuid,
+    document_id: Uuid,
+    pieces: &[ChunkPiece],
+    sha256: &str,
+) -> AppResult<Option<Vec<(String, String)>>> {
+    replace_chunks_for_snapshot(pool, kb_id, document_id, pieces, Some(sha256)).await
+}
+
+async fn replace_chunks_for_snapshot(
+    pool: &PgPool,
+    kb_id: Uuid,
+    document_id: Uuid,
+    pieces: &[ChunkPiece],
+    sha256: Option<&str>,
+) -> AppResult<Option<Vec<(String, String)>>> {
     let mut tx = pool.begin().await?;
+    // 两个任务可能同时处理同一文档。先锁父记录，即使还没有分块，
+    // 后一个任务也能认领前一个任务写入的行，避免重复插入。
+    //
+    // **`FOR NO KEY UPDATE`，不是 `FOR UPDATE`**：后者与外键检查要的 `FOR KEY SHARE`
+    // 冲突，于是这个事务活着的时候，这份文档所有子表的插入都被挡住（chunks、
+    // document_versions、memory::append），而这个事务是每个分块一个来回——四千块的
+    // 文档要锁四秒。两者对另一个 `replace_chunks` 的互斥是一样的
+    let current: Option<(String, bool)> = sqlx::query_as(
+        "SELECT sha256, deleted_at IS NOT NULL FROM documents WHERE id = $1 FOR NO KEY UPDATE",
+    )
+    .bind(document_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(expected) = sha256 {
+        if !matches!(current, Some((ref sha, false)) if sha == expected) {
+            return Ok(None);
+        }
+    }
     let (version,): (i32,) = sqlx::query_as(
         "SELECT COALESCE(MAX(version), 1) FROM document_versions WHERE document_id = $1",
     )
@@ -1388,7 +1480,7 @@ pub async fn replace_chunks(
         .await?;
     }
     tx.commit().await?;
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// 抽取完成一个分块即打标（认领的块携带标记跳过重抽；也让中断的抽取可续跑）。
@@ -1576,7 +1668,7 @@ pub async fn vector_search(
              LIMIT $3
          )
          SELECT id FROM nearest ORDER BY {resort}",
-        live = crate::record_axis::chunk_live_at("c", 4),
+        live = crate::record_axis::chunk_live_at("c", as_of.map(|_| 4)),
         same_dims = crate::vector_index::same_dims("c.embedding", dims),
         distance = crate::vector_index::distance("c.embedding", 2, dims),
         resort = crate::vector_index::RESORT,
@@ -1606,8 +1698,8 @@ pub async fn chunks_by_ids(
          FROM chunks c JOIN documents d ON d.id = c.document_id
          WHERE c.kb_id = $1 AND c.id = ANY($2)
            AND {live} AND {doc_live}",
-        live = crate::record_axis::chunk_live_at("c", 3),
-        doc_live = crate::record_axis::document_live_at("d", 3),
+        live = crate::record_axis::chunk_live_at("c", as_of.map(|_| 3)),
+        doc_live = crate::record_axis::document_live_at("d", as_of.map(|_| 3)),
     ))
     .bind(kb_id)
     .bind(ids)

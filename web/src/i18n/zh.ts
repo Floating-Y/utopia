@@ -10,6 +10,36 @@
 import type { Strings } from "./en";
 
 export const zh: Strings = {
+  expressionDraft: {
+    title: "表达式草稿探索",
+    unsaved: "仅为未保存的草稿，不会写入知识库，也不检查单位兼容性。",
+    undeclared: "未声明",
+    attribute: "属性",
+    constant: "数字",
+    add: "加 (+)",
+    sub: "减 (−)",
+    mul: "乘 (×)",
+    div: "除 (÷)",
+    expression: "表达式",
+    left: "左操作数",
+    right: "右操作数",
+    kind: "节点类型",
+    depthLimit: "已达嵌套深度上限，请选择属性或数字。",
+    choose: "搜索并选择…",
+    missing: "属性已不可用",
+    loading: "正在读取属性和规则…",
+    loadError: "无法读取此知识库，请检查访问权限后重试。",
+    retry: "重试",
+    empty: "此知识库尚无属性。",
+    conclusion: "结论",
+    condition: "条件",
+    existing: "探索已有表达式",
+    unsupported: "此表达式结构尚不支持，未对其进行转换。名称和说明仍可在原规则编辑器中修改。",
+    preview: "草稿预览（未保存）",
+    incomplete: "请为每个操作数选择可用属性或填写有限数字以预览。",
+    reset: "新建草稿",
+    count: (n: number) => `已读取此知识库的 ${n} 个属性`,
+  },
   app: {
     name: "Utopia",
     /* 标语与出处都与 Utopia / Persona / Charter 同类：品牌的一部分，两种语言同值 */
@@ -505,6 +535,7 @@ export const zh: Strings = {
       url: "网页",
       rss: "RSS 订阅",
       api: "API",
+      statements: "陈述",
       custom: "自定义",
       github_issues: "GitHub 工单",
       jira_issues: "Jira 工单",
@@ -542,6 +573,8 @@ export const zh: Strings = {
         "同步一个 Notion 集成能看见的页面——把页面分享给集成，它就会出现在这里。" +
         "日期取页面最后一次编辑的时刻，那是页面自己的时钟，不是我们抓它的时刻。",
       api: "外部系统把 JSON 文档推送到这里，用这个来源自己的令牌认证。",
+      statements:
+        "外部系统把已经是抽取契约形状的陈述推送到这里，不经模型；发事件，别发整张表的状态。",
       custom:
         "按计划轮询一个你控制的 URL——你的服务返回 JSON 条目，Utopia 保持同步。",
       memory:
@@ -676,6 +709,14 @@ export const zh: Strings = {
     chunkOf: (filename: string, seq: number) => `${filename} · 第 ${seq} 段`,
   },
   ask: {
+    streamInterrupted: "回答连接已中断，请重新打开会话查看状态。",
+    noActiveAnswer: "未发现正在生成的回答，你可以发送新消息。",
+    historyLoadFailed: "无法读取此会话。",
+    retryHistory: "重试",
+    loadingHistory: "正在读取会话…",
+    loadEarlierConversations: "加载更早的会话",
+    conversationsLoadFailed: "无法读取会话列表。",
+    retryConversations: "重试",
     greeting: "问问 Utopia 都记住了什么",
     emptyTitle: "对话",
     emptyBody:
@@ -700,6 +741,7 @@ export const zh: Strings = {
     deleteBtn: "删除",
     cancel: "取消",
     noSources: "未引用任何来源",
+    openOriginal: "打开原文",
   },
   graph: {
     untyped: "未分类",
@@ -1036,6 +1078,9 @@ export const zh: Strings = {
     modelsIntro:
       "OpenAI 兼容协议——DeepSeek、Qwen、GLM、Ollama、vLLM 都可用。完全内网友好。",
     chatModel: "对话模型",
+    reasoningEffort: "推理强度",
+    reasoningDefault: "端点默认",
+    reasoningHint: "推理模型先想再答，抽取一次调用九成的输出是思考；minimal 关掉它，答案不变。",
     embedModel: "向量模型（可选，启用语义检索）",
     baseUrl: "接口地址",
     model: "模型",
@@ -1097,6 +1142,14 @@ export const zh: Strings = {
     uniquenessShort: "并存",
     refineShort: "类型消解",
     rulesShort: "业务规则",
+    ruleExpressionReadOnly: "此表单只读展示这条规则的定义。可修改名称和说明，表达式和条件保持原样。",
+    ruleUnknownExpression: "暂不支持的表达式（只读）",
+    ruleDependencies: "潜在依赖",
+    ruleDependenciesHint: "根据规则定义列出的候选关系，不代表实际执行。读数、条件和时间决定哪些规则成立；这里也包括已停用的定义。",
+    ruleDependenciesIncomplete: "部分定义或类信息无法完整读取，此列表可能不完整。",
+    rulePotentialProducers: "可能从这些规则获得输入",
+    rulePotentialConsumers: "可能为这些规则提供输入",
+    ruleDependenciesEmpty: "在可读取的定义中未找到候选关系。",
     rulesTitle: "业务规则",
     rulesHint: "按实体自己的属性判定类别、或算出取值的规则。结论是派生的，依据没了就自动失效。",
     rulesEmpty: "还没有规则。",
@@ -1123,6 +1176,11 @@ export const zh: Strings = {
     ruleConcludes: "得出",
     ruleConcludesTyping: "这个类",
     ruleConcludesAttribute: "这个属性",
+    ruleConcludesRelation: "这条关系",
+    ruleConcludesRelationText: (join: string, conclude: string): string =>
+      `经「${join}」从 X 到「${conclude}」`,
+    ruleSideX: "X",
+    ruleSideY: "Y",
     ruleConditions: "当满足",
     ruleConditionsHint: "一块里的条件要同时成立；再加一块就是另一种情况，任意一块成立即可。",
     ruleAddCondition: "加一个条件",
@@ -1159,6 +1217,12 @@ export const zh: Strings = {
     ruleEditing: "正在编辑",
     ruleMatchesTitle: "它标住了谁",
     ruleMatchesEmpty: "此刻一个也没有。",
+    ruleVersion: (n: number) => `v${n}`,
+    ruleHistoryTitle: "这条规则改过几次、每一版怎么说",
+    ruleHistoryEmpty: "还没有历史。",
+    ruleVersionCurrent: "当前",
+    ruleVersionSince: (from: string, to: string | null) => (to ? `${from} 至 ${to}` : `自 ${from}`),
+    ruleVersionStanding: (n: number) => `此刻凭它成立 ${n} 条`,
     ruleMatchBecause: (premises: string) => `凭 ${premises}`,
     ruleMatchSpan: (from: string, to: string | null) =>
       to ? `${from} 至 ${to}` : `${from} 起`,
@@ -1535,6 +1599,7 @@ export const zh: Strings = {
     railViolations: "公理",
     railDefects: "本体",
     railAlignment: "对齐",
+    railErrata: "勘误",
     railDecisions: "决定",
     railMerges: "合并",
     railAgent: "Agent",
@@ -1623,6 +1688,7 @@ export const zh: Strings = {
       namesake: "同一篇文档里有两个同名实体",
       namesake_tie: "同名，画像分不出谁是谁",
       shared_name: "另一个实体已经叫这个名字",
+      name_vector: "名字相近（向量召回），等裁决",
       contains: "一个名字包含另一个",
       ambiguous_name: "同名，但上下文没能定夺",
       type_drift: "同名，但类型不同",
@@ -1672,7 +1738,44 @@ export const zh: Strings = {
     alignmentStatements: (n: number) => `${n} 条陈述`,
     alignmentEntities: (n: number) => `${n} 样东西`,
     alignmentVotes: (first: string, second: string) => `两票：${first} · ${second}`,
-    alignmentTyped: (kept: number, retired: number) => `类型化图谱已重算：${kept} 条成了类型化事实，${retired} 行作废`,
+    alignmentRuleImplies: (property: string) => `同时蕴含 ${property}`,
+    alignmentRuleObjectIsStatement: "宾语：陈述自己的宾语",
+    alignmentRuleReading: (reading: string) => `宾语：按「${reading.replace(/_/g, " ")}」从字里读出`,
+    alignmentRuleKindWord: (word: string) => `叫作「${word}」的东西`,
+    alignmentApprove: "批准规则",
+    alignmentReject: "驳回",
+    alignmentRuleAccepted: "已保存，隐含事实正在后台计算。",
+    // 勘误队列（0044 决定 7）
+    errata: "勘误 agent 留给你的",
+    errataHint:
+      "抽取之后，一个 agent 按文档复读类型化事实，结构报了的先看，撤、改、加都以文档原话为证据。会牵动图外东西的动作（有派生靠着它、有人问过它、会让只许一个值的属性有两个值）留在这里等人。",
+    errataRetract: "想撤掉",
+    errataRevise: "想改成",
+    errataAdd: "想加上",
+    errataFlag: (flag: string) =>
+      ({
+        domain: "结构报的：主语不在属性允许的类里",
+        range: "结构报的：宾语不在属性允许的类里",
+        name_absent: "结构报的：名字不在文档里",
+        no_date: "结构报的：日期属性没有日期",
+      })[flag] ?? flag,
+    errataHeld: (detail: string) => {
+      const [kind, ...rest] = detail.split(" ");
+      const value = rest.join(" ");
+      if (kind === "derived") return `留下的原因：有 ${value} 条派生靠着它`;
+      if (kind === "answered") return `留下的原因：它在 ${value} 次回答里被提到`;
+      if (kind === "contradiction") return `留下的原因：「${value}」只许一个值，这样会有两个`;
+      if (kind === "unflagged") return "留下的原因：结构没报过这条，撤或改要人确认";
+      return `留下的原因：${detail}`;
+    },
+    errataQuote: "文档原话：",
+    errataApprove: "执行",
+    errataReject: "否",
+    errataDecided: "已保存。",
+    alignmentTooMany: (n: number) => `有 ${n} 条属性都可能对得上，多到没法问模型。请选一条或留在开放图谱。`,
+    alignmentConflict: "此决定与当前状态冲突。请刷新并核对后再试。",
+    alignmentKindWordBusy: "这个类别词正在被其他操作更新，请稍后重试。",
+    alignmentAccepted: "已保存。类型化图谱正在后台重算，算完会在这里自动刷新。",
     defects: "本体自相矛盾",
     defectsHint:
       "定义本身的问题，没有牵涉任何事实。这一档排在前面：定义站不住的时候，据它报出来的每一条事实级结论都可疑。",

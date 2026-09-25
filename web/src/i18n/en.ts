@@ -3,6 +3,36 @@
 //
 // 加新文案时先加在这里，再补其余语言包——顺序反了会得到一个类型错误，那正是本意。
 export const en = {
+  expressionDraft: {
+    title: "Expression draft exploration",
+    unsaved: "Unsaved draft only. Nothing here is saved to the knowledge base. Unit compatibility is not checked.",
+    undeclared: "Undeclared",
+    attribute: "Attribute",
+    constant: "Number",
+    add: "Add (+)",
+    sub: "Subtract (−)",
+    mul: "Multiply (×)",
+    div: "Divide (÷)",
+    expression: "Expression",
+    left: "Left operand",
+    right: "Right operand",
+    kind: "Node type",
+    depthLimit: "Depth limit reached: choose an attribute or a number.",
+    choose: "Search and choose…",
+    missing: "Attribute no longer available",
+    loading: "Loading attributes and rules…",
+    loadError: "Could not load this knowledge base. Check your access and retry.",
+    retry: "Retry",
+    empty: "This knowledge base has no attributes yet.",
+    conclusion: "Conclusion",
+    condition: "Condition",
+    existing: "Explore an existing expression",
+    unsupported: "This expression has an unsupported shape. It has not been converted. Use the existing rule editor for metadata changes.",
+    preview: "Draft preview — not saved",
+    incomplete: "Complete every operand with an available attribute or a finite number to preview.",
+    reset: "Start a new draft",
+    count: (n: number) => `${n} attributes loaded from this knowledge base`,
+  },
   app: {
     name: "Utopia",
     // 化用《乌托邦》全书最后一句（Burnet 1684 译本）：
@@ -556,6 +586,7 @@ export const en = {
       url: "URLs",
       rss: "RSS feed",
       api: "API",
+      statements: "Statements",
       custom: "Custom",
       github_issues: "GitHub issues",
       jira_issues: "Jira issues",
@@ -596,6 +627,8 @@ export const en = {
         "and it appears here. Dated by when the page was last edited, which is the page's " +
         "own clock rather than ours.",
       api: "External systems push JSON documents here, authenticated with this source's own token.",
+      statements:
+        "Your system pushes statements already in the extraction contract; no model reads them. Send events, not the state of a table.",
       custom:
         "Polls a URL you control on a schedule — your service returns JSON items and Utopia keeps them in sync.",
       memory:
@@ -735,6 +768,14 @@ export const en = {
     chunkOf: (filename: string, seq: number) => `${filename} · section ${seq}`,
   },
   ask: {
+    streamInterrupted: "The answer stream was interrupted. Reopen the conversation to check its status.",
+    noActiveAnswer: "No active answer was found. You can send a new message.",
+    historyLoadFailed: "Could not load this conversation.",
+    retryHistory: "Retry",
+    loadingHistory: "Loading conversation…",
+    loadEarlierConversations: "Load earlier conversations",
+    conversationsLoadFailed: "Could not load conversations.",
+    retryConversations: "Retry",
     /* 新对话首屏问候：碑铭衬线，品牌名入句（标题不带句号） */
     greeting: "Ask Utopia what it remembers",
     emptyTitle: "Chat",
@@ -762,6 +803,8 @@ export const en = {
     cancel: "Cancel",
     // 这条回答背后一条来源都没有（#547）。是事实陈述，所以每条都挂，不猜哪条该挂
     noSources: "No sources consulted",
+    // 预览浮窗右上角那条出路：看完这一段还想看整篇的人走这里
+    openOriginal: "Open original",
   },
   graph: {
     // 还没判出类型的实体（0009）。不是一个类，是"这一格还空着"
@@ -1156,6 +1199,10 @@ export const en = {
     modelsIntro:
       "OpenAI-compatible protocol — DeepSeek, Qwen, GLM, Ollama, vLLM all work. Fully on-prem friendly.",
     chatModel: "Chat model",
+    reasoningEffort: "Reasoning effort",
+    reasoningDefault: "endpoint default",
+    reasoningHint:
+      "Reasoning models think before they answer; for extraction nine tenths of the output was thinking. minimal turns it off without changing the answer.",
     embedModel: "Embedding model (optional, enables semantic search)",
     baseUrl: "Base URL",
     model: "Model",
@@ -1220,6 +1267,14 @@ export const en = {
     refineShort: "Refine types",
     /* ---- 业务规则（0021 / #277）---- */
     rulesShort: "Business rules",
+    ruleExpressionReadOnly: "This definition is read-only in this form. You can edit its name and description without changing its expressions or conditions.",
+    ruleUnknownExpression: "Unsupported expression (read-only)",
+    ruleDependencies: "Potential dependencies",
+    ruleDependenciesHint: "Candidates from rule definitions, not proof of execution. Readings, conditions and time determine what actually runs; disabled definitions are included.",
+    ruleDependenciesIncomplete: "Some definitions or classes could not be read completely. This list may be incomplete.",
+    rulePotentialProducers: "May receive input from",
+    rulePotentialConsumers: "May provide input to",
+    ruleDependenciesEmpty: "No candidates found in the readable definitions.",
     rulesTitle: "Business rules",
     /* 说清三件事：谁写的、结论是什么身份、什么时候重算。第三件最容易被误解成
        「保存就生效」，而它其实等下一轮物化 */
@@ -1258,6 +1313,11 @@ export const en = {
     ruleConcludes: "Concludes",
     ruleConcludesTyping: "the class",
     ruleConcludesAttribute: "the attribute",
+    ruleConcludesRelation: "the relation",
+    ruleConcludesRelationText: (join: string, conclude: string): string =>
+      `${conclude} from X through ${join}`,
+    ruleSideX: "X",
+    ruleSideY: "Y",
     /* 从前是「当以下全部成立」。**一条规则现在可以写第二种情况**，那句话就
        不再是真的——标签退回一个「当」，全不全由下面那句说明交代 */
     ruleConditions: "When",
@@ -1303,6 +1363,12 @@ export const en = {
     ruleEditing: "Editing",
     ruleMatchesTitle: "What it marks",
     ruleMatchesEmpty: "Nothing right now.",
+    ruleVersion: (n: number) => `v${n}`,
+    ruleHistoryTitle: "How this rule has read",
+    ruleHistoryEmpty: "No history yet.",
+    ruleVersionCurrent: "current",
+    ruleVersionSince: (from: string, to: string | null) => (to ? `${from} to ${to}` : `since ${from}`),
+    ruleVersionStanding: (n: number) => (n === 1 ? "1 conclusion stands on it" : `${n} conclusions stand on it`),
     /* 前提要读成「凭什么」，所以用 because 起头而不是干列 */
     ruleMatchBecause: (premises: string) => `because ${premises}`,
     /* 同一个实体会因为不同时段的读数出现好几次——不写出这一段就像重复了 */
@@ -1753,6 +1819,7 @@ export const en = {
     railViolations: "Axioms",
     railDefects: "Ontology",
     railAlignment: "Alignment",
+    railErrata: "Errata",
     railDecisions: "Decisions",
     railMerges: "Merges",
     railAgent: "Agent",
@@ -1854,6 +1921,8 @@ export const en = {
       /* 画像分不开时的并列：分数是真的，所以百分比照常显示（与 namesake 的哨兵值不同） */
       namesake_tie: "Same name, and the profiles cannot tell them apart",
       shared_name: "Another entity already has this name",
+      /* 名字向量召回（0041 第 2 刀）：简称、另一种文字的同一个名字；只提议，裁决器判 */
+      name_vector: "A similar name, found by vector recall",
       /* 名字互相包含：等值召回看不见，简称会静默变成第二个实体 */
       contains: "One name contains the other",
       ambiguous_name: "Same name, context did not settle it",
@@ -1912,8 +1981,44 @@ export const en = {
     alignmentStatements: (n: number) => (n === 1 ? "1 statement" : `${n} statements`),
     alignmentEntities: (n: number) => (n === 1 ? "1 thing" : `${n} things`),
     alignmentVotes: (first: string, second: string) => `Votes: ${first} · ${second}`,
-    alignmentTyped: (kept: number, retired: number) =>
-      `Typed graph recomputed: ${kept} statements typed, ${retired} rows retired`,
+    alignmentRuleImplies: (property: string) => `also implies ${property}`,
+    alignmentRuleObjectIsStatement: "object: the statement's own object",
+    alignmentRuleReading: (reading: string) => `object: read from the words as ${reading.replace(/_/g, " ")}`,
+    alignmentRuleKindWord: (word: string) => `things called "${word}"`,
+    alignmentApprove: "Approve rule",
+    alignmentReject: "Reject",
+    alignmentRuleAccepted: "Saved. Implied facts are being computed in the background.",
+    // 勘误队列（0044 决定 7）
+    errata: "The errata agent held these for you",
+    errataHint:
+      "After extraction an agent rereads each document's typed facts, structural flags first, and retracts, revises or adds with the document's own words as evidence. An action that would reach outside the graph (a derived fact rests on it, someone asked about it, or it would give a one-value property two values) waits here for a person.",
+    errataRetract: "wants to retract",
+    errataRevise: "wants to revise to",
+    errataAdd: "wants to add",
+    errataFlag: (flag: string) =>
+      ({
+        domain: "flagged: subject outside the property's kinds",
+        range: "flagged: object outside the property's kinds",
+        name_absent: "flagged: a name not in the document",
+        no_date: "flagged: date property without a date",
+      })[flag] ?? flag,
+    errataHeld: (detail: string) => {
+      const [kind, ...rest] = detail.split(" ");
+      const value = rest.join(" ");
+      if (kind === "derived") return `Held: ${value} derived fact(s) rest on it`;
+      if (kind === "answered") return `Held: it was named in ${value} answer(s)`;
+      if (kind === "contradiction") return `Held: "${value}" allows one value and would get two`;
+      if (kind === "unflagged") return "Held: the structure did not doubt this fact; a person confirms the change";
+      return `Held: ${detail}`;
+    },
+    errataQuote: "Document says:",
+    errataApprove: "Apply",
+    errataReject: "Reject",
+    errataDecided: "Saved.",
+    alignmentTooMany: (n: number) => `${n} properties could apply; too many to ask the model. Pick one or leave it open.`,
+    alignmentConflict: "This decision conflicts with the current state. Refresh and review it before trying again.",
+    alignmentKindWordBusy: "This kind word is being updated by another operation. Please try again shortly.",
+    alignmentAccepted: "Decision saved. The typed graph is being recomputed and will refresh here when it is done.",
     defects: "Ontology contradicts itself",
     defectsHint:
       "Problems in the definitions themselves — no facts involved. These come first: while a definition contradicts itself, every fact-level finding that rests on it is suspect.",

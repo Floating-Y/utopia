@@ -273,9 +273,9 @@ pub async fn paths_between(
             .then(y.2.partial_cmp(&x.2).unwrap_or(std::cmp::Ordering::Equal))
     });
 
-    // 同一串节点、同一串谓词只回一条：同一条边常有两份事实（一份带日期，一份只有
-    // 锚点），不去重的话十个名额里有三个是同一条路
-    let mut seen: HashSet<(Vec<Uuid>, Vec<String>)> = HashSet::new();
+    // 同一串节点、同一串有向谓词只回一条：同向的重复观察折叠，但 A → B 和
+    // A ← B 不是同一条关系，不能因遍历时两端相同而丢掉一个方向。
+    let mut seen = HashSet::new();
     let mut out = Vec::new();
     for (_, spec, _, c) in scored {
         if out.len() >= limits.max_paths {
@@ -286,11 +286,17 @@ pub async fn paths_between(
         let Some(edges) = edges else {
             continue;
         };
-        let predicates: Vec<String> = edges
+        let directed_predicates: Vec<_> = edges
             .iter()
-            .map(|e| e.predicate.clone().unwrap_or_default())
+            .zip(&c.nodes)
+            .map(|(e, node)| {
+                (
+                    e.predicate.clone().unwrap_or_default(),
+                    e.subject_id == *node,
+                )
+            })
             .collect();
-        if !seen.insert((c.nodes.clone(), predicates)) {
+        if !seen.insert((c.nodes.clone(), directed_predicates)) {
             continue;
         }
         out.push(Path {
@@ -322,7 +328,7 @@ async fn touching(
             AND ({subject} = ANY($2) OR {object} = ANY($2))
             AND {subject} <> {object}
             AND {held} AND {hold}",
-        held = record_axis::facts_held_at("f", 3),
+        held = record_axis::facts_held_at("f", as_of.map(|_| 3)),
         hold = world_axis::facts_hold_at("f", 4),
     ))
     .bind(kb_id)
@@ -354,7 +360,7 @@ async fn degrees(
                        AND ({subject} = n.id OR {object} = n.id)
                        AND {held} AND {hold}
           GROUP BY n.id",
-        held = record_axis::facts_held_at("f", 3),
+        held = record_axis::facts_held_at("f", as_of.map(|_| 3)),
         hold = world_axis::facts_hold_at("f", 4),
     ))
     .bind(kb_id)
