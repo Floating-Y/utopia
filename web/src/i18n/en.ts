@@ -66,6 +66,7 @@ export const en = {
     stream_ended:
       "The answer stream ended unexpectedly. Reopen the conversation to check its status.",
     stream_lagged: "This page fell behind the answer stream. Reopen the conversation.",
+    conversation_busy: "An answer is already being generated in this conversation.",
     model_out_of_credit:
       "The model account cannot pay for this request. Top it up, or pick another endpoint under Administration → Models.",
     model_rate_limited: "The model endpoint is rate limiting. Wait a moment and ask again.",
@@ -805,6 +806,8 @@ export const en = {
     scopeLabel: "Knowledge base",
     send: "Send",
     stop: "Stop",
+    stopping: "Stopping…",
+    stopped: "Stopped",
     thinking: "Thinking…",
     /* 轨迹上每一步的话（#942）。服务端只给字段：状态、数、时刻，怎么说在这里定。
        查询、实体名、来源名、问数的目的、记下的那句话是数据，原样显示；

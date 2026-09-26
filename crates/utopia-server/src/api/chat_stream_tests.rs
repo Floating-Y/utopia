@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn reattachment_preserves_terminal_frames_on_both_sides_of_emit() {
-    for event in ["done", "error"] {
+    for (event, data) in [("done", r#"{"stopped":true}"#), ("error", "safe outcome")] {
         let registry = Arc::new(crate::live::Registry::default());
         let id = Uuid::now_v7();
-        let handle = registry.begin(id).await;
+        let handle = registry.begin(id).await.unwrap();
         handle.emit(delta_event("partial")).await;
         let before = sse_from(registry.attach(id).await);
-        handle.emit(Frame::new(event, "safe outcome".into())).await;
+        handle.emit(Frame::new(event, data.into())).await;
         // Finish closes the late receiver on the old implementation, so this
         // counterexample completes without timing out even when terminal is lost.
         let after = sse_from(registry.attach(id).await);
@@ -25,7 +25,7 @@ async fn reattachment_preserves_terminal_frames_on_both_sides_of_emit() {
                 1,
                 "{text}"
             );
-            assert!(text.contains("partial") && text.contains("safe outcome"));
+            assert!(text.contains("partial") && text.contains(data));
         }
         let idle = axum::body::to_bytes(
             sse_from(registry.attach(id).await)
@@ -43,7 +43,7 @@ async fn reattachment_preserves_terminal_frames_on_both_sides_of_emit() {
 async fn lagged_subscribers_receive_an_error_not_done() {
     let registry = Arc::new(crate::live::Registry::default());
     let id = Uuid::now_v7();
-    let handle = registry.begin(id).await;
+    let handle = registry.begin(id).await.unwrap();
     let stream = sse_from(registry.attach(id).await);
     for _ in 0..300 {
         handle.emit(delta_event("x")).await;
@@ -60,7 +60,7 @@ async fn lagged_subscribers_receive_an_error_not_done() {
 async fn producer_disappearing_without_an_outcome_ends_in_one_error() {
     let registry = Arc::new(crate::live::Registry::default());
     let id = Uuid::now_v7();
-    let handle = registry.begin(id).await;
+    let handle = registry.begin(id).await.unwrap();
     let stream = sse_from(registry.attach(id).await);
     handle.emit(delta_event("partial")).await;
     handle.finish().await;
@@ -82,7 +82,7 @@ async fn producer_disappearing_without_an_outcome_ends_in_one_error() {
 async fn first_terminal_freezes_the_snapshot_and_broadcast() {
     let registry = Arc::new(crate::live::Registry::default());
     let id = Uuid::now_v7();
-    let handle = registry.begin(id).await;
+    let handle = registry.begin(id).await.unwrap();
     handle.emit(delta_event("kept")).await;
     handle
         .emit(error_event("answer_failed", "original error"))

@@ -92,6 +92,7 @@ const historyTurns = (messages: ConversationMessage[]): Turn[] => messages.map((
   content: m.content,
   steps: m.steps.length ? m.steps : undefined,
   sources: m.sources.length ? m.sources : undefined,
+  stopped: m.stopped,
 }));
 const viewKey = (kbId: string, id: string | null) => `${kbId}/${id ?? ""}`;
 
@@ -324,13 +325,14 @@ export function Chat() {
           ],
           abort,
         );
+        handle.identify(id, s.generation_id);
       },
       onSources: (sources) => handle?.patchLast((t) => ({ ...t, sources })),
       onStep: (step) =>
         handle?.patchLast((t) => ({ ...t, steps: [...(t.steps ?? []), step] })),
       onDelta: (text) => handle?.patchLast((t) => ({ ...t, content: t.content + text })),
-      onDone: () => {
-        handle?.finish();
+      onDone: (stopped) => {
+        handle?.finish(stopped);
         invalidateList();
       },
       onError: (message) => {
@@ -442,6 +444,7 @@ export function Chat() {
   const send = () => {
     const q = input.trim();
     if (!q || streaming || !kb || kb.id !== kbId || loadingHistory || historyError) return;
+    if (liveAnswer.entry(kb.id, activeId)?.streaming) return;
     const owner = claimView(activeId);
     following.current = true;
     setIdleHistoryKey(null);
@@ -467,8 +470,8 @@ export function Chat() {
       kb.id,
       { conversation_id: activeId ?? undefined, message: q },
       {
-        onConversation: (id) => {
-          handle.identify(id);
+        onConversation: (id, generationId) => {
+          handle.identify(id, generationId);
           invalidateList();
           if (!ownsView(owner)) return;
           // 先 identify 生成句柄再换 URL；layout effect 重置视图后，loadConversation 会认领该句柄。
@@ -486,11 +489,20 @@ export function Chat() {
           handle.patchLast((t) => ({ ...t, steps: [...(t.steps ?? []), step] })),
         onDelta: (text) =>
           handle.patchLast((t) => ({ ...t, content: t.content + text })),
-        onDone: () => {
-          handle.finish();
+        onDone: (stopped) => {
+          handle.finish(stopped);
           invalidateList();
         },
-        onError: (message) => {
+        onError: (message, error) => {
+          if (error?.status === 409 && error.code === "conversation_busy" && activeId) {
+            handle.discard();
+            if (!ownsView(owner)) return;
+            const draft = [q, inputRef.current?.value ?? sessionStorage.getItem(DRAFT_KEY)].filter(Boolean).join("\n");
+            sessionStorage.setItem(DRAFT_KEY, draft);
+            setInput(draft);
+            void loadConversation(activeId);
+            return;
+          }
           handle.patchLast((t) => ({ ...t, error: message }));
           handle.finish();
         },
@@ -524,6 +536,9 @@ export function Chat() {
           }
         }}
       />
+      {liveHere?.stopError && (
+        <div role="alert" className="text-small text-danger">{liveHere.stopError}</div>
+      )}
       <div className="flex items-center justify-between gap-3 pt-1">
         <div className="flex items-center gap-3 min-w-0">
           {/* 作用域 chip：提问点位可见"在问哪个库"，切库沿用现有语义（开新会话） */}
@@ -586,7 +601,8 @@ export function Chat() {
               // 别场照常写它们自己的条目
               if (kb) liveAnswer.stop(kb.id, currentId);
             }}
-            label={S.ask.stop}
+            label={liveHere?.stopping ? S.ask.stopping : S.ask.stop}
+            disabled={liveHere?.stopping}
             variant="secondary"
             className="shrink-0"
           >
@@ -1027,6 +1043,7 @@ function TurnView({ turn, live }: { turn: Turn; live?: boolean }) {
           ),
         )}
         {thinking && <Thinking step={lastStep} />}
+        {turn.stopped && <div className="text-small text-ink-2">{S.ask.stopped}</div>}
         {turn.error && <div className="text-danger">{turn.error}</div>}
       </div>
       {/* **引用等答案说完再出。**

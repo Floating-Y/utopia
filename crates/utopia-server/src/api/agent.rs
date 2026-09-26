@@ -398,6 +398,7 @@ pub fn dynamic_tools(shared: &Arc<Shared>) -> Vec<DynamicTool> {
 #[derive(Clone)]
 pub struct Policy {
     pub shared: Arc<Shared>,
+    pub cancellation: crate::live::Cancellation,
     /// The next logical call hands off before provider I/O; it cannot run tools.
     pub max_rounds: usize,
 }
@@ -412,7 +413,9 @@ impl AgentHook for Policy {
         self.shared
             .finalizing
             .store(turn > self.max_rounds, Ordering::Relaxed);
-        let action = if turn > self.max_rounds {
+        let action = if self.cancellation.is_cancelled() {
+            CompletionCallAction::Stop("Stopped by the user".into())
+        } else if turn > self.max_rounds {
             // Rig 0.42 resolves this hook before model selection or provider I/O.
             // The route consumes this per-run state only with PromptCancelled.
             self.shared.answer_requested.store(true, Ordering::Relaxed);
@@ -529,7 +532,9 @@ impl AgentHook for Policy {
     ) -> impl std::future::Future<Output = ToolCallAction> + Send {
         // **说不清自己要做什么的调用不执行。** 把话回给模型，让它重来；
         // 界面上照样显示成一次没做成的调用
-        let action = if self.shared.finalizing() {
+        let action = if self.cancellation.is_cancelled() {
+            ToolCallAction::Stop("Stopped by the user".into())
+        } else if self.shared.finalizing() {
             ToolCallAction::Stop(FINAL_TOOL_CALL.into())
         } else {
             match super::chat::check_call(&self.shared.schema, event.tool_name, event.args) {

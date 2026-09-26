@@ -5,6 +5,11 @@
 #[path = "chat_finalization.rs"]
 mod finalization;
 
+#[path = "chat_generation.rs"]
+mod generation;
+
+use generation::{Answer, ProducerEvent};
+
 use super::agent;
 use super::rig_model::{self, RigModel};
 use crate::live::Frame;
@@ -39,11 +44,6 @@ const KNOWN_ENTITY_LIMIT: usize = 20;
 
 const MAX_HISTORY: usize = 20;
 const MAX_ROUNDS: usize = 6;
-
-enum ProducerEvent {
-    Progress(Frame),
-    Outcome(Result<Uuid, Failure>),
-}
 
 /// 一次没答成的生成（0004）：`code` 给界面去 `err.*` 表里查措辞，英文原句留给日志、
 /// MCP 和不做本地化的客户端。**服务端不出显示文本**——`error` 帧与请求被拒用的是
@@ -627,23 +627,6 @@ pub async fn chat(
     if query.is_empty() {
         return Err(AppError::Validation("Missing user message".into()).into());
     }
-    // 语义层：跟这个问题有关的那几条确认口径进 system prompt——问数优先用确认口径，
-    // 而不是每次从 schema 猜。按问题挑而不是全塞：二十七条的上界 17/18 是在
-    // 三十条的上限之下量的，一百条口径靠字典序截断就不成立了（#574）
-    let mappings = if mounted_sources.is_empty() {
-        Vec::new()
-    } else {
-        crate::mapping_index::relevant(
-            &state,
-            kb_id,
-            kb.workspace_id,
-            &query,
-            crate::mapping_index::DEFINITIONS_IN_PROMPT,
-        )
-        .await
-        .map_err(AppError::Other)?
-    };
-
     // 会话持久化：有 id 则校验归属，无则以首句为题新建；用户消息即刻落库,
     // 上下文由服务端从库里拼——前端只送新消息
     let conversation_id = match req.conversation_id {
@@ -653,6 +636,11 @@ pub async fn chat(
         }
         None => utopia_store::conversations::create(&state.pool, kb_id, user.id, &query).await?,
     };
+    // Reserve before writing the question: a refused follow-up must not enter history.
+    // Dropping the handle releases the reservation if preparation fails.
+    let handle = state.live.begin(conversation_id).await?;
+    let generation_id = handle.generation_id();
+    let cancellation = handle.cancellation();
     let user_message_id = utopia_store::conversations::append_message(
         &state.pool,
         conversation_id,
@@ -684,6 +672,15 @@ pub async fn chat(
 
     // 注册表在生成器之前取出来：下面那个 `async_stream!` 会把 `state` 整个搬走
     let live = state.live.clone();
+    let save_pool = state.pool.clone();
+    let previous_answer = history
+        .turns
+        .iter()
+        .rev()
+        .find(|(role, _)| role == "assistant")
+        .map(|(_, content)| content.clone())
+        .unwrap_or_default();
+    let previous_sources = history.last_sources.clone();
 
     // 生成过程不挂在这条连接上。
     //
@@ -699,6 +696,24 @@ pub async fn chat(
     // 代价说清楚：**没人看的时候仍然在花钱**。这是有意的——丢答案比多跑一轮贵，
     // 而 `MAX_ROUNDS` 已经给了上限。send 失败（接收端没了）不中断，那正是要点。
     let producer = async_stream::stream! {
+        // Identify before any model-dependent preparation, so an early Stop can target this run.
+        yield ProducerEvent::Progress(Frame::new("conversation", json!({
+            "id": conversation_id, "generation_id": generation_id,
+        }).to_string()));
+        let mappings = if mounted_sources.is_empty() {
+            Vec::new()
+        } else {
+            match crate::mapping_index::relevant(
+                &state, kb_id, workspace_id, &query, crate::mapping_index::DEFINITIONS_IN_PROMPT,
+            ).await {
+                Ok(mappings) => mappings,
+                Err(error) => {
+                    tracing::warn!(%error, "Could not retrieve conversation mappings");
+                    yield ProducerEvent::Outcome(Err(Failure::new("search_failed", "Could not retrieve relevant mappings.")));
+                    return;
+                }
+            }
+        };
         let ds_names: Vec<String> = mounted_sources.iter().map(|d| d.name.clone()).collect();
         let tools = tools_schema(can_write, &ds_names);
         let mut system_prompt = if can_write && REMEMBER_ENABLED {
@@ -758,9 +773,6 @@ pub async fn chat(
             }
         }
 
-        // 会话 id 先行下发（新会话由此告知前端）
-        yield ProducerEvent::Progress(Frame::new("conversation", json!({ "id": conversation_id }).to_string()));
-
         // 循环是 rig 的（#546）：工具、策略钩子、历史、实体清单都交给它；
         // 这里只把它的事件翻成前端认得的帧，并在结束时落库
         let shared = agent::Shared::new(
@@ -777,6 +789,7 @@ pub async fn chat(
         let policy = agent::Policy {
             shared: shared.clone(),
             max_rounds: MAX_ROUNDS,
+            cancellation,
         };
         let tool_server = ToolServer::new()
             .dynamic_tools(agent::dynamic_tools(&shared))
@@ -897,6 +910,7 @@ pub async fn chat(
                     let text = rig_model::tool_result_text(&tool_result.content);
                     // 闸门工具不留轨迹：「你好」下面挂一条「声明不用查」是噪音
                     let mut is_error = None;
+                    let mut published_step = None;
                     if tool_result.name != agent::NO_EVIDENCE_TOOL {
                         let mut step = match shared.take_step(&internal_call_id) {
                             Some((step, failed)) => { is_error = Some(failed); step }
@@ -917,7 +931,7 @@ pub async fn chat(
                             obj.insert("at".into(), json!(answer_acc.encode_utf16().count()));
                         }
                         steps_acc.push(step.clone());
-                        yield ProducerEvent::Progress(Frame::new("step", serde_json::to_string(&step).unwrap_or_default()));
+                        published_step = Some(step);
                     }
                     // cite() only appends: document reads can add citations too, regardless
                     // of the UI step kind. Release the sink before yielding to subscribers.
@@ -930,12 +944,24 @@ pub async fn chat(
                             None
                         }
                     };
-                    if let Some(sources) = sources {
-                        yield ProducerEvent::Progress(Frame::new("sources", serde_json::to_string(&sources).unwrap_or_else(|_| "[]".into())));
-                    }
                     let mut recorded = tool_result_message(tool_result.call.as_str(), &text);
                     if let Some(failed) = is_error { recorded["is_error"] = json!(failed); }
                     exchange_acc.push(recorded);
+                    // Retain completed tool history before exposing its step to a client
+                    // that might immediately press Stop. Incomplete parallel calls are
+                    // removed by the generation driver when it saves a stopped answer.
+                    let resolved = shared.sink.lock().await.resolved.clone();
+                    yield ProducerEvent::Context {
+                        resolved,
+                        tool_exchange: exchange_acc.clone(),
+                        gathered: !steps_acc.is_empty(),
+                    };
+                    if let Some(step) = published_step {
+                        yield ProducerEvent::Progress(Frame::new("step", step.to_string()));
+                    }
+                    if let Some(sources) = sources {
+                        yield ProducerEvent::Progress(Frame::new("sources", serde_json::to_string(&sources).unwrap_or_else(|_| "[]".into())));
+                    }
                 }
                 // 钩子把这一回合退了回去。已经流给用户的话收不回来，接下来的正文
                 // 另起一段；还扣着的（写成正文的工具调用）随这一回合丢掉
@@ -967,7 +993,6 @@ pub async fn chat(
                             state.clone(),
                             kb_id,
                             workspace_id,
-                            conversation_id,
                             query.clone(),
                             history.turns.clone(),
                             client.clone(),
@@ -1051,71 +1076,30 @@ pub async fn chat(
                 .unwrap_or_default();
             sources = carried_sources(&answer_acc, previous, &history.last_sources);
         }
-        let saved = utopia_store::conversations::append_message(
-            &state.pool, conversation_id, "assistant", &answer_acc,
-            &utopia_store::conversations::TurnRecord {
+        yield ProducerEvent::Outcome(Ok(Answer {
+            content: answer_acc,
+            record: utopia_store::conversations::TurnRecord {
+                stopped: false,
                 steps: serde_json::Value::Array(steps_acc),
-                sources: serde_json::Value::Array(sources.clone()),
+                sources: serde_json::Value::Array(sources),
                 resolved: serde_json::Value::Array(resolved),
                 tool_exchange: serde_json::Value::Array(exchange_acc),
             },
-        ).await;
-        let saved_id = match saved {
-            Ok(id) => id,
-            Err(error) => {
-                tracing::error!(%error, %conversation_id, "Could not persist final answer");
-                yield ProducerEvent::Outcome(Err(Failure::new("answer_not_saved", "Could not save the answer. Please try again later.")));
-                return;
-            }
-        };
-        yield ProducerEvent::Progress(Frame::new("sources", serde_json::to_string(&sources).unwrap_or_else(|_| "[]".into())));
-        if shared.finalizing() { yield ProducerEvent::Progress(delta_event(&turn_text)); }
-        yield ProducerEvent::Outcome(Ok(saved_id));
+            final_text: shared.finalizing().then_some(turn_text),
+        }));
     };
 
     // 生成登记在案，然后**这条连接也只是去「接上」它**——与刷新之后
     // 那条重连走的是同一段代码。两条路分开写的话，迟早只有一条是对的
-    let handle = live.begin(conversation_id).await;
     let attached = live.attach(conversation_id).await;
-    tokio::spawn(async move {
-        let mut producer = std::pin::pin!(producer);
-        let mut outcome = None;
-        while let Some(event) = producer.next().await {
-            // 没有订阅者是常态（人走了）。**照发不误**：这里中断就等于
-            // 把「切走一次丢一个回答」原样搬回来
-            match event {
-                ProducerEvent::Progress(frame) => {
-                    if matches!(frame.event, "done" | "error") {
-                        outcome = Some(Err(Failure::new(
-                            "answer_failed",
-                            "Producer sent a terminal as progress",
-                        )));
-                        break;
-                    }
-                    handle.emit(frame).await;
-                }
-                ProducerEvent::Outcome(result) => {
-                    outcome = Some(result);
-                    break;
-                }
-            }
-        }
-        let terminal = match outcome {
-            Some(Ok(_saved_id)) => done_event(),
-            Some(Err(failure)) => error_event(
-                failure.code,
-                if failure.message.trim().is_empty() {
-                    "Answer failed"
-                } else {
-                    &failure.message
-                },
-            ),
-            None => error_event("stream_ended", "Answer stream ended unexpectedly"),
-        };
-        handle.emit(terminal).await;
-        // 注销之后再接上的人得到「没有在跑的」，那时答案已经落库
-        handle.finish().await;
-    });
+    tokio::spawn(generation::run(
+        save_pool,
+        conversation_id,
+        handle,
+        producer,
+        previous_answer,
+        previous_sources,
+    ));
 
     Ok(sse_from(attached))
 }
@@ -1150,7 +1134,6 @@ fn legacy_rag(
     state: AppState,
     kb_id: Uuid,
     workspace_id: Uuid,
-    conversation_id: Uuid,
     query: String,
     turns: Vec<(String, String)>,
     client: utopia_llm::LlmClient,
@@ -1191,22 +1174,14 @@ fn legacy_rag(
                     yield ProducerEvent::Outcome(Err(Failure::new("answer_empty", "Model returned an empty answer")));
                     return;
                 }
-                let saved = utopia_store::conversations::append_message(
-                    &state.pool, conversation_id, "assistant", &answer_acc,
-                    &utopia_store::conversations::TurnRecord {
-                        steps: serde_json::Value::Array(Vec::new()),
+                yield ProducerEvent::Outcome(Ok(Answer {
+                    content: answer_acc,
+                    record: utopia_store::conversations::TurnRecord {
                         sources: serde_json::Value::Array(legacy_sources),
-                        resolved: serde_json::Value::Array(Vec::new()),
-                        tool_exchange: serde_json::Value::Array(Vec::new()),
+                        ..utopia_store::conversations::TurnRecord::empty()
                     },
-                ).await;
-                match saved {
-                    Ok(id) => yield ProducerEvent::Outcome(Ok(id)),
-                    Err(error) => {
-                        tracing::error!(%error, "fallback answer persistence was not confirmed");
-                        yield ProducerEvent::Outcome(Err(Failure::new("answer_not_saved", "Could not confirm that the answer was saved.")));
-                    }
-                }
+                    final_text: None,
+                }));
             }
             Err(e) => yield ProducerEvent::Outcome(Err(Failure::model(&e, e.to_string()))),
         }
@@ -1276,6 +1251,25 @@ pub async fn reattach(
     Ok(sse_from(state.live.attach(conversation_id).await))
 }
 
+#[derive(Deserialize)]
+pub struct StopReq {
+    pub generation_id: Uuid,
+}
+
+/// Only signal the owner. It alone saves the partial answer and sends the terminal.
+pub async fn stop(
+    State(state): State<AppState>,
+    AuthUser(user): AuthUser,
+    Path((kb_id, conversation_id)): Path<(Uuid, Uuid)>,
+    Json(req): Json<StopReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    utopia_store::access::require_kb(&state.pool, &user, kb_id, Role::Viewer).await?;
+    utopia_store::conversations::require_owned(&state.pool, kb_id, user.id, conversation_id)
+        .await?;
+    state.live.stop(conversation_id, req.generation_id).await;
+    Ok(Json(json!({ "ok": true })))
+}
+
 /// 生成器产出的是 `Frame`，不是 `axum` 的 `Event`。
 /// **广播与快照都要读回事件的内容**，而 `Event` 读不回来（见 `live`）
 fn delta_event(text: &str) -> Frame {
@@ -1285,6 +1279,7 @@ fn delta_event(text: &str) -> Frame {
     )
 }
 
+#[cfg(test)]
 fn done_event() -> Frame {
     Frame::new("done", "{}".into())
 }
