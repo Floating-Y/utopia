@@ -2,7 +2,8 @@
 
 Records: [0042] (the loop), [0014] (MCP tools and scope), [0015] (`remember` and the nod), [0020]
 (the read contract), [0021] (rule tools), [0019] and [0022] (timed reads), [0035] (retrieval),
-[0011] and [0036] (mappings in the prompt), [0040] (origin in results), [0046] (where an app gets built).
+[0011] and [0036] (mappings in the prompt), [0040] (origin in results), [0046] (where an app gets built),
+[0063] (stopping a generation).
 
 ## What it does today
 
@@ -22,6 +23,13 @@ entities become a `system` message right before the question; degradation to one
 only on a 400 or 422 to the first request with tools [0042 d2]. A question whose answer failed stays
 stored without one; a retry names it (`retry_message_id`) and answers it in place, only while it is
 the conversation's last message and no answer is being written there (#936).
+
+**Stop** explicitly cancels pending model and tool work, then saves the published partial answer
+once with `stopped: true` before sending `done`. The browser waits for that terminal outcome before
+allowing a follow-up; navigation and SSE disconnections let generation continue. A conversation
+admits one generation through persistence, for both new questions and retries; another request
+receives HTTP 409 with `answer_running`. A generation ID keeps a delayed Stop from cancelling a
+later turn [0063].
 
 **Tools** live once in `tools.rs` and serve chat and MCP alike: `search_chunks`, `search_docs`,
 `find_entities`, `entity_facts` (names marked as names, derived rows with their rule, `as_of` and
