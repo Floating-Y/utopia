@@ -472,6 +472,10 @@ fn render_rows(
         data.extend(rest.into_iter().map(|r| (String::new(), r)));
     }
     if data.is_empty() && headers.is_empty() {
+        // 单列纯文字的每行都会被当成说明；没有表格主体时也不能丢掉这些文字。
+        if width == 1 && !captions.is_empty() {
+            return Some((captions.join("\n\n"), Vec::new()));
+        }
         return None;
     }
 
@@ -630,6 +634,24 @@ mod tests {
     fn render(html: &str) -> String {
         let (_, tables) = lift_tables(html);
         tables.join("\n=====\n")
+    }
+
+    #[test]
+    fn single_column_text_survives_without_rendering_empty_or_wide_caption_only_tables() {
+        let rows = vec![
+            vec![("Action".into(), 1, 0)],
+            vec![(String::new(), 1, 0)],
+            vec![("Approve contract".into(), 1, 0)],
+            vec![("Renew license".into(), 1, 0)],
+        ];
+        for first_is_header in [false, true] {
+            assert_eq!(
+                render_grid(&rows, first_is_header).as_deref(),
+                Some("Action\n\nApprove contract\n\nRenew license")
+            );
+        }
+        assert!(render_grid(&[vec![(String::new(), 1, 0)]], false).is_none());
+        assert!(render_grid(&[vec![("Caption".into(), 2, 0)]], false).is_none());
     }
 
     #[test]
