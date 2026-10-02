@@ -419,7 +419,7 @@ async fn materialize_in_tx(
     // 3b. 见证跟着来源陈述走（0064 决定 3、5）：类型化的行自己没有出处。物化与算隐含行
     //     用的写入口在陈述没有见证时填的是此刻（那是给人写的事实用的缺省），这里改回陈述的。
     //     排在 3a 之后：规则算出的行也是这样写下的
-    sync_typed_attestation(&mut **tx, kb_id).await?;
+    written.extend(sync_typed_attestation_ids(&mut **tx, kb_id).await?);
     Ok((
         Outcome {
             retired,
@@ -444,7 +444,15 @@ pub async fn sync_typed_attestation<'e>(
     ex: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
     kb_id: Uuid,
 ) -> AppResult<u64> {
-    let moved = sqlx::query(
+    Ok(sync_typed_attestation_ids(ex, kb_id).await?.len() as u64)
+}
+
+// 已有行的见证也可能在这一轮改变；提交后与新写下的行一起对账。
+async fn sync_typed_attestation_ids<'e>(
+    ex: impl sqlx::Executor<'e, Database = sqlx::Postgres>,
+    kb_id: Uuid,
+) -> AppResult<Vec<Uuid>> {
+    let moved = sqlx::query_scalar(
         "UPDATE facts t
             SET attested_from = src.at, attested_by = src.by
            FROM (SELECT u.fact_id,
@@ -465,12 +473,13 @@ pub async fn sync_typed_attestation<'e>(
             AND (t.implied
                  OR EXISTS (SELECT 1 FROM typed_fact_sources ts WHERE ts.fact_id = t.id))
             AND (t.attested_from IS DISTINCT FROM src.at
-                 OR t.attested_by IS DISTINCT FROM src.by)",
+                 OR t.attested_by IS DISTINCT FROM src.by)
+          RETURNING t.id",
     )
     .bind(kb_id)
-    .execute(ex)
+    .fetch_all(ex)
     .await?;
-    Ok(moved.rows_affected())
+    Ok(moved)
 }
 
 #[derive(sqlx::FromRow)]

@@ -661,7 +661,8 @@ async fn attest_statements(
            FROM fact_evidence fe
            JOIN facts f ON f.id = fe.fact_id
            JOIN chunks c ON c.id = fe.chunk_id
-          WHERE fe.document_id = $1 AND f.layer = 'open' AND f.invalidated_at IS NULL",
+          WHERE fe.document_id = $1 AND c.superseded_at IS NULL
+            AND f.layer = 'open' AND f.invalidated_at IS NULL",
     )
     .bind(doc.id)
     .fetch_all(pool)
@@ -686,8 +687,26 @@ async fn attest_statements(
     }
     // 已经物化出来的、规则算出来的类型化行跟着它们的陈述走
     let typed = utopia_store::materialize::sync_typed_attestation(pool, doc.kb_id).await?;
+    let mut reconciled = utopia_store::temporal::ReconcileReport::default();
+    if typed > 0 {
+        // 同步覆盖整个库；这些已有行的见证也会改变唯一性时间线。先提交同步，再拿时间线锁，
+        // 不在持有 UPDATE 行锁时等待咨询锁（与物化提交后对账的顺序一致）。
+        let affected: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT t.id FROM facts t
+              WHERE t.kb_id = $1 AND t.layer = 'typed' AND t.invalidated_at IS NULL
+                AND (t.implied
+                     OR EXISTS (SELECT 1 FROM typed_fact_sources ts WHERE ts.fact_id = t.id))",
+        )
+        .bind(doc.kb_id)
+        .fetch_all(pool)
+        .await?;
+        reconciled =
+            utopia_store::temporal::reconcile_moved_facts(pool, doc.kb_id, &affected).await?;
+    }
     if moved > 0 || typed > 0 {
-        tracing::info!(document_id = %doc.id, statements = moved, typed, "陈述按它所在那一节的日期作了证");
+        tracing::info!(document_id = %doc.id, statements = moved, typed,
+            corrected = reconciled.corrected.len(), conflicts = reconciled.conflicts,
+            "陈述按它所在那一节的日期作了证");
         state.emit_graph(doc.kb_id);
     }
     Ok(())
@@ -696,6 +715,10 @@ async fn attest_statements(
 #[cfg(test)]
 #[path = "time_context_tests.rs"]
 mod context_tests;
+
+#[cfg(test)]
+#[path = "time_attestation_tests.rs"]
+mod attestation_tests;
 
 #[cfg(test)]
 mod tests {
