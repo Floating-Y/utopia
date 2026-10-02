@@ -137,8 +137,8 @@ fn pdf_with_poppler(bytes: &[u8]) -> anyhow::Result<String> {
 }
 
 /// docx：解压 word/document.xml。正文 w:t 取字；不在表格里的 w:p 是一段，段末留空行；
-/// 段内的 w:br/w:cr 仍是单换行。表格（w:tbl）收成网格交给 `table::render_grid`，和 HTML 表
-/// 走同一套渲染：w:gridSpan 跨列，上下合并（w:vMerge）的续格留空，格内段落的左缩进 w:ind
+/// 段内的 w:br/w:cr 仍是单换行。表格（w:tbl）收成网格交给 `table::grid_or_lines`，和 HTML 表
+/// 走同一套渲染（不成表的网格按行写出字来）：w:gridSpan 跨列，上下合并（w:vMerge）的续格留空，格内段落的左缩进 w:ind
 /// 当内边距（小节行靠它折进标签）。套在格子里的表按格子文字处理。标题（有大纲级别的段落，
 /// 见 [`docx_heading_styles`]）写成 Markdown 标题。
 pub fn docx(bytes: &[u8]) -> anyhow::Result<String> {
@@ -436,7 +436,7 @@ pub(crate) fn docx_xml_to_text(
                 "w:tbl" => {
                     depth = depth.saturating_sub(1);
                     if depth == 0 {
-                        if let Some(md) = crate::table::render_grid(&rows, false) {
+                        if let Some(md) = crate::table::grid_or_lines(&rows, false) {
                             if !out.is_empty() {
                                 let end = out.trim_end().len();
                                 out.truncate(end);
@@ -1166,7 +1166,7 @@ fn pptx_xml_to_text(xml: &str) -> anyhow::Result<String> {
                 "a:tbl" => {
                     table_depth = table_depth.saturating_sub(1);
                     if table_depth == 0 {
-                        if let Some(md) = crate::table::render_grid(&rows, first_is_header) {
+                        if let Some(md) = crate::table::grid_or_lines(&rows, first_is_header) {
                             out.push('\n');
                             out.push_str(&md);
                             out.push_str("\n\n");

@@ -116,6 +116,33 @@ fn a_slide_with_only_a_single_column_text_table_keeps_every_cell() {
     }
 }
 
+/// Two columns where only one cell in each row has words, and a notice in one cell
+/// that spans the row: neither is a table with headers and data, and both keep their words.
+#[test]
+fn a_slide_table_that_is_not_a_grid_of_data_keeps_its_words() {
+    for first_row in [false, true] {
+        let text = parse_slide(&table(
+            first_row,
+            &[
+                row(&[cell("Action"), empty_cell("")]),
+                row(&[cell("Approve contract"), empty_cell("")]),
+                row(&[empty_cell(""), cell("Renew license")]),
+            ],
+        ));
+        for words in ["Action", "Approve contract", "Renew license"] {
+            assert!(text.contains(words), "missing {words:?}: {text}");
+        }
+        let text = parse_slide(&table(
+            first_row,
+            &[row(&[
+                cell_with_props("Notice for the board", r#"gridSpan="2""#),
+                empty_cell(r#"hMerge="1""#),
+            ])],
+        ));
+        assert!(text.contains("Notice for the board"), "{text}");
+    }
+}
+
 #[test]
 fn a_three_by_four_slide_table_keeps_its_header_and_rows() {
     let text = parse_slide(&table(
