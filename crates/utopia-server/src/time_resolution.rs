@@ -687,22 +687,11 @@ async fn attest_statements(
     }
     // 已经物化出来的、规则算出来的类型化行跟着它们的陈述走
     let typed = utopia_store::materialize::sync_typed_attestation(pool, doc.kb_id).await?;
-    let mut reconciled = utopia_store::temporal::ReconcileReport::default();
-    if typed > 0 {
-        // 同步覆盖整个库；这些已有行的见证也会改变唯一性时间线。先提交同步，再拿时间线锁，
-        // 不在持有 UPDATE 行锁时等待咨询锁（与物化提交后对账的顺序一致）。
-        let affected: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT t.id FROM facts t
-              WHERE t.kb_id = $1 AND t.layer = 'typed' AND t.invalidated_at IS NULL
-                AND (t.implied
-                     OR EXISTS (SELECT 1 FROM typed_fact_sources ts WHERE ts.fact_id = t.id))",
-        )
-        .bind(doc.kb_id)
-        .fetch_all(pool)
-        .await?;
-        reconciled =
-            utopia_store::temporal::reconcile_moved_facts(pool, doc.kb_id, &affected).await?;
-    }
+    // 见证动了的行换了它在唯一性时间线上的位置：只把这些行所在的时间线重算一遍，不是整个库
+    // ——每篇文档都把全库的时间线各开一个事务重算一遍，库一大就是每篇几千个事务。
+    // 先提交同步，再拿时间线锁，不在持有 UPDATE 行锁时等咨询锁（与物化提交后对账的顺序一致）
+    let reconciled = utopia_store::temporal::reconcile_moved_facts(pool, doc.kb_id, &typed).await?;
+    let typed = typed.len();
     if moved > 0 || typed > 0 {
         tracing::info!(document_id = %doc.id, statements = moved, typed,
             corrected = reconciled.corrected.len(), conflicts = reconciled.conflicts,
