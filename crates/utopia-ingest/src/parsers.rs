@@ -931,7 +931,7 @@ fn spreadsheet_headers(regions: &[GridMerge], rows: &[GridRow]) -> Option<std::o
 /// Display 原样写这个数，2024-01-15 就成了 45306——文档里没有这个日期了，时间抽取看不见
 /// 它，模型只当它是个量；同一天在 1904 纪年的工作簿里还是另一个数（43844）。
 ///
-/// 写成 ISO：整天只写日期，带时刻的加上时刻，整数部分是 0 的只写时刻（`h:mm` 一类格式），
+/// 写成 ISO：整天只写日期，带时刻的加上时刻，明确的纯时间格式或整数部分是 0 的只写时刻，
 /// 累计时长（`[h]:mm:ss`）写累计的时分秒。显示用的格式 calamine 不交出来，所以只显示年月
 /// 的格子也写到日。出了 Excel 日历的数照原样写
 fn excel_date(d: &calamine::ExcelDateTime) -> String {
@@ -956,7 +956,7 @@ fn excel_date(d: &calamine::ExcelDateTime) -> String {
     } else {
         format!("{hour:02}:{minute:02}:{second:02}")
     };
-    if value < 1.0 {
+    if d.is_time() || value < 1.0 {
         return time;
     }
     let date = format!("{year:04}-{month:02}-{day:02}");

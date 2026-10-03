@@ -16,6 +16,7 @@ WORKDIR /src
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
+COPY vendor/ vendor/
 COPY migrations/ migrations/
 # docs_corpus.rs 用 include_str! 把产品内文档编进二进制，所以它是后端的源码依赖，
 # 不只是前端资源——漏掉这行，cargo build 直接报 couldn't read。
