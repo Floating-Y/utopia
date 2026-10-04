@@ -1089,19 +1089,15 @@ fn pptx_xml_to_text(xml: &str) -> anyhow::Result<String> {
                 }
                 "a:tr" if table_depth == 1 => row.clear(),
                 "a:tc" if table_depth == 1 => {
+                    // DrawingML 的合并属性属于 a:tc，后面的 a:tcPr 只描述样式。
                     cell = Some(TableCell {
-                        span: 1,
+                        span: attr(&e, "gridSpan")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(1),
+                        horizontal_merge: truthy(&e, "hMerge"),
+                        vertical_merge: truthy(&e, "vMerge"),
                         ..TableCell::default()
                     });
-                }
-                "a:tcPr" if table_depth == 1 => {
-                    if let Some(c) = cell.as_mut() {
-                        if let Some(span) = attr(&e, "gridSpan").and_then(|v| v.parse().ok()) {
-                            c.span = span;
-                        }
-                        c.horizontal_merge = truthy(&e, "hMerge");
-                        c.vertical_merge = truthy(&e, "vMerge");
-                    }
                 }
                 "a:t" => {
                     if cell.is_some() || table_depth == 0 {
@@ -1118,15 +1114,6 @@ fn pptx_xml_to_text(xml: &str) -> anyhow::Result<String> {
             Ok(Event::Empty(e)) => match e.name().as_ref() {
                 "a:tblPr" if table_depth == 1 => {
                     first_is_header = truthy(&e, "firstRow");
-                }
-                "a:tcPr" if table_depth == 1 => {
-                    if let Some(c) = cell.as_mut() {
-                        if let Some(span) = attr(&e, "gridSpan").and_then(|v| v.parse().ok()) {
-                            c.span = span;
-                        }
-                        c.horizontal_merge = truthy(&e, "hMerge");
-                        c.vertical_merge = truthy(&e, "vMerge");
-                    }
                 }
                 "a:br" => match cell.as_mut() {
                     Some(c) => c.text.push(' '),
