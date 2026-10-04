@@ -42,11 +42,12 @@ const NOTION_VERSION: &str = "2026-03-11";
 /// 可以有几万页。
 const MAX_PAGES_PER_SYNC: usize = 500;
 
-/// 每页最多取多少个 block。再深的页面截断，比让一次同步卡在一页上好。
+/// 每页所有层级合计最多取多少个 block，包含无文字容器。
+/// 再深的页面截断，比让一次同步卡在一页上好。
 const MAX_BLOCKS_PER_PAGE: usize = 500;
 
 /// 两次请求之间至少隔这么久。Notion 说的是「平均每秒三次」，取 350 毫秒留一点余量：
-/// 500 页的上限下一次同步最坏三分钟出头，比同步失败便宜得多。
+/// 总耗时还取决于每页的嵌套层级与分页数。
 const MIN_INTERVAL: Duration = Duration::from_millis(350);
 /// 一次请求撞上 429 最多等几回。`Retry-After` 通常是个位数秒，连等几回还在限流
 /// 就不是节奏问题了，该把错误交出去。
@@ -82,11 +83,17 @@ fn client(token: &str) -> anyhow::Result<reqwest::Client> {
 struct Paced {
     http: reqwest::Client,
     last: Option<Instant>,
+    // 私有地址入口让 HTTP 测试走真实取页和限流逻辑，不增加用户配置。
+    api_root: String,
 }
 
 impl Paced {
     fn new(http: reqwest::Client) -> Self {
-        Self { http, last: None }
+        Self {
+            http,
+            last: None,
+            api_root: "https://api.notion.com/v1".into(),
+        }
     }
 
     /// 发一次请求并解析 JSON。`what` 进日志和错误文案（"search" / "blocks"）。
@@ -162,6 +169,13 @@ fn retry_after(header: Option<&str>) -> Duration {
 /// 表格里的每一行是一个页面，会在同一次搜索里出现。
 pub async fn fetch(token: &str, query: Option<&str>) -> anyhow::Result<(Vec<NotionPage>, bool)> {
     let mut http = Paced::new(client(token)?);
+    fetch_pages(&mut http, query).await
+}
+
+async fn fetch_pages(
+    http: &mut Paced,
+    query: Option<&str>,
+) -> anyhow::Result<(Vec<NotionPage>, bool)> {
     let mut out = Vec::new();
     let mut cursor: Option<String> = None;
     let mut truncated = false;
@@ -178,11 +192,8 @@ pub async fn fetch(token: &str, query: Option<&str>) -> anyhow::Result<(Vec<Noti
             body["start_cursor"] = serde_json::Value::String(c.clone());
         }
 
-        let v = http
-            .send("search", |c| {
-                c.post("https://api.notion.com/v1/search").json(&body)
-            })
-            .await?;
+        let url = format!("{}/search", http.api_root);
+        let v = http.send("search", |c| c.post(&url).json(&body)).await?;
 
         for p in v["results"].as_array().unwrap_or(&vec![]).clone() {
             // 回收站里的和归档的都不要——它们在界面上已经不算数了
@@ -195,7 +206,7 @@ pub async fn fetch(token: &str, query: Option<&str>) -> anyhow::Result<(Vec<Noti
             }
             let Some(id) = p["id"].as_str() else { continue };
             let title = page_title(&p);
-            let text = page_text(&mut http, id).await.unwrap_or_else(|e| {
+            let text = page_text(http, id).await.unwrap_or_else(|e| {
                 tracing::warn!(%id, error = %e, "notion page body could not be read, keeping the title only");
                 String::new()
             });
@@ -251,24 +262,52 @@ fn page_title(page: &serde_json::Value) -> String {
 /// 取一页的正文，逐层展开 block。
 async fn page_text(http: &mut Paced, page_id: &str) -> anyhow::Result<String> {
     let mut out = String::new();
-    let mut n = 0usize;
+    let mut block_count = 0;
+    append_children(http, page_id, &mut out, &mut block_count).await?;
+    Ok(out)
+}
+
+/// 每个父块独立分页，先写父块，再读完子树，最后继续兄弟块。
+/// 输出和预算由整页共享；递归深度也受同一块数上限约束。
+async fn append_children(
+    http: &mut Paced,
+    parent_id: &str,
+    out: &mut String,
+    block_count: &mut usize,
+) -> anyhow::Result<()> {
     let mut cursor: Option<String> = None;
 
-    loop {
-        let mut url = format!("https://api.notion.com/v1/blocks/{page_id}/children?page_size=100");
+    while *block_count < MAX_BLOCKS_PER_PAGE {
+        let mut url = format!(
+            "{}/blocks/{parent_id}/children?page_size=100",
+            http.api_root
+        );
         if let Some(c) = &cursor {
             url.push_str(&format!("&start_cursor={c}"));
         }
         let v = http.send("blocks", |c| c.get(&url)).await?;
 
         for b in v["results"].as_array().unwrap_or(&vec![]) {
-            if n >= MAX_BLOCKS_PER_PAGE {
-                return Ok(out);
+            if *block_count >= MAX_BLOCKS_PER_PAGE {
+                return Ok(());
             }
-            n += 1;
+            *block_count += 1;
             if let Some(line) = render_block(b) {
                 out.push_str(&line);
                 out.push('\n');
+            }
+            // 不能因父块没有 rich_text 而跳过 column 等容器。
+            // 独立页面由 search 单独摄入，数据库也不是父页正文的一部分。
+            let independent_content =
+                matches!(b["type"].as_str(), Some("child_page" | "child_database"));
+            if *block_count < MAX_BLOCKS_PER_PAGE
+                && b["has_children"].as_bool() == Some(true)
+                && !independent_content
+            {
+                let id = b["id"]
+                    .as_str()
+                    .context("notion blocks: child block is missing id")?;
+                Box::pin(append_children(http, id, out, block_count)).await?;
             }
         }
         if v["has_more"].as_bool() != Some(true) {
@@ -279,7 +318,7 @@ async fn page_text(http: &mut Paced, page_id: &str) -> anyhow::Result<String> {
             break;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 /// 把一个 block 渲染成一行文本。
@@ -340,6 +379,14 @@ fn slug(title: &str) -> String {
         s.chars().take(60).collect()
     }
 }
+
+#[cfg(test)]
+#[path = "notion_tests.rs"]
+mod traversal_tests;
+
+#[cfg(test)]
+#[path = "notion_resync_tests.rs"]
+mod resync_tests;
 
 #[cfg(test)]
 mod tests {
