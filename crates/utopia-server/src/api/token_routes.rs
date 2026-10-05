@@ -5,8 +5,10 @@
 
 use axum::extract::{Path, State};
 use axum::Json;
+use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use serde_json::json;
+use utopia_core::{AppError, AppResult};
 use uuid::Uuid;
 
 use crate::auth::AuthUser;
@@ -35,14 +37,36 @@ fn default_days() -> i64 {
     90
 }
 
+fn token_expires_at(now: DateTime<Utc>, expires_in_days: i64) -> AppResult<Option<DateTime<Utc>>> {
+    if expires_in_days < 0 {
+        return Err(AppError::invalid(
+            "bad_token_expiry",
+            "expires_in_days must be non-negative",
+        ));
+    }
+    if expires_in_days == 0 {
+        return Ok(None);
+    }
+
+    let duration = Duration::try_days(expires_in_days).ok_or_else(|| {
+        AppError::invalid(
+            "bad_token_expiry",
+            "Token expiration duration is out of range",
+        )
+    })?;
+    let expires_at = now.checked_add_signed(duration).ok_or_else(|| {
+        AppError::invalid("bad_token_expiry", "Token expiration date is out of range")
+    })?;
+    Ok(Some(expires_at))
+}
+
 /// 发一枚。**明文只在这一次的响应里出现**,之后库里只有哈希。
 pub async fn issue(
     State(state): State<AppState>,
     AuthUser(user): AuthUser,
     Json(req): Json<IssueReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let expires_at = (req.expires_in_days > 0)
-        .then(|| chrono::Utc::now() + chrono::Duration::days(req.expires_in_days));
+    let expires_at = token_expires_at(Utc::now(), req.expires_in_days)?;
     let (view, plain) = utopia_store::tokens::issue(
         &state.pool,
         user.id,
@@ -92,3 +116,7 @@ pub async fn revoke(
     .await;
     Ok(Json(json!({ "ok": true })))
 }
+
+#[cfg(test)]
+#[path = "token_routes_tests.rs"]
+mod tests;

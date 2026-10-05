@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::auth::AuthUser;
 use crate::error::ApiResult;
-use crate::state::AppState;
+use crate::state::{AppEvent, AppState};
 
 /// 一页几组。弹窗里放得下的量——再多就该翻页，而不是让人滚一屏。
 const PAGE: i64 = 8;
@@ -139,7 +139,12 @@ pub async fn stream(
     State(state): State<AppState>,
     AuthUser(_user): AuthUser,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
-    let mut rx = state.events.subscribe();
+    Ok(alert_event_stream(state.events.subscribe()))
+}
+
+fn alert_event_stream(
+    mut rx: broadcast::Receiver<AppEvent>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = async_stream::stream! {
         loop {
             match rx.recv().await {
@@ -147,10 +152,111 @@ pub async fn stream(
                     yield Ok(Event::default().event("alert").data("{}"));
                 }
                 Ok(_) => continue,
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // 唯一的告警可能已被其他类型的通知挤掉。结束响应，让 EventSource
+                // 重连后通过 onRecover 补刷，即使之后再没有新告警。
+                Err(broadcast::error::RecvError::Lagged(_)) => return,
                 Err(broadcast::error::RecvError::Closed) => return,
             }
         }
     };
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+    use axum::{routing::get, Router};
+    use futures_util::{FutureExt, StreamExt};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn lagged_alert_stream_ends_when_non_alert_events_displace_its_only_alert() {
+        let (sender, _) = broadcast::channel(256);
+        let route_sender = sender.clone();
+        let app = Router::new().route(
+            "/events",
+            get(move || {
+                let sender = route_sender.clone();
+                async move {
+                    let receiver = sender.subscribe();
+                    sender
+                        .send(AppEvent {
+                            kb_id: None,
+                            kind: "alert",
+                            document_id: None,
+                        })
+                        .unwrap();
+                    for _ in 0..257 {
+                        sender
+                            .send(AppEvent {
+                                kb_id: Some(Uuid::now_v7()),
+                                kind: "document",
+                                document_id: None,
+                            })
+                            .unwrap();
+                    }
+                    alert_event_stream(receiver)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let request = async {
+            let response = client
+                .get(format!("http://{address}/events"))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.headers()["content-type"], "text/event-stream");
+            response.text().await.unwrap()
+        };
+        // 保留 sender：被过滤的剩余事件不能让漏掉告警的连接一直开着。
+        let result = tokio::time::timeout(Duration::from_secs(2), request).await;
+        server.abort();
+        assert!(result
+            .expect("a lagged alert SSE response must end")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn alert_stream_filters_non_alerts_and_never_exposes_alert_details() {
+        let (sender, receiver) = broadcast::channel(256);
+        let response = alert_event_stream(receiver).into_response();
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let mut body = response.into_body().into_data_stream();
+        assert!(body.next().now_or_never().is_none());
+        sender
+            .send(AppEvent {
+                kb_id: Some(Uuid::now_v7()),
+                kind: "document",
+                document_id: None,
+            })
+            .unwrap();
+        assert!(body.next().now_or_never().is_none());
+        sender
+            .send(AppEvent {
+                kb_id: Some(Uuid::now_v7()),
+                kind: "alert",
+                document_id: Some(Uuid::now_v7()),
+            })
+            .unwrap();
+        let frame = body.next().await.unwrap().unwrap();
+        assert_eq!(frame.as_ref(), b"event: alert\ndata: {}\n\n");
+        assert!(body.next().now_or_never().is_none());
+        drop(sender);
+        assert!(body.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_an_alert_response_releases_its_subscription() {
+        let (sender, receiver) = broadcast::channel(256);
+        let response = alert_event_stream(receiver).into_response();
+        assert_eq!(sender.receiver_count(), 1);
+        drop(response);
+        assert_eq!(sender.receiver_count(), 0);
+    }
 }
