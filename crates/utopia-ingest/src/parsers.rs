@@ -485,6 +485,10 @@ pub(crate) fn docx_xml_to_text(
 
 /// PPTX: extract a:t text in the presentation's logical slide order. Tables under a:tbl
 /// become Markdown grids through the same renderer as DOCX and spreadsheet tables.
+///
+/// 第一页是这份演示的开头，写在任何标题之前；第二页起每页一节（`## Slide N`）。封面上的
+/// 日期说的是整份演示，而一个日期管到哪看它所在的标题（0064）：封面也是一节的话，它的
+/// 日期只管封面，后面每一页的陈述都没有见证。Word 的标题块本来就在第一个标题之前，这里一样
 pub fn pptx(bytes: &[u8]) -> anyhow::Result<String> {
     let mut archive =
         zip::ZipArchive::new(Cursor::new(bytes.to_vec())).context("Failed to unzip pptx")?;
@@ -515,7 +519,12 @@ pub fn pptx(bytes: &[u8]) -> anyhow::Result<String> {
     for (num, name) in slides {
         let xml = pptx_part(&mut archive, &name)?;
         let text = pptx_xml_to_text(&xml)?;
-        if !text.trim().is_empty() {
+        if text.trim().is_empty() {
+            continue;
+        }
+        if num == 1 {
+            out.push_str(&format!("{text}\n"));
+        } else {
             out.push_str(&format!("\n## Slide {num}\n{text}\n"));
         }
     }
@@ -1089,19 +1098,15 @@ fn pptx_xml_to_text(xml: &str) -> anyhow::Result<String> {
                 }
                 "a:tr" if table_depth == 1 => row.clear(),
                 "a:tc" if table_depth == 1 => {
+                    // DrawingML 的合并属性属于 a:tc，后面的 a:tcPr 只描述样式。
                     cell = Some(TableCell {
-                        span: 1,
+                        span: attr(&e, "gridSpan")
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(1),
+                        horizontal_merge: truthy(&e, "hMerge"),
+                        vertical_merge: truthy(&e, "vMerge"),
                         ..TableCell::default()
                     });
-                }
-                "a:tcPr" if table_depth == 1 => {
-                    if let Some(c) = cell.as_mut() {
-                        if let Some(span) = attr(&e, "gridSpan").and_then(|v| v.parse().ok()) {
-                            c.span = span;
-                        }
-                        c.horizontal_merge = truthy(&e, "hMerge");
-                        c.vertical_merge = truthy(&e, "vMerge");
-                    }
                 }
                 "a:t" => {
                     if cell.is_some() || table_depth == 0 {
@@ -1118,15 +1123,6 @@ fn pptx_xml_to_text(xml: &str) -> anyhow::Result<String> {
             Ok(Event::Empty(e)) => match e.name().as_ref() {
                 "a:tblPr" if table_depth == 1 => {
                     first_is_header = truthy(&e, "firstRow");
-                }
-                "a:tcPr" if table_depth == 1 => {
-                    if let Some(c) = cell.as_mut() {
-                        if let Some(span) = attr(&e, "gridSpan").and_then(|v| v.parse().ok()) {
-                            c.span = span;
-                        }
-                        c.horizontal_merge = truthy(&e, "hMerge");
-                        c.vertical_merge = truthy(&e, "vMerge");
-                    }
                 }
                 "a:br" => match cell.as_mut() {
                     Some(c) => c.text.push(' '),

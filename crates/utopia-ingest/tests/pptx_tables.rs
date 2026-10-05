@@ -31,12 +31,12 @@ fn text_box(text: &str) -> String {
 }
 
 fn cell(text: &str) -> String {
-    cell_with_props(text, "")
+    cell_with_attrs(text, "")
 }
 
-fn cell_with_props(text: &str, props: &str) -> String {
+fn cell_with_attrs(text: &str, attrs: &str) -> String {
     format!(
-        r#"<a:tc><a:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>{text}</a:t></a:r></a:p></a:txBody><a:tcPr {props}/></a:tc>"#
+        r#"<a:tc {attrs}><a:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:t>{text}</a:t></a:r></a:p></a:txBody><a:tcPr/></a:tc>"#
     )
 }
 
@@ -48,8 +48,8 @@ fn cell_with_paragraphs(paragraphs: &[&str]) -> String {
     format!(r#"<a:tc><a:txBody><a:bodyPr/><a:lstStyle/>{paragraphs}</a:txBody><a:tcPr/></a:tc>"#)
 }
 
-fn empty_cell(props: &str) -> String {
-    format!(r#"<a:tc><a:txBody><a:bodyPr/><a:lstStyle/><a:p/></a:txBody><a:tcPr {props}/></a:tc>"#)
+fn empty_cell(attrs: &str) -> String {
+    format!(r#"<a:tc {attrs}><a:txBody><a:bodyPr/><a:lstStyle/><a:p/></a:txBody><a:tcPr/></a:tc>"#)
 }
 
 fn row(cells: &[String]) -> String {
@@ -135,7 +135,7 @@ fn a_slide_table_that_is_not_a_grid_of_data_keeps_its_words() {
         let text = parse_slide(&table(
             first_row,
             &[row(&[
-                cell_with_props("Notice for the board", r#"gridSpan="2""#),
+                cell_with_attrs("Notice for the board", r#"gridSpan="2""#),
                 empty_cell(r#"hMerge="1""#),
             ])],
         ));
@@ -186,43 +186,60 @@ fn a_title_and_text_around_a_slide_table_keep_their_lines() {
 
 #[test]
 fn grid_span_and_horizontal_merge_keep_the_grid_shape() {
-    let text = parse_slide(&table(
+    let body = table(
         true,
         &[
             row(&[
-                cell_with_props("Summary", r#"gridSpan="2""#),
-                cell_with_props("COVERED", r#"hMerge="1""#),
+                cell_with_attrs("Summary", r#"gridSpan="2""#),
+                cell_with_attrs("HORIZONTAL-COVERED", r#"hMerge="1""#),
                 cell("Total"),
             ]),
             row(&[cell("Q1"), cell("1,200"), cell("1,350")]),
         ],
-    ));
-
-    assert!(
-        text.contains("|  | Summary | Total |\n| --- | --- | --- |\n| Q1 | 1,200 | 1,350 |"),
-        "{text}"
     );
-    assert!(!text.contains("COVERED"), "{text}");
+
+    // Both XML event forms must leave the merge attributes read from a:tc intact.
+    for properties in ["<a:tcPr/>", "<a:tcPr></a:tcPr>"] {
+        let text = parse_slide(&body.replace("<a:tcPr/>", properties));
+        assert!(!text.contains("HORIZONTAL-COVERED"), "{properties}: {text}");
+        assert!(
+            text.contains("|  | Summary | Total |\n| --- | --- | --- |\n| Q1 | 1,200 | 1,350 |"),
+            "{properties}: {text}"
+        );
+    }
 }
 
 #[test]
 fn a_vertical_merge_continuation_stays_an_empty_cell() {
-    let text = parse_slide(&table(
+    let body = table(
         true,
         &[
             row(&[cell("Quarter"), cell("Revenue"), cell("YoY")]),
-            row(&[cell("Q1"), cell("1,200"), cell("+12%")]),
-            row(&[cell("Q2"), cell("1,350"), empty_cell(r#"vMerge="1""#)]),
+            row(&[
+                cell("Q1"),
+                cell("1,200"),
+                cell_with_attrs("+12%", r#"rowSpan="2""#),
+            ]),
+            row(&[
+                cell("Q2"),
+                cell("1,350"),
+                cell_with_attrs("VERTICAL-COVERED", r#"vMerge="1""#),
+            ]),
             row(&[cell("Q3"), cell("1,410"), cell("+7%")]),
         ],
-    ));
-
-    assert!(
-        text.contains(
-            "| Quarter | Revenue | YoY |\n| --- | --- | --- |\n| Q1 | 1,200 | +12% |\n| Q2 | 1,350 |  |\n| Q3 | 1,410 | +7% |"
-        ),
-        "{text}"
     );
+
+    // An already empty continuation would pass even if vMerge were ignored.
+    for properties in ["<a:tcPr/>", "<a:tcPr></a:tcPr>"] {
+        let text = parse_slide(&body.replace("<a:tcPr/>", properties));
+        assert!(!text.contains("VERTICAL-COVERED"), "{properties}: {text}");
+        assert!(
+            text.contains(
+                "| Quarter | Revenue | YoY |\n| --- | --- | --- |\n| Q1 | 1,200 | +12% |\n| Q2 | 1,350 |  |\n| Q3 | 1,410 | +7% |"
+            ),
+            "{properties}: {text}"
+        );
+    }
 }
 
 #[test]

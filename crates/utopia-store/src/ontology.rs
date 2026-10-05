@@ -19,9 +19,15 @@ pub async fn entity_type_views(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Enti
                   WHERE p.child_id = t.id AND p.is_primary) AS primary_parent,
                 ARRAY(SELECT d.b_id FROM entity_type_disjoint d
                       WHERE d.kb_id = t.kb_id AND d.a_id = t.id) AS disjoint,
-                (SELECT count(*) FROM entities e
-                 WHERE e.type_id = t.id AND e.merged_into IS NULL) AS usage
-         FROM entity_types t WHERE t.kb_id = $1 ORDER BY lower(t.label)",
+                COALESCE(u.usage, 0) AS usage
+         FROM entity_types t
+         LEFT JOIN (
+             SELECT type_id, count(*)::bigint AS usage
+             FROM entities
+             WHERE kb_id = $1 AND merged_into IS NULL AND type_id IS NOT NULL
+             GROUP BY type_id
+         ) u ON u.type_id = t.id
+         WHERE t.kb_id = $1 ORDER BY lower(t.label)",
     )
     .bind(kb_id)
     .fetch_all(pool)
@@ -86,9 +92,15 @@ pub async fn relation_type_views(pool: &PgPool, kb_id: Uuid) -> AppResult<Vec<Re
                       WHERE g.relation_type_id = r.id) AS ranges,
                 ARRAY(SELECT q.qualifier_type_id FROM relation_type_qualifiers q
                       WHERE q.relation_type_id = r.id) AS qualifiers,
-                (SELECT count(*) FROM facts f
-                 WHERE f.predicate_id = r.id AND f.invalidated_at IS NULL) AS usage
-         FROM relation_types r WHERE r.kb_id = $1 ORDER BY lower(r.label)",
+                COALESCE(u.usage, 0) AS usage
+         FROM relation_types r
+         LEFT JOIN (
+             SELECT predicate_id, count(*)::bigint AS usage
+             FROM facts
+             WHERE kb_id = $1 AND invalidated_at IS NULL AND predicate_id IS NOT NULL
+             GROUP BY predicate_id
+         ) u ON u.predicate_id = r.id
+         WHERE r.kb_id = $1 ORDER BY lower(r.label)",
     )
     .bind(kb_id)
     .fetch_all(pool)
@@ -2495,6 +2507,27 @@ pub struct AgentProposalReport {
     pub adopted: i64,
     pub adopted_edited: i64,
     pub rejected: i64,
+}
+
+/// 文档说了、本体还放不下的：没绑到类的类别词，和没绑到属性的短语形状（判成 none 的
+/// 与两票不一致的）。本体代理读的就是这两样（0061 决定 2）；工作台拿这两个数说「还缺什么」，
+/// 不再拿 0003 的 `ontology_misses`——开放图谱的抽取不往那张表里写
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow, serde::Serialize)]
+pub struct Uncovered {
+    pub kind_words: i64,
+    pub phrases: i64,
+}
+
+pub async fn uncovered(pool: &PgPool, kb_id: Uuid) -> AppResult<Uncovered> {
+    Ok(sqlx::query_as(
+        "SELECT (SELECT count(*) FROM type_bindings
+                  WHERE kb_id = $1 AND status <> 'bound') AS kind_words,
+                (SELECT count(*) FROM phrase_bindings
+                  WHERE kb_id = $1 AND status <> 'bound') AS phrases",
+    )
+    .bind(kb_id)
+    .fetch_one(pool)
+    .await?)
 }
 
 pub async fn agent_proposal_report(pool: &PgPool, kb_id: Uuid) -> AppResult<AgentProposalReport> {
