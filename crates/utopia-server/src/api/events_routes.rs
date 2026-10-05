@@ -24,7 +24,13 @@ pub async fn kb_events(
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     utopia_store::access::require_kb(&state.pool, &user, kb_id, Role::Viewer).await?;
 
-    let mut rx = state.events.subscribe();
+    Ok(kb_event_stream(state.events.subscribe(), kb_id))
+}
+
+fn kb_event_stream(
+    mut rx: broadcast::Receiver<AppEvent>,
+    kb_id: Uuid,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let stream = async_stream::stream! {
         loop {
             match rx.recv().await {
@@ -35,13 +41,14 @@ pub async fn kb_events(
                         .data(serde_json::to_string(&ev).unwrap_or_else(|_| "{}".into()))),
                     None => continue,
                 },
-                // 消费落后被跳帧：无所谓，事件只是"该刷新了"的信号
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                // 丢掉的可能是这个库或告警的唯一通知；余下事件可能全部被过滤。
+                // 结束响应，让 EventSource 重连后通过 onRecover 补刷。
+                Err(broadcast::error::RecvError::Lagged(_)) => return,
                 Err(broadcast::error::RecvError::Closed) => return,
             }
         }
     };
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 #[derive(Debug, PartialEq)]
@@ -66,6 +73,125 @@ fn relay(ev: &AppEvent, kb_id: Uuid) -> Option<Relay> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
+    use axum::{routing::get, Router};
+    use futures_util::{FutureExt, StreamExt};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn lagged_kb_stream_ends_when_its_only_document_or_global_alert_is_lost() {
+        let (here, elsewhere) = (Uuid::now_v7(), Uuid::now_v7());
+        for (kb_id, kind) in [(Some(here), "document"), (None, "alert")] {
+            let (sender, _) = broadcast::channel(256);
+            let route_sender = sender.clone();
+            let app = Router::new().route(
+                "/events",
+                get(move || {
+                    let sender = route_sender.clone();
+                    async move {
+                        let receiver = sender.subscribe();
+                        sender
+                            .send(AppEvent {
+                                kb_id,
+                                kind,
+                                document_id: None,
+                            })
+                            .unwrap();
+                        // 首次 poll 前确定性地挤掉唯一有效通知，剩下的全部会被过滤。
+                        for _ in 0..257 {
+                            sender
+                                .send(AppEvent {
+                                    kb_id: Some(elsewhere),
+                                    kind: "document",
+                                    document_id: None,
+                                })
+                                .unwrap();
+                        }
+                        kb_event_stream(receiver, here)
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let request = async {
+                let response = client
+                    .get(format!("http://{address}/events"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), reqwest::StatusCode::OK);
+                assert_eq!(response.headers()["content-type"], "text/event-stream");
+                response.text().await.unwrap()
+            };
+            // 保留 sender，确保真实 HTTP 响应结束来自 Lagged，而不是通道关闭。
+            let result = tokio::time::timeout(Duration::from_secs(2), request).await;
+            server.abort();
+            assert!(result
+                .expect("a lagged KB SSE response must end")
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn kb_stream_keeps_filtering_and_alert_payloads_until_the_channel_closes() {
+        let (here, elsewhere) = (Uuid::now_v7(), Uuid::now_v7());
+        let (sender, receiver) = broadcast::channel(256);
+        let response = kb_event_stream(receiver, here).into_response();
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        let mut body = response.into_body().into_data_stream();
+        // 初次连接不凭空发刷新事件，也不结束响应。
+        assert!(body.next().now_or_never().is_none());
+        sender
+            .send(AppEvent {
+                kb_id: Some(elsewhere),
+                kind: "document",
+                document_id: None,
+            })
+            .unwrap();
+        assert!(body.next().now_or_never().is_none());
+
+        let document = AppEvent {
+            kb_id: Some(here),
+            kind: "document",
+            document_id: Some(Uuid::now_v7()),
+        };
+        sender.send(document.clone()).unwrap();
+        let frame = body.next().await.unwrap().unwrap();
+        assert_eq!(
+            frame.as_ref(),
+            format!(
+                "event: document\ndata: {}\n\n",
+                serde_json::to_string(&document).unwrap()
+            )
+            .as_bytes()
+        );
+
+        for kb_id in [None, Some(here), Some(elsewhere)] {
+            sender
+                .send(AppEvent {
+                    kb_id,
+                    kind: "alert",
+                    document_id: Some(Uuid::now_v7()),
+                })
+                .unwrap();
+            let frame = body.next().await.unwrap().unwrap();
+            assert_eq!(frame.as_ref(), b"event: alert\ndata: {}\n\n");
+        }
+        assert!(body.next().now_or_never().is_none());
+        drop(sender);
+        assert!(body.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropping_a_kb_response_releases_its_subscription() {
+        let (sender, receiver) = broadcast::channel(256);
+        let response = kb_event_stream(receiver, Uuid::now_v7()).into_response();
+        assert_eq!(sender.receiver_count(), 1);
+        drop(response);
+        assert_eq!(sender.receiver_count(), 0);
+    }
 
     #[test]
     fn a_kb_stream_carries_its_own_events_and_every_alert() {
