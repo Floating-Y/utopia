@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
 use oxrdf::vocab::{rdf, rdfs, xsd};
-use oxrdf::{Literal, NamedNode, NamedNodeRef, Term, TripleRef};
+use oxrdf::{Literal, NamedNode, Term, TripleRef};
 use utopia_store::export::{
     ExportAxiomViolation, ExportClass, ExportDerived, ExportDocument, ExportEntity, ExportFact,
     ExportFactConflict, ExportRelation,
@@ -809,14 +809,128 @@ fn is_relative(v: &serde_json::Value) -> bool {
 /// 相对的值写成普通字符串：`"45 days after the Trigger Date"^^xsd:date` 是个不合法的字面量
 fn literal_value(v: &serde_json::Value, datatype: Option<&str>) -> Option<Literal> {
     let (text, prose) = literal_text(v)?;
-    let ty: NamedNodeRef<'_> = match datatype {
-        _ if prose || is_relative(v) => xsd::STRING,
-        Some("number") => xsd::DECIMAL,
-        Some("date") => xsd::DATE,
-        Some("bool") => xsd::BOOLEAN,
-        _ => xsd::STRING,
+    if prose || is_relative(v) {
+        return Some(Literal::new_simple_literal(text));
+    }
+    Some(match datatype {
+        Some("number") => Literal::new_typed_literal(decimal_text(text), xsd::DECIMAL),
+        Some("date") => {
+            date_literal(&text).unwrap_or_else(|| Literal::new_typed_literal(text, xsd::DATE))
+        }
+        Some("bool") => Literal::new_typed_literal(text, xsd::BOOLEAN),
+        _ => Literal::new_simple_literal(text),
+    })
+}
+
+/// JSON 数可以带指数，xsd:decimal 不可以。用已有的精确十进制类型展开文本，
+/// 不再过一次 f64，也不舍入；没有指数的写法（包括负零）原样保留。
+fn decimal_text(text: String) -> String {
+    let Some((coefficient, exponent)) = text.split_once(['e', 'E']) else {
+        return text;
     };
-    Some(Literal::new_typed_literal(text, ty))
+    // 归一化后的有限 f64 指数只在这个范围内。其他字符串不一定经过归一化，
+    // 不让异常的大指数触发无界分配，也不顺手清洗 BigDecimal 能容忍的下划线等写法。
+    let supported_exponent = exponent
+        .parse::<i32>()
+        .is_ok_and(|exponent| (-324..=308).contains(&exponent));
+    let decimal_coefficient = coefficient
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '+' | '-' | '.'));
+    if supported_exponent && decimal_coefficient {
+        if let Ok(number) = text.parse::<sqlx::types::BigDecimal>() {
+            return number.to_plain_string();
+        }
+    }
+    text
+}
+
+/// 属性日期保留的是原文，不是世界时间区间。parse_time 会截掉小数秒、把无时区
+/// 钟点降到天，所以只在没有钟点时借它判断年/月/日；时钟和时区从原文规范化。
+/// 无法识别的文本由调用方沿用原输出；输入校验仍可能接受非日期的钟点文本，
+/// 本次不收紧它的规则。年份按字段格式化，不能按四个字符切片；chrono 在扩展
+/// 正年份前加的 `+` 也需去掉，因为 XSD 年份不允许正号。
+fn date_literal(value: &str) -> Option<Literal> {
+    let Some((date, clock)) = value.split_once(['T', ' ']) else {
+        let (date, precision) = utopia_extract::parse_time(value)?;
+        let (format, datatype) = match precision {
+            "year" => ("%Y", xsd::G_YEAR),
+            "month" => ("%Y-%m", xsd::G_YEAR_MONTH),
+            _ => ("%Y-%m-%d", xsd::DATE),
+        };
+        let lexical = date.format(format).to_string();
+        return Some(Literal::new_typed_literal(
+            lexical.trim_start_matches('+'),
+            datatype,
+        ));
+    };
+    let date = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    let calendar_date = date.format("%Y-%m-%d").to_string();
+    let calendar_date = calendar_date.trim_start_matches('+');
+    let (clock, zone) = if let Some(clock) = clock.strip_suffix(['Z', 'z']) {
+        (clock, "Z".to_string())
+    } else if let Some(index) = clock.find(['+', '-']) {
+        let (clock, zone) = clock.split_at(index);
+        (clock, xsd_timezone(zone)?)
+    } else {
+        // XSD 允许没有时区的 dateTime；不能替原文猜一个 UTC。
+        (clock, String::new())
+    };
+    let parts: Vec<&str> = clock.split(':').collect();
+    let (hour, minute, second) = match parts.as_slice() {
+        [hour] => (*hour, "00", "00"),
+        [hour, minute] => (*hour, *minute, "00"),
+        [hour, minute, second] => (*hour, *minute, *second),
+        _ => return None,
+    };
+    let (second, fraction) = match second.split_once('.') {
+        Some((second, fraction)) => {
+            if fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            (second, format!(".{fraction}"))
+        }
+        None => (second, String::new()),
+    };
+    if ![hour, minute, second]
+        .iter()
+        .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let hour = hour.parse().ok()?;
+    let minute = minute.parse().ok()?;
+    let second = second.parse().ok()?;
+    chrono::NaiveTime::from_hms_opt(hour, minute, second)?;
+    // dateTime 必须有 HH:MM:SS；补零表示该小时/分钟的起点，类型本身不能表达
+    // 「只精确到小时/分钟」。小数秒不交给 chrono，避免超过纳秒的原文被截断。
+    let lexical = format!("{calendar_date}T{hour:02}:{minute:02}:{second:02}{fraction}{zone}");
+    Some(Literal::new_typed_literal(lexical, xsd::DATE_TIME))
+}
+
+/// parse_time 也接受 ±HH 和 ±HHMM，XSD 时区则要求 ±HH:MM。
+fn xsd_timezone(zone: &str) -> Option<String> {
+    if !zone.is_ascii() {
+        return None;
+    }
+    let normalized = match zone.len() {
+        3 => format!("{zone}:00"),
+        5 => format!("{}:{}", &zone[..3], &zone[3..]),
+        6 if zone.as_bytes()[3] == b':' => zone.to_string(),
+        _ => return None,
+    };
+    let digits = [&normalized[1..3], &normalized[4..6]];
+    if !digits
+        .iter()
+        .all(|part| part.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let hour: u32 = digits[0].parse().ok()?;
+    let minute: u32 = digits[1].parse().ok()?;
+    if hour > 14 || minute > 59 || (hour == 14 && minute != 0) {
+        return None;
+    }
+    Some(normalized)
 }
 
 /// 把事实的 `object_value` 形状抽出可写的字面文本，以及这段文本是不是人写的散文。
@@ -859,7 +973,7 @@ fn literal_text(v: &serde_json::Value) -> Option<(String, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxrdf::Quad;
+    use oxrdf::{NamedNodeRef, Quad};
 
     fn kb() -> Uuid {
         Uuid::parse_str("01a06dc4-f40a-7013-b09f-1b499e2e7441").unwrap()
@@ -945,7 +1059,7 @@ mod tests {
     }
 
     /// 导出一遍再解析回来。**必须解析回来**：断言字符串里有没有某一段，
-    /// 证明不了这份文件是不是合法的 Turtle，而那正是导出唯一要保证的事
+    /// 证明不了文件语法是否合法；字面文本是否符合 XSD 类型仍须另行断言
     fn export(format: Format, emit: impl FnOnce(&mut Sink, &Names, &Vocabulary)) -> Vec<Quad> {
         let names = Names::new(kb(), None).unwrap();
         let classes = vec![
@@ -1005,6 +1119,311 @@ mod tests {
     const SUBJ: &str = "<urn:utopia:kb:01a06dc4-f40a-7013-b09f-1b499e2e7441:entity:0a0a0a0a-0a0a-0a0a-0a0a-0a0a0a0a0a0a>";
     const OBJ: &str = "<urn:utopia:kb:01a06dc4-f40a-7013-b09f-1b499e2e7441:entity:0b0b0b0b-0b0b-0b0b-0b0b-0b0b0b0b0b0b>";
     const WORKS_FOR: &str = "https://schema.org/worksFor";
+
+    /// 同一个属性值穿过所有出口；RDF 能解析不代表 XSD 字面文本符合其类型。
+    fn assert_attribute_literal_exports(
+        value: serde_json::Value,
+        datatype: &str,
+        expected: Option<(&str, NamedNodeRef<'_>)>,
+    ) {
+        let mut attribute = fact(5);
+        attribute.predicate_id = Some(id(4));
+        attribute.object_id = None;
+        attribute.object_value = Some(value.clone());
+        attribute
+            .qualifiers
+            .push(utopia_core::models::FactQualifier {
+                qualifier_type_id: id(4),
+                value: Some(value.clone()),
+                ..Default::default()
+            });
+        let derived = ExportDerived {
+            id: id(7),
+            subject_id: id(10),
+            predicate_id: id(4),
+            object_id: None,
+            object_value: Some(value.clone()),
+            rule_id: None,
+            attribute_rule_id: Some(id(9)),
+            valid_from: None,
+            valid_from_precision: None,
+            valid_to: None,
+            valid_to_precision: None,
+            derived_at: at("2026-02-01T00:00:00Z"),
+            invalidated_at: None,
+            confidence: 0.9,
+            rule: "business".into(),
+            rule_predicate: None,
+            rule_name: Some("Attribute conclusion".into()),
+            premises: vec![id(5)],
+            premises_derived: Vec::new(),
+            subject_kb: Some(kb()),
+            object_kb: None,
+            predicate_kb: Some(kb()),
+            rule_kb: None,
+            attribute_rule_kb: Some(kb()),
+            foreign_fact_premise: false,
+            foreign_derived_premise: false,
+            subject_merged: false,
+            object_merged: false,
+        };
+        let names = Names::new(kb(), None).unwrap();
+        let mut property = relation(4, "value", None, "attribute");
+        property.datatype = Some(datatype.into());
+        let property_iri = names.relation(&property);
+        let statement_iri = names.fact(attribute.id).to_string();
+        let subject_iri = names.entity(attribute.subject_id).to_string();
+        let derived_iri = names.derived(derived.id).to_string();
+        for format in [Format::Turtle, Format::JsonLd] {
+            let quads = export(format, |sink, names, _| {
+                let vocab = vocabulary(names, &[], std::slice::from_ref(&property));
+                emit_fact(sink, names, &vocab, &attribute, at("2026-06-01T00:00:00Z")).unwrap();
+                emit_derived(sink, names, &vocab, &derived).unwrap();
+            });
+            for (outlet, subject, predicate) in [
+                ("fact", &statement_iri, rdf::OBJECT.as_str()),
+                ("current triple", &subject_iri, property_iri.as_str()),
+                ("qualifier", &statement_iri, property_iri.as_str()),
+                ("derived fact", &derived_iri, rdf::OBJECT.as_str()),
+            ] {
+                let objects: Vec<_> = quads
+                    .iter()
+                    .filter(|quad| {
+                        quad.subject.to_string() == *subject && quad.predicate.as_str() == predicate
+                    })
+                    .map(|quad| &quad.object)
+                    .collect();
+                let context = format!("{outlet}, {format:?}, {datatype}, {value}");
+                match expected {
+                    Some((lexical, expected_datatype)) => {
+                        assert_eq!(objects.len(), 1, "{context}");
+                        let Term::Literal(literal) = objects[0] else {
+                            panic!("expected a literal: {context}");
+                        };
+                        assert_eq!(literal.value(), lexical, "{context}");
+                        assert_eq!(literal.datatype(), expected_datatype, "{context}");
+                    }
+                    None => assert!(objects.is_empty(), "unexpected object: {context}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_numbers_export_as_decimal_without_exponents() {
+        for (input, expected) in [
+            (serde_json::json!(0.0000001), "0.0000001"),
+            (serde_json::json!("1e-7"), "0.0000001"),
+            (serde_json::json!(1e20), "100000000000000000000"),
+            (serde_json::json!(-1e-7), "-0.0000001"),
+            (serde_json::json!(-1e20), "-100000000000000000000"),
+            (serde_json::json!(0), "0.0"),
+            (serde_json::json!(-0.0), "-0.0"),
+            (serde_json::json!(12.375), "12.375"),
+            (serde_json::json!(-12.375), "-12.375"),
+            (serde_json::json!(1.25e-7), "0.000000125"),
+        ] {
+            let normalized = utopia_extract::normalize_attr_value("number", &input).unwrap();
+            assert_attribute_literal_exports(
+                normalized.clone(),
+                "number",
+                Some((expected, xsd::DECIMAL)),
+            );
+            assert_attribute_literal_exports(
+                serde_json::json!({"value": normalized}),
+                "number",
+                Some((expected, xsd::DECIMAL)),
+            );
+        }
+        // 已存的整数不能再经过 f64：这个值超过了双精度能逐个表示整数的范围。
+        assert_attribute_literal_exports(
+            serde_json::json!({"value": 9_007_199_254_740_993_u64}),
+            "number",
+            Some(("9007199254740993", xsd::DECIMAL)),
+        );
+        // 最小次正规数和最大有限数：不能因固定小数位变成零，也不能溢出。
+        for (input, expected) in [
+            (f64::from_bits(1), format!("0.{}5", "0".repeat(323))),
+            (f64::MAX, format!("17976931348623157{}", "0".repeat(292))),
+        ] {
+            let normalized =
+                utopia_extract::normalize_attr_value("number", &serde_json::json!(input)).unwrap();
+            assert_attribute_literal_exports(normalized, "number", Some((&expected, xsd::DECIMAL)));
+        }
+    }
+
+    #[test]
+    fn normalized_dates_export_their_precision_and_original_clock() {
+        for (input, expected, datatype) in [
+            ("2024", "2024", xsd::G_YEAR),
+            ("2024-07", "2024-07", xsd::G_YEAR_MONTH),
+            ("2024-07-15", "2024-07-15", xsd::DATE),
+            (
+                "2024-07-15T14:32:07Z",
+                "2024-07-15T14:32:07Z",
+                xsd::DATE_TIME,
+            ),
+            (
+                "2024-07-15T14:32:07+08:00",
+                "2024-07-15T14:32:07+08:00",
+                xsd::DATE_TIME,
+            ),
+            (
+                "2024-07-15T14:32:07.382-05:30",
+                "2024-07-15T14:32:07.382-05:30",
+                xsd::DATE_TIME,
+            ),
+            (
+                "2024-07-15T14:32:07.123456789012Z",
+                "2024-07-15T14:32:07.123456789012Z",
+                xsd::DATE_TIME,
+            ),
+            ("2024-07-15T14Z", "2024-07-15T14:00:00Z", xsd::DATE_TIME),
+            (
+                "2024-07-15T14+08:00",
+                "2024-07-15T14:00:00+08:00",
+                xsd::DATE_TIME,
+            ),
+            ("2024-07-15T14:32Z", "2024-07-15T14:32:00Z", xsd::DATE_TIME),
+            (
+                "2024-07-15T14:32+08:00",
+                "2024-07-15T14:32:00+08:00",
+                xsd::DATE_TIME,
+            ),
+            (
+                "2024-07-15T14:32+0800",
+                "2024-07-15T14:32:00+08:00",
+                xsd::DATE_TIME,
+            ),
+            (
+                "2024-07-15T14+08",
+                "2024-07-15T14:00:00+08:00",
+                xsd::DATE_TIME,
+            ),
+            ("2024-07-15T14:32z", "2024-07-15T14:32:00Z", xsd::DATE_TIME),
+            (
+                "2024-07-15T14+14",
+                "2024-07-15T14:00:00+14:00",
+                xsd::DATE_TIME,
+            ),
+            (
+                "2024-07-15T14-14",
+                "2024-07-15T14:00:00-14:00",
+                xsd::DATE_TIME,
+            ),
+            (
+                "2024-07-15 14:32+08:00",
+                "2024-07-15T14:32:00+08:00",
+                xsd::DATE_TIME,
+            ),
+            ("2024-07-15T14", "2024-07-15T14:00:00", xsd::DATE_TIME),
+            ("2024-07-15T14:32", "2024-07-15T14:32:00", xsd::DATE_TIME),
+            (
+                "2024-07-15T14:32:07.382",
+                "2024-07-15T14:32:07.382",
+                xsd::DATE_TIME,
+            ),
+        ] {
+            let normalized =
+                utopia_extract::normalize_attr_value("date", &serde_json::json!(input)).unwrap();
+            assert_attribute_literal_exports(
+                normalized.clone(),
+                "date",
+                Some((expected, datatype)),
+            );
+            assert_attribute_literal_exports(
+                serde_json::json!({"value": normalized}),
+                "date",
+                Some((expected, datatype)),
+            );
+        }
+    }
+
+    #[test]
+    fn attribute_calendar_years_are_not_cut_to_four_characters() {
+        for (input, expected, datatype) in [
+            ("-0001-07", "-0001-07", xsd::G_YEAR_MONTH),
+            ("-0001-07-15", "-0001-07-15", xsd::DATE),
+            ("+10000-07", "10000-07", xsd::G_YEAR_MONTH),
+            ("+10000-07-15", "10000-07-15", xsd::DATE),
+            (
+                "+10000-07-15T14:32:07.382Z",
+                "10000-07-15T14:32:07.382Z",
+                xsd::DATE_TIME,
+            ),
+        ] {
+            let normalized =
+                utopia_extract::normalize_attr_value("date", &serde_json::json!(input)).unwrap();
+            assert_attribute_literal_exports(normalized, "date", Some((expected, datatype)));
+        }
+    }
+
+    #[test]
+    fn unrecognized_literal_text_keeps_the_existing_fallback() {
+        for value in ["1e309", "1e-325", "1e2147483648", "1_0e2", "before"] {
+            assert_eq!(decimal_text(value.to_string()), value);
+        }
+        for value in [
+            "2024-07-15Tnot-a-clock",
+            "2024-07-15T14:32:07.noiseZ",
+            "2024-07-15T14+14:01",
+            "2024-07-15T14+08:60",
+            "2024-07-15T14+时区",
+        ] {
+            assert!(date_literal(value).is_none(), "{value}");
+        }
+    }
+
+    #[test]
+    fn typed_attributes_keep_value_precedence_prose_and_missing_objects() {
+        for (value, datatype, expected) in [
+            (
+                serde_json::json!({"value": 12.5, "summary": "estimate"}),
+                "number",
+                Some(("12.5", xsd::DECIMAL)),
+            ),
+            (
+                serde_json::json!({"value": "2024", "summary": "sometime in 2024"}),
+                "date",
+                Some(("2024", xsd::G_YEAR)),
+            ),
+            (
+                serde_json::json!({"value": 0, "summary": ""}),
+                "number",
+                Some(("0", xsd::DECIMAL)),
+            ),
+            (
+                serde_json::json!({"summary": "before the merge"}),
+                "date",
+                Some(("before the merge", xsd::STRING)),
+            ),
+            (
+                serde_json::json!({"value": null, "summary": "not specified"}),
+                "number",
+                Some(("not specified", xsd::STRING)),
+            ),
+            (
+                serde_json::json!({"class": "gas_well"}),
+                "number",
+                Some(("gas_well", xsd::STRING)),
+            ),
+            (
+                serde_json::json!({"value": "45 days after the Trigger Date", "relative": true}),
+                "date",
+                Some(("45 days after the Trigger Date", xsd::STRING)),
+            ),
+            (serde_json::json!({"value": null}), "date", None),
+            (serde_json::json!({"confidence": 0.9}), "number", None),
+            (
+                serde_json::json!({"summary": "", "class": ""}),
+                "date",
+                None,
+            ),
+            (serde_json::Value::Null, "number", None),
+        ] {
+            assert_attribute_literal_exports(value, datatype, expected);
+        }
+    }
 
     #[test]
     fn unbound_literal_objects_survive_both_formats() {
@@ -1118,13 +1537,13 @@ mod tests {
         let cases: &[(&str, serde_json::Value, &[&str])] = &[
             (
                 "value wins over summary when both are present",
-                serde_json::json!({ "value": "2026-01-15", "summary": "around mid-January" }),
-                &["\"2026-01-15\"^^<http://www.w3.org/2001/XMLSchema#decimal>"],
+                serde_json::json!({ "value": 12.5, "summary": "about a dozen" }),
+                &["\"12.5\"^^<http://www.w3.org/2001/XMLSchema#decimal>"],
             ),
             (
                 "value alone resolves to its scalar string",
-                serde_json::json!({ "value": "45 days after the Trigger Date" }),
-                &["\"45 days after the Trigger Date\"^^<http://www.w3.org/2001/XMLSchema#decimal>"],
+                serde_json::json!({ "value": "42" }),
+                &["\"42\"^^<http://www.w3.org/2001/XMLSchema#decimal>"],
             ),
             (
                 "summary alone is prose: a string, never the declared type",
@@ -1133,8 +1552,8 @@ mod tests {
             ),
             (
                 "empty summary with a value resolves to the value",
-                serde_json::json!({ "summary": "", "value": "actual text" }),
-                &["\"actual text\"^^<http://www.w3.org/2001/XMLSchema#decimal>"],
+                serde_json::json!({ "summary": "", "value": "0" }),
+                &["\"0\"^^<http://www.w3.org/2001/XMLSchema#decimal>"],
             ),
             (
                 "null value and no summary → no rdf:object",

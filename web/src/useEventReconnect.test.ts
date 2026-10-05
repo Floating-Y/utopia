@@ -128,9 +128,12 @@ afterEach(() => {
 });
 
 describe("KB stream reconnect", () => {
-  it("refetches missed changes immediately for every stream key in the current KB", async () => {
+  it("refetches every current KB stream key and alerts after reconnect without new business events", async () => {
     const client = createClient();
     const current = await Promise.all(STREAM_KEYS.map((head) => watch(client, [head, "kb-a", "detail"])));
+    const badge = await watch(client, ["alerts", "unread"]);
+    const list = await watch(client, ["alerts", "list", "", 0]);
+    const recoveredQueries = [...current, badge, list];
     const otherKb = await watch(client, ["graph", "kb-b"]);
     const unrelated = await watch(client, ["health"]);
     const inactiveKey = ["documents", "kb-a", "unmounted"];
@@ -138,20 +141,23 @@ describe("KB stream reconnect", () => {
     const { source } = mount(() => useKbEvents("kb-a"));
     expect(source.url).toBe("/api/v1/kbs/kb-a/events");
     source.emit("open");
-    for (const query of current) expect(query.fetch).toHaveBeenCalledTimes(1);
+    for (const query of recoveredQueries) expect(query.fetch).toHaveBeenCalledTimes(1);
 
     source.emit("error");
-    for (const query of current) query.changeServer();
+    for (const query of recoveredQueries) query.changeServer();
     // staleTime 到期只让缓存变旧，不会自动请求；断线期间完全没有业务事件。
     await vi.advanceTimersByTimeAsync(STREAM_STALE_MS + 1);
-    for (const query of current) expect(query.fetch).toHaveBeenCalledTimes(1);
+    for (const query of recoveredQueries) expect(query.fetch).toHaveBeenCalledTimes(1);
 
     source.emit("open");
     // 重连不等普通事件的 300ms 合并窗口。
-    for (const query of current) expect(query.fetch).toHaveBeenCalledTimes(2);
+    for (const query of recoveredQueries) expect(query.fetch).toHaveBeenCalledTimes(2);
     await vi.waitFor(() => {
-      for (const query of current) expect(query.observer.getCurrentResult().data).toBe("after disconnect");
+      for (const query of recoveredQueries) expect(query.observer.getCurrentResult().data).toBe("after disconnect");
     });
+    source.emit("open");
+    await vi.advanceTimersByTimeAsync(SETTLE_MS);
+    for (const query of recoveredQueries) expect(query.fetch).toHaveBeenCalledTimes(2);
     expect(client.getQueryState(inactiveKey)?.isInvalidated).toBe(true);
     expect(otherKb.fetch).toHaveBeenCalledTimes(1);
     expect(unrelated.fetch).toHaveBeenCalledTimes(1);
@@ -173,17 +179,25 @@ describe("KB stream reconnect", () => {
     const client = createClient();
     const graph = await watch(client, ["graph", "kb-a"]);
     const documents = await watch(client, ["documents", "kb-a"]);
+    const badge = await watch(client, ["alerts", "unread"]);
+    const list = await watch(client, ["alerts", "list", "", 0]);
     const { source } = mount(() => useKbEvents("kb-a"));
     source.emit("open");
     source.emit("document");
     source.emit("graph");
+    source.emit("alert");
+    source.emit("alert");
     source.emit("error");
     source.emit("open");
     expect(graph.fetch).toHaveBeenCalledTimes(2);
     expect(documents.fetch).toHaveBeenCalledTimes(2);
+    expect(badge.fetch).toHaveBeenCalledTimes(2);
+    expect(list.fetch).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(SETTLE_MS);
     expect(graph.fetch).toHaveBeenCalledTimes(2);
     expect(documents.fetch).toHaveBeenCalledTimes(2);
+    expect(badge.fetch).toHaveBeenCalledTimes(2);
+    expect(list.fetch).toHaveBeenCalledTimes(2);
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -209,15 +223,18 @@ describe("KB stream reconnect", () => {
     const client = createClient();
     const oldKb = await watch(client, ["graph", "kb-a"]);
     const newKb = await watch(client, ["graph", "kb-b"]);
+    const badge = await watch(client, ["alerts", "unread"]);
+    const list = await watch(client, ["alerts", "list", "", 0]);
     const old = mount(() => useKbEvents("kb-a"));
     old.source.emit("open");
     old.source.emit("error");
     const lateOpen = [...old.source.listeners.get("open") ?? []];
     const lateGraph = [...old.source.listeners.get("graph") ?? []];
+    const lateAlert = [...old.source.listeners.get("alert") ?? []];
     old.unmount();
     const next = mount(() => useKbEvents("kb-b"));
     next.source.emit("open");
-    for (const callback of [...lateOpen, ...lateGraph]) callback();
+    for (const callback of [...lateOpen, ...lateGraph, ...lateAlert]) callback();
     old.source.emit("open");
     old.source.emit("document");
     await vi.advanceTimersByTimeAsync(SETTLE_MS);
@@ -226,10 +243,14 @@ describe("KB stream reconnect", () => {
     expect(vi.getTimerCount()).toBe(0);
     expect(oldKb.fetch).toHaveBeenCalledTimes(1);
     expect(newKb.fetch).toHaveBeenCalledTimes(1);
+    expect(badge.fetch).toHaveBeenCalledTimes(1);
+    expect(list.fetch).toHaveBeenCalledTimes(1);
     next.source.emit("error");
     next.source.emit("open");
     expect(oldKb.fetch).toHaveBeenCalledTimes(1);
     expect(newKb.fetch).toHaveBeenCalledTimes(2);
+    expect(badge.fetch).toHaveBeenCalledTimes(2);
+    expect(list.fetch).toHaveBeenCalledTimes(2);
   });
 
   it("does not subscribe without a selected KB", () => {

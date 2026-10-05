@@ -18,7 +18,7 @@ use crate::extraction::chat_retrying_rate_limits_at;
 use crate::llm_util;
 use crate::state::AppState;
 use chrono::{DateTime, Duration, Months, NaiveDate, NaiveTime, TimeZone, Utc};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use utopia_extract::time::{
     build_interpretation_messages, headings_at, now_in_force, parse_interpretation_response,
     Anchor, DateParts, Direction, DocumentDating, Granularity, Interpretation, MentionInput,
@@ -232,7 +232,7 @@ fn anchor_time(
     }
 }
 
-/// 一条解释 → 世界轴位置。`earlier` 是同一批里已经算出来的提及（锚点指着它们）。
+/// 一条解释 → 世界轴位置。`earlier` 是同一文档里已经算出来的提及（锚点指着它们）。
 fn resolve_one(
     interp: &Interpretation,
     ctx: &DocumentDating,
@@ -345,6 +345,45 @@ fn resolve_one(
         }
         Reference::None => UNRESOLVED,
     }
+}
+
+/// 计算已收到的解释；每条解释使用它自己的章节上下文。
+fn resolve_interpretations(
+    interpretations: &[Interpretation],
+    context_for: impl Fn(i64) -> DocumentDating,
+) -> HashMap<i64, Resolved> {
+    let mut resolved = HashMap::new();
+    let mut pending: Vec<&Interpretation> = interpretations.iter().collect();
+    while !pending.is_empty() {
+        let before = pending.len();
+        pending.retain(|interp| {
+            let r = resolve_one(interp, &context_for(interp.id), &resolved);
+            if r == UNRESOLVED {
+                return true;
+            }
+            resolved.insert(interp.id, r);
+            false
+        });
+        // 每轮至少解开一条才继续；循环、自引用、缺失或不可用的锚点都在无进展时留下 C。
+        // 不能固定遍数：模型回复可以把任意长的依赖链倒着写。
+        if pending.len() == before {
+            break;
+        }
+    }
+    for interp in pending {
+        resolved.insert(interp.id, UNRESOLVED);
+    }
+    resolved
+}
+
+/// 算的时候文档的日期换成提及所在那一节的起算点。
+fn context_at(context: &DocumentDating, now: Option<usize>) -> DocumentDating {
+    let mut scoped = context.clone();
+    if let Some(entry) = now.and_then(|i| context.entries.get(i)) {
+        scoped.date = Some(entry.from.clone());
+        scoped.date_words = Some(entry.words.clone());
+    }
+    scoped
 }
 
 /// 一条陈述的起与止：`when` 给起（点与区间也给止），`ended` 给止。
@@ -473,29 +512,21 @@ pub async fn resolve_document(state: &AppState, document_id: Uuid) -> anyhow::Re
             distinct.push(key);
         }
     }
-    // 算的时候文档的日期换成那一节的起算点
-    let context_at = |now: Option<usize>| -> DocumentDating {
-        let mut c = context.clone();
-        if let Some(e) = now.and_then(|i| context.entries.get(i)) {
-            c.date = Some(e.from.clone());
-            c.date_words = Some(e.words.clone());
-        }
-        c
-    };
     let ctx = TimeContext {
         date: context.date.as_ref(),
         date_words: context.date_words.as_deref(),
         periods: &context.periods,
         fiscal_year_end: context.fiscal_year_end,
     };
-    let mut resolved: HashMap<usize, (Interpretation, Resolved)> = HashMap::new();
+    let mut interpretations = Vec::new();
+    let mut received = HashSet::new();
     let mut malformed = 0usize;
     // 问两轮：第一轮全部，第二轮只问第一轮没答到的。模型漏答的提及从前就留着字、没有解释，
     // 也没有人再问（测量台上的「上周」三遍都是这样）
     let mut todo: Vec<usize> = (0..distinct.len()).collect();
     for round in 0..2 {
         if round == 1 {
-            todo.retain(|i| !resolved.contains_key(i));
+            todo.retain(|i| !received.contains(&(*i as i64)));
             if todo.is_empty() {
                 break;
             }
@@ -539,33 +570,24 @@ pub async fn resolve_document(state: &AppState, document_id: Uuid) -> anyhow::Re
                 // 坏条目要看得见是哪一条、坏在哪：只报一个数的话，「上周」三遍都没日期也查不出原因
                 tracing::warn!(%document_id, skipped, reply = %reply.text.chars().take(600).collect::<String>(), "时间解释里有读不了的条目");
             }
-            // 两遍：先算不靠别的提及的，再算指着别的提及的
-            let mut earlier: HashMap<i64, Resolved> = HashMap::new();
-            let anchored_to_mention = |i: &Interpretation| {
-                matches!(
-                    &i.reference,
-                    Reference::Anchored {
-                        anchor: Anchor::Mention { .. },
-                        ..
-                    }
-                )
-            };
-            for pass in 0..2 {
-                for interp in interps
-                    .iter()
-                    .filter(|i| anchored_to_mention(i) == (pass == 1))
-                {
-                    let now = usize::try_from(interp.id)
-                        .ok()
-                        .and_then(|i| distinct.get(i))
-                        .and_then(|k| k.2);
-                    let r = resolve_one(interp, &context_at(now), &earlier);
-                    earlier.insert(interp.id, r);
-                    if let Ok(i) = usize::try_from(interp.id) {
-                        resolved.insert(i, (interp.clone(), r));
-                    }
-                }
-            }
+            received.extend(interps.iter().map(|interp| interp.id));
+            interpretations.extend(interps);
+        }
+    }
+    // 收到解释和算出日期是两件事：补答只问没收到的，计算则看全部批次和补答里的解释。
+    // 这样下游不用再问模型，也能用上后一批或补答才给出的锚点。
+    let computed = resolve_interpretations(&interpretations, |id| {
+        let now = usize::try_from(id)
+            .ok()
+            .and_then(|i| distinct.get(i))
+            .and_then(|key| key.2);
+        context_at(&context, now)
+    });
+    let mut resolved: HashMap<usize, (Interpretation, Resolved)> = HashMap::new();
+    for interp in interpretations {
+        if let Ok(i) = usize::try_from(interp.id) {
+            let r = computed[&interp.id];
+            resolved.insert(i, (interp, r));
         }
     }
 
@@ -778,6 +800,268 @@ mod tests {
             fiscal_year_end: Some((1, 25)),
             skipped: 0,
         }
+    }
+
+    fn day_point(date: &str, grade: &'static str) -> Resolved {
+        Resolved {
+            from: Some(at(date)),
+            from_p: Some("day"),
+            to: Some(at(date)),
+            to_p: Some("day"),
+            grade,
+        }
+    }
+
+    fn absolute_day(id: i64) -> Interpretation {
+        Interpretation {
+            id,
+            shape: Shape::Point,
+            reference: Reference::Absolute {
+                from: parts(2024, Some(1), Some(1)),
+                to: None,
+            },
+            granularity: Granularity::Day,
+        }
+    }
+
+    fn next_day(id: i64, anchor_id: i64) -> Interpretation {
+        Interpretation {
+            reference: Reference::Anchored {
+                anchor: Anchor::Mention { id: anchor_id },
+                offset: Some(Offset {
+                    count: 1,
+                    unit: Unit::Day,
+                    direction: Direction::After,
+                }),
+            },
+            ..absolute_day(id)
+        }
+    }
+
+    #[test]
+    fn mention_dependencies_resolve_in_all_reply_orders() {
+        let items = [
+            serde_json::json!([0, "point", {"kind": "absolute", "from": {"y": 2024, "m": 1, "d": 1}}, "day"]),
+            serde_json::json!([1, "point", {"kind": "anchored", "anchor": {"kind": "mention", "id": 0}, "offset": {"count": 1, "unit": "day", "direction": "after"}}, "day"]),
+            serde_json::json!([2, "point", {"kind": "anchored", "anchor": {"kind": "mention", "id": 1}, "offset": {"count": 1, "unit": "day", "direction": "after"}}, "day"]),
+        ];
+        let expected = HashMap::from([
+            (0, day_point("2024-01-01T00:00:00Z", "A")),
+            (1, day_point("2024-01-02T00:00:00Z", "B")),
+            (2, day_point("2024-01-03T00:00:00Z", "B")),
+        ]);
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let reply = serde_json::json!({"m": order.map(|i| items[i].clone())});
+            let (interpretations, skipped) =
+                parse_interpretation_response(&reply.to_string(), &[0, 1, 2]).unwrap();
+            assert_eq!(skipped, 0);
+            assert_eq!(interpretations.len(), 3);
+            let resolved = resolve_interpretations(&interpretations, |_| DocumentDating::default());
+            assert_eq!(resolved, expected, "reply order: {order:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_reverse_chain_does_not_follow_numeric_ids_or_a_fixed_pass_limit() {
+        // 编号上下交错，与依赖次序无关；链长也超过一批的大小。
+        let ids: Vec<i64> = (0..81).map(|depth| 500 + (depth * 37) % 101).collect();
+        let mut interpretations = vec![absolute_day(ids[0])];
+        for pair in ids.windows(2) {
+            interpretations.push(next_day(pair[1], pair[0]));
+        }
+        interpretations.reverse();
+        let resolved = resolve_interpretations(&interpretations, |_| DocumentDating::default());
+        assert_eq!(resolved.len(), ids.len());
+        for (depth, id) in ids.iter().enumerate() {
+            let date = at("2024-01-01T00:00:00Z") + Duration::days(depth as i64);
+            assert_eq!(
+                resolved[id],
+                Resolved {
+                    from: Some(date),
+                    from_p: Some("day"),
+                    to: Some(date),
+                    to_p: Some("day"),
+                    grade: if depth == 0 { "A" } else { "B" },
+                },
+                "depth {depth}, id {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn independent_chains_resolve_while_cycles_and_missing_anchors_stay_unresolved() {
+        let second_root = Interpretation {
+            reference: Reference::Absolute {
+                from: parts(2025, Some(6), Some(10)),
+                to: None,
+            },
+            ..absolute_day(20)
+        };
+        let interpretations = [
+            next_day(2, 1),
+            next_day(30, 30), // 自引用
+            next_day(31, 32),
+            next_day(32, 31),  // 循环
+            next_day(33, 999), // 缺失的解释
+            next_day(34, 31),  // 依赖循环的下游
+            next_day(22, 21),
+            next_day(1, 0),
+            next_day(21, 20),
+            second_root,
+            absolute_day(0),
+        ];
+        let resolved = resolve_interpretations(&interpretations, |_| ctx_dated(2030, 1, 1));
+        assert_eq!(
+            resolved,
+            HashMap::from([
+                (0, day_point("2024-01-01T00:00:00Z", "A")),
+                (1, day_point("2024-01-02T00:00:00Z", "B")),
+                (2, day_point("2024-01-03T00:00:00Z", "B")),
+                (20, day_point("2025-06-10T00:00:00Z", "A")),
+                (21, day_point("2025-06-11T00:00:00Z", "B")),
+                (22, day_point("2025-06-12T00:00:00Z", "B")),
+                (30, UNRESOLVED),
+                (31, UNRESOLVED),
+                (32, UNRESOLVED),
+                (33, UNRESOLVED),
+                (34, UNRESOLVED),
+            ])
+        );
+    }
+
+    #[test]
+    fn received_interpretations_can_use_anchors_from_later_batches_and_the_makeup_reply() {
+        let first_reply = r#"{"m": [
+            [2, "point", {"kind": "anchored", "anchor": {"kind": "mention", "id": 1}, "offset": {"count": 1, "unit": "day", "direction": "after"}}, "day"],
+            [1, "point", {"kind": "anchored", "anchor": {"kind": "mention", "id": 40}, "offset": {"count": 1, "unit": "day", "direction": "after"}}, "day"]
+        ]}"#;
+        let (mut interpretations, skipped) =
+            parse_interpretation_response(first_reply, &[0, 1, 2]).unwrap();
+        assert_eq!(skipped, 0);
+        let before = resolve_interpretations(&interpretations, |_| DocumentDating::default());
+        assert_eq!(before, HashMap::from([(1, UNRESOLVED), (2, UNRESOLVED)]));
+        assert!(!before.contains_key(&0), "未回答与已回答但未解析的提及不同");
+
+        let later_batch = r#"{"m": [
+            [40, "point", {"kind": "anchored", "anchor": {"kind": "mention", "id": 0}, "offset": {"count": 1, "unit": "day", "direction": "after"}}, "day"]
+        ]}"#;
+        let (later, skipped) = parse_interpretation_response(later_batch, &[40]).unwrap();
+        assert_eq!(skipped, 0);
+        interpretations.extend(later);
+        let still_waiting =
+            resolve_interpretations(&interpretations, |_| DocumentDating::default());
+        assert_eq!(still_waiting[&2], UNRESOLVED);
+
+        let makeup_reply = r#"{"m": [
+            [0, "point", {"kind": "absolute", "from": {"y": 2024, "m": 1, "d": 1}}, "day"]
+        ]}"#;
+        let (makeup, skipped) = parse_interpretation_response(makeup_reply, &[0]).unwrap();
+        assert_eq!(skipped, 0);
+        interpretations.extend(makeup);
+        let after = resolve_interpretations(&interpretations, |_| DocumentDating::default());
+        assert_eq!(
+            after,
+            HashMap::from([
+                (0, day_point("2024-01-01T00:00:00Z", "A")),
+                (40, day_point("2024-01-02T00:00:00Z", "B")),
+                (1, day_point("2024-01-03T00:00:00Z", "B")),
+                (2, day_point("2024-01-04T00:00:00Z", "B")),
+            ])
+        );
+    }
+
+    #[test]
+    fn dependency_resolution_keeps_each_mentions_section_context() {
+        let mut context = ctx_dated(2030, 1, 1);
+        for (section, year) in [("First report", 2024), ("Second report", 2025)] {
+            context.entries.push(utopia_extract::time::TimeEntry {
+                kind: "now".into(),
+                name: String::new(),
+                words: year.to_string(),
+                from: parts(year, Some(1), Some(1)),
+                to: None,
+                scope: vec![section.into()],
+                chunk: None,
+                char_start: None,
+            });
+        }
+        let document_anchor = |id| Interpretation {
+            reference: Reference::Anchored {
+                anchor: Anchor::Document,
+                offset: None,
+            },
+            ..absolute_day(id)
+        };
+        // 偶数在第一节，奇数在第二节；两条链各自从本节日期起算。
+        let interpretations = [
+            next_day(4, 2),
+            next_day(5, 3),
+            next_day(2, 0),
+            next_day(3, 1),
+            document_anchor(1),
+            document_anchor(0),
+        ];
+        let resolved = resolve_interpretations(&interpretations, |id| {
+            context_at(&context, Some((id % 2) as usize))
+        });
+        assert_eq!(
+            resolved,
+            HashMap::from([
+                (0, day_point("2024-01-01T00:00:00Z", "B")),
+                (2, day_point("2024-01-02T00:00:00Z", "B")),
+                (4, day_point("2024-01-03T00:00:00Z", "B")),
+                (1, day_point("2025-01-01T00:00:00Z", "B")),
+                (3, day_point("2025-01-02T00:00:00Z", "B")),
+                (5, day_point("2025-01-03T00:00:00Z", "B")),
+            ])
+        );
+    }
+
+    #[test]
+    fn dependency_resolution_preserves_dateless_endings_and_unusable_anchors() {
+        let interpretations = [
+            next_day(1, 0),
+            Interpretation {
+                shape: Shape::Until,
+                ..absolute_day(0)
+            },
+            next_day(3, 2),
+            Interpretation {
+                shape: Shape::EndedUnknown,
+                ..next_day(2, 2)
+            },
+        ];
+        let resolved = resolve_interpretations(&interpretations, |_| DocumentDating::default());
+        assert_eq!(
+            resolved,
+            HashMap::from([
+                (
+                    0,
+                    Resolved {
+                        from: None,
+                        from_p: None,
+                        ..day_point("2024-01-01T00:00:00Z", "A")
+                    }
+                ),
+                (1, UNRESOLVED),
+                (
+                    2,
+                    Resolved {
+                        to_p: Some(ENDED_UNKNOWN),
+                        grade: "A",
+                        ..UNRESOLVED
+                    }
+                ),
+                (3, UNRESOLVED),
+            ])
+        );
     }
 
     #[test]
