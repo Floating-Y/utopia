@@ -1,5 +1,6 @@
 //! A page imported before nested traversal must gain its missing body on resync,
-//! even when Notion's edit timestamp has not changed.
+//! even when Notion's edit timestamp has not changed. A later failed read must
+//! leave that complete body and its processing history unchanged.
 use super::{fetch_pages, Paced};
 use crate::ingest_sources::{ingest_item, IngestAction};
 use chrono::{DateTime, Utc};
@@ -10,7 +11,7 @@ use uuid::Uuid;
 use wiremock::{matchers::method, matchers::path, Mock, MockServer, ResponseTemplate};
 
 #[tokio::test]
-async fn resync_adds_nested_body_without_a_new_edit_timestamp() -> anyhow::Result<()> {
+async fn resync_adds_nested_body_and_preserves_it_when_a_later_read_fails() -> anyhow::Result<()> {
     let Some(url) = utopia_store::test_db::url() else {
         return Ok(());
     };
@@ -85,7 +86,7 @@ async fn resync_adds_nested_body_without_a_new_edit_timestamp() -> anyhow::Resul
                 }],
                 "has_more": false
             })))
-            .expect(2)
+            .expect(3)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -97,7 +98,7 @@ async fn resync_adds_nested_body_without_a_new_edit_timestamp() -> anyhow::Resul
                 }],
                 "has_more": false
             })))
-            .expect(2)
+            .expect(3)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -151,9 +152,54 @@ async fn resync_adds_nested_body_without_a_new_edit_timestamp() -> anyhow::Resul
             .fetch_all(&pool)
             .await?;
             anyhow::ensure!(
-                versions == vec![(1, original.sha256.clone()), (2, updated.sha256)],
+                versions == vec![(1, original.sha256.clone()), (2, updated.sha256.clone())],
                 "resync must retain the old body and create exactly one new version"
             );
+            if expected == IngestAction::Updated {
+                let jobs_before: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM jobs WHERE kind='process_document' AND payload->>'document_id'=$1",
+                )
+                .bind(updated.id.to_string())
+                .fetch_one(&pool)
+                .await?;
+                Mock::given(method("GET"))
+                    .and(path("/blocks/toggle/children"))
+                    .respond_with(ResponseTemplate::new(503).set_body_json(json!({
+                        "message": "temporarily unavailable"
+                    })))
+                    .with_priority(1)
+                    .up_to_n_times(1)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let error = fetch_pages(&mut http, None).await.err().ok_or_else(|| {
+                    anyhow::anyhow!("a failed body read must not return a page to ingest")
+                })?;
+                anyhow::ensure!(
+                    error.to_string()
+                        == "notion page page: notion blocks returned 503 Service Unavailable: temporarily unavailable"
+                );
+                let retained = documents::find_by_external_key(&pool, source, external_key)
+                    .await?
+                    .ok_or_else(|| anyhow::anyhow!("the complete page was lost after a failed read"))?;
+                anyhow::ensure!(retained.sha256 == updated.sha256);
+                anyhow::ensure!(retained.updated_at == updated.updated_at);
+                anyhow::ensure!(state.blob.get(&retained.sha256).await? == complete_body.as_bytes());
+                let versions_after: Vec<(i32, String)> = sqlx::query_as(
+                    "SELECT version, sha256 FROM document_versions WHERE document_id=$1 ORDER BY version",
+                )
+                .bind(updated.id)
+                .fetch_all(&pool)
+                .await?;
+                anyhow::ensure!(versions_after == versions);
+                let jobs_after: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM jobs WHERE kind='process_document' AND payload->>'document_id'=$1",
+                )
+                .bind(updated.id.to_string())
+                .fetch_one(&pool)
+                .await?;
+                anyhow::ensure!(jobs_after == jobs_before);
+            }
         }
         Ok::<_, anyhow::Error>(())
     }

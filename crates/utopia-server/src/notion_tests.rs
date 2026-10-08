@@ -424,7 +424,7 @@ async fn child_rate_limit_exhaustion_is_an_error() {
 }
 
 #[tokio::test]
-async fn child_failure_keeps_only_title_and_preserves_page_identity() {
+async fn child_failure_rejects_the_sync_instead_of_returning_title_only_pages() {
     let server = MockServer::start().await;
     Mock::given(method("POST")).and(path("/search"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -440,18 +440,118 @@ async fn child_failure_keeps_only_title_and_preserves_page_identity() {
     )
     .await;
     Mock::given(path("/blocks/child/children"))
-        .respond_with(ResponseTemplate::new(500).set_body_json(json!({"message":"unavailable"})))
+        .respond_with(ResponseTemplate::new(503).set_body_json(json!({"message":"unavailable"})))
         .expect(1)
         .mount(&server)
         .await;
-    let (pages, truncated) = fetch_pages(&mut paced(&server), None).await.unwrap();
-    assert!(!truncated);
-    assert_eq!(pages.len(), 1);
-    assert_eq!(pages[0].external_key, "notion://page");
-    assert_eq!(pages[0].filename, "Quarterly-policy.md");
+    let error = fetch_pages(&mut paced(&server), None).await.err().unwrap();
     assert_eq!(
-        pages[0].last_edited,
-        Some("2026-10-01T12:00:00Z".parse().unwrap())
+        error.to_string(),
+        "notion page page: notion blocks returned 503 Service Unavailable: unavailable"
     );
-    assert_eq!(pages[0].text, "# Quarterly policy\n\n");
+}
+
+#[tokio::test]
+async fn a_nested_table_keeps_its_header_cells_and_paginated_rows() {
+    let server = MockServer::start().await;
+    children(
+        &server,
+        "page",
+        None,
+        vec![block("toggle", "toggle", "Quarterly policy", true)],
+        None,
+    )
+    .await;
+    children(
+        &server,
+        "toggle",
+        None,
+        vec![
+            json!({"id":"table", "type":"table", "has_children":true,
+                "table":{"table_width":3, "has_column_header":true, "has_row_header":true}}),
+            block("after", "paragraph", "After table", false),
+        ],
+        None,
+    )
+    .await;
+    children(
+        &server,
+        "table",
+        None,
+        vec![
+            json!({"type":"table_row", "table_row":{"cells":[
+                [{"plain_text":"Metric"}], [{"plain_text":"Value"}], [{"plain_text":"Notes"}]
+            ]}}),
+            json!({"type":"table_row", "table_row":{"cells":[
+                [{"plain_text":"Revenue"}], [], [{"plain_text":"Pending"}]
+            ]}}),
+        ],
+        Some("table-next"),
+    )
+    .await;
+    children(
+        &server,
+        "table",
+        Some("table-next"),
+        vec![json!({"type":"table_row", "table_row":{"cells":[
+            [{"plain_text":"Pipe | slash \\"}],
+            [{"plain_text":"42"}, {"plain_text":" million"}],
+            [{"plain_text":"First\r\nSecond\nThird\rLast"}]
+        ]}})],
+        None,
+    )
+    .await;
+    let text = page_text(&mut paced(&server), "page").await.unwrap();
+    assert_eq!(
+        text,
+        "Quarterly policy\n\n| Metric | Value | Notes |\n| --- | --- | --- |\n| Revenue |  | Pending |\n| Pipe \\| slash \\\\ | 42 million | First<br>Second<br>Third<br>Last |\n\nAfter table\n"
+    );
+    assert_eq!(
+        request_paths(&server).await,
+        [
+            "/blocks/page/children",
+            "/blocks/toggle/children",
+            "/blocks/table/children",
+            "/blocks/table/children"
+        ]
+    );
+    let chunks = utopia_ingest::chunk_text(&text);
+    assert!(chunks
+        .iter()
+        .any(|chunk| chunk.text.contains("| --- | --- | --- |")));
+}
+
+#[tokio::test]
+async fn a_table_without_column_headers_keeps_the_first_row_as_data() {
+    let server = MockServer::start().await;
+    children(
+        &server,
+        "page",
+        None,
+        vec![
+            block("before", "paragraph", "Before table", false),
+            json!({"id":"table", "type":"table", "has_children":true,
+                "table":{"table_width":2, "has_column_header":false}}),
+            block("after", "paragraph", "After table", false),
+        ],
+        None,
+    )
+    .await;
+    children(
+        &server,
+        "table",
+        None,
+        vec![
+            json!({"type":"table_row", "table_row":{"cells":[
+                [{"plain_text":"Revenue"}], [{"plain_text":"42 million"}]
+            ]}}),
+            json!({"type":"table_row", "table_row":{"cells":[[], []]}}),
+        ],
+        None,
+    )
+    .await;
+    assert_eq!(
+        page_text(&mut paced(&server), "page").await.unwrap(),
+        "Before table\n\n|  |  |\n| --- | --- |\n| Revenue | 42 million |\n|  |  |\n\nAfter table\n"
+    );
 }
