@@ -167,7 +167,12 @@ fn retry_after(header: Option<&str>) -> Duration {
 ///
 /// **只搜页面，不搜 data source。** 后者是表格的容器，它自己没有正文；
 /// 表格里的每一行是一个页面，会在同一次搜索里出现。
-pub async fn fetch(token: &str, query: Option<&str>) -> anyhow::Result<(Vec<NotionPage>, bool)> {
+///
+/// 第三项是正文没读出来的页，每页一句原因。它们不在第一项里，见 `fetch_pages`。
+pub async fn fetch(
+    token: &str,
+    query: Option<&str>,
+) -> anyhow::Result<(Vec<NotionPage>, bool, Vec<String>)> {
     let mut http = Paced::new(client(token)?);
     fetch_pages(&mut http, query).await
 }
@@ -175,8 +180,9 @@ pub async fn fetch(token: &str, query: Option<&str>) -> anyhow::Result<(Vec<Noti
 async fn fetch_pages(
     http: &mut Paced,
     query: Option<&str>,
-) -> anyhow::Result<(Vec<NotionPage>, bool)> {
+) -> anyhow::Result<(Vec<NotionPage>, bool, Vec<String>)> {
     let mut out = Vec::new();
+    let mut unread: Vec<String> = Vec::new();
     let mut cursor: Option<String> = None;
     let mut truncated = false;
 
@@ -206,10 +212,18 @@ async fn fetch_pages(
             }
             let Some(id) = p["id"].as_str() else { continue };
             let title = page_title(&p);
-            // 取页全部成功后才摄入，失败不能拿仅标题的版本替换已有正文。
-            let text = page_text(http, id)
-                .await
-                .map_err(|error| anyhow::anyhow!("notion page {id}: {error:#}"))?;
+            // 正文读不出来的页整页跳过：不摄入，库里已有的正文原样留着，不拿仅标题的
+            // 版本去替换它。**其余的页照常同步**——中止整轮是另一头的错：有的页永远
+            // 读不出来（嵌套块没共享给 integration，Notion 回 404），那样整个来源
+            // 就再也不动了。对象存储的目录占位符是同一个教训（#214）。
+            let text = match page_text(http, id).await {
+                Ok(text) => text,
+                Err(error) => {
+                    tracing::warn!(%id, error = %format!("{error:#}"), "notion page body could not be read, leaving the stored page as it is");
+                    unread.push(format!("notion page {id}: {error:#}"));
+                    continue;
+                }
+            };
 
             out.push(NotionPage {
                 external_key: format!("notion://{id}"),
@@ -230,7 +244,7 @@ async fn fetch_pages(
             break;
         }
     }
-    Ok((out, truncated))
+    Ok((out, truncated, unread))
 }
 
 /// 页面标题。
@@ -519,7 +533,7 @@ mod tests {
             eprintln!("跳过：未设 UTOPIA_NOTION_TEST_TOKEN");
             return Ok(());
         };
-        let (pages, _) = fetch(&token, None).await?;
+        let (pages, _, _) = fetch(&token, None).await?;
         assert!(
             !pages.is_empty(),
             "一页都没有——integration 可能没有被分享任何页面"

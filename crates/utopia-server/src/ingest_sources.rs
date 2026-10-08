@@ -1165,7 +1165,7 @@ async fn sync_notion(state: &AppState, source: &Source) -> anyhow::Result<SyncSt
         .map(str::trim)
         .filter(|s| !s.is_empty());
 
-    let (pages, truncated) = crate::notion::fetch(token, query).await?;
+    let (pages, truncated, unread) = crate::notion::fetch(token, query).await?;
     if truncated {
         tracing::warn!("页面数到达单次上限，其余留给下一次同步");
     }
@@ -1184,6 +1184,21 @@ async fn sync_notion(state: &AppState, source: &Source) -> anyhow::Result<SyncSt
         )
         .await?;
         stats.absorb(action);
+    }
+    // 读得出来的页已经进库了；读不出来的那几页让这一轮记成失败并点名，
+    // 不然它们停在旧版本上没有人知道
+    if !unread.is_empty() {
+        anyhow::bail!(
+            "{} Notion page(s) synced; {} could not be read and keep their stored content: {}",
+            stats.total(),
+            unread.len(),
+            unread
+                .iter()
+                .take(3)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
     }
     Ok(stats)
 }

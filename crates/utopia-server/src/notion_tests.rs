@@ -424,12 +424,15 @@ async fn child_rate_limit_exhaustion_is_an_error() {
 }
 
 #[tokio::test]
-async fn child_failure_rejects_the_sync_instead_of_returning_title_only_pages() {
+async fn a_page_whose_body_cannot_be_read_is_left_out_and_the_others_still_come_back() {
     let server = MockServer::start().await;
+    let page = |id: &str, title: &str| {
+        json!({"id": id, "properties": {"Name": {"type": "title", "title": [{"plain_text": title}]}},
+            "last_edited_time": "2026-10-01T12:00:00Z"})
+    };
     Mock::given(method("POST")).and(path("/search"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "results":[{"id":"page", "properties":{"Name":{"type":"title", "title":[{"plain_text":"Quarterly policy"}]}},
-                "last_edited_time":"2026-10-01T12:00:00Z"}], "has_more":false
+            "results": [page("page", "Quarterly policy"), page("other", "Travel policy")], "has_more": false
         }))).expect(1).mount(&server).await;
     children(
         &server,
@@ -444,10 +447,29 @@ async fn child_failure_rejects_the_sync_instead_of_returning_title_only_pages() 
         .expect(1)
         .mount(&server)
         .await;
-    let error = fetch_pages(&mut paced(&server), None).await.err().unwrap();
+    children(
+        &server,
+        "other",
+        None,
+        vec![block(
+            "p",
+            "paragraph",
+            "Economy class under six hours",
+            false,
+        )],
+        None,
+    )
+    .await;
+
+    let (pages, truncated, unread) = fetch_pages(&mut paced(&server), None).await.unwrap();
+    // 读坏的那一页不带着半截正文或只有标题回来，另一页不受它连累
+    assert_eq!(pages.len(), 1);
+    assert_eq!(pages[0].external_key, "notion://other");
+    assert!(pages[0].text.contains("Economy class under six hours"));
+    assert!(!truncated);
     assert_eq!(
-        error.to_string(),
-        "notion page page: notion blocks returned 503 Service Unavailable: unavailable"
+        unread,
+        vec!["notion page page: notion blocks returned 503 Service Unavailable: unavailable"]
     );
 }
 

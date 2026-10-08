@@ -117,7 +117,7 @@ async fn resync_adds_nested_body_and_preserves_it_when_a_later_read_fails() -> a
         http.api_root = server.uri();
 
         for expected in [IngestAction::Updated, IngestAction::Unchanged] {
-            let (pages, truncated) = fetch_pages(&mut http, None).await?;
+            let (pages, truncated, _) = fetch_pages(&mut http, None).await?;
             anyhow::ensure!(!truncated && pages.len() == 1);
             let page = &pages[0];
             anyhow::ensure!(page.external_key == external_key);
@@ -172,12 +172,14 @@ async fn resync_adds_nested_body_and_preserves_it_when_a_later_read_fails() -> a
                     .expect(1)
                     .mount(&server)
                     .await;
-                let error = fetch_pages(&mut http, None).await.err().ok_or_else(|| {
-                    anyhow::anyhow!("a failed body read must not return a page to ingest")
-                })?;
+                let (pages, _, unread) = fetch_pages(&mut http, None).await?;
                 anyhow::ensure!(
-                    error.to_string()
-                        == "notion page page: notion blocks returned 503 Service Unavailable: temporarily unavailable"
+                    pages.is_empty(),
+                    "a failed body read must not return a page to ingest"
+                );
+                anyhow::ensure!(
+                    unread
+                        == vec!["notion page page: notion blocks returned 503 Service Unavailable: temporarily unavailable".to_string()]
                 );
                 let retained = documents::find_by_external_key(&pool, source, external_key)
                     .await?
