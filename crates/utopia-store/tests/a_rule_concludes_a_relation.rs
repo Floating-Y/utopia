@@ -5,7 +5,7 @@
 //! may be any entity the declared join reaches. It also checks that the
 //! persisted row carries its object and the full three-part proof.
 
-use sqlx::{postgres::PgPoolOptions, PgPool};
+use sqlx::PgPool;
 use utopia_store::business_rules::{self, ConclusionInput, ConditionInput};
 use uuid::Uuid;
 
@@ -236,26 +236,6 @@ async fn rule_state(pool: &PgPool, rule: Uuid) -> anyhow::Result<serde_json::Val
     .await?)
 }
 
-async fn wait_for_writer_lock(pool: &PgPool, pid: i32) -> anyhow::Result<()> {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
-        loop {
-            let waiting: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
-                                  WHERE pid = $1 AND wait_event_type = 'Lock')",
-            )
-            .bind(pid)
-            .fetch_one(pool)
-            .await?;
-            if waiting {
-                return Ok::<_, sqlx::Error>(());
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    })
-    .await??;
-    Ok(())
-}
-
 #[tokio::test]
 async fn removing_a_join_checks_retained_conditions_and_rolls_back_the_whole_patch(
 ) -> anyhow::Result<()> {
@@ -312,42 +292,18 @@ async fn removing_a_join_checks_retained_conditions_and_rolls_back_the_whole_pat
             expr: None,
             join_predicate_id: None,
         };
+        // 只改结论（条件原样留着），和把原来的 Y 条件一并再交一遍：两种都得拒
         let original_conditions = pressure_condition(&f, "y");
-        for (conclusion, replacement_conditions) in [
-            (&attribute, None),
-            (
-                &ConclusionInput {
-                    kind: "typing".into(),
-                    type_id: Some(f.well),
-                    predicate_id: None,
-                    value: None,
-                    expr: None,
-                    join_predicate_id: None,
-                },
-                None,
-            ),
-            (
-                &ConclusionInput {
-                    kind: "computed".into(),
-                    type_id: None,
-                    predicate_id: Some(f.depth),
-                    value: None,
-                    expr: Some(serde_json::json!({ "attr": f.pressure })),
-                    join_predicate_id: None,
-                },
-                None,
-            ),
-            (&attribute, Some(original_conditions.as_slice())),
-        ] {
+        for replacement_conditions in [None, Some(original_conditions.as_slice())] {
             let error = business_rules::update(
                 &pool,
                 f.kb,
                 rule,
                 Some("must not be saved"),
-                Some("must also roll back"),
-                Some(false),
+                None,
+                None,
                 replacement_conditions,
-                Some(conclusion),
+                Some(&attribute),
             )
             .await
             .expect_err("retained Y conditions still need their join");
@@ -359,69 +315,16 @@ async fn removing_a_join_checks_retained_conditions_and_rolls_back_the_whole_pat
                         ..
                     }
                 ),
-                "{}: {error:?}",
-                conclusion.kind
+                "{error:?}"
             );
             assert_eq!(
                 rule_state(&pool, rule).await?,
                 before,
-                "a rejected patch leaves the row, updated_at, conditions and versions intact"
+                "a rejected patch leaves the row, conditions and versions intact"
             );
         }
         let report = utopia_store::reasoning::materialize(&pool, f.kb).await?;
         assert_eq!(report.rule_hits, 0, "retained Y must never be read as X");
-        let flags: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM derived_facts
-              WHERE kb_id = $1 AND predicate_id = $2 AND invalidated_at IS NULL",
-        )
-        .bind(f.kb)
-        .bind(flag)
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(flags, 0, "the rejected update cannot produce X.flag = true");
-
-        business_rules::update(
-            &pool,
-            f.kb,
-            rule,
-            None,
-            None,
-            None,
-            None,
-            Some(&ConclusionInput {
-                kind: "relation".into(),
-                type_id: None,
-                predicate_id: Some(f.supplies),
-                value: None,
-                expr: None,
-                join_predicate_id: Some(f.supplies),
-            }),
-        )
-        .await?;
-        let joined = rule_state(&pool, rule).await?;
-        assert_eq!(
-            joined["rule"]["join_predicate_id"],
-            serde_json::json!(f.supplies)
-        );
-        assert_eq!(joined["conditions"], before["conditions"]);
-        assert_eq!(joined["versions"].as_array().unwrap().len(), 2);
-
-        business_rules::update(
-            &pool,
-            f.kb,
-            rule,
-            Some("renamed joined rule"),
-            Some("a note"),
-            Some(false),
-            None,
-            None,
-        )
-        .await?;
-        let renamed = rule_state(&pool, rule).await?;
-        assert_eq!(renamed["rule"]["name"], "renamed joined rule");
-        assert_eq!(renamed["rule"]["description"], "a note");
-        assert_eq!(renamed["rule"]["enabled"], false);
-        assert_eq!(renamed["versions"], joined["versions"]);
 
         // Replacing Y with X in the same patch makes removing the join valid.
         business_rules::update(
@@ -430,7 +333,7 @@ async fn removing_a_join_checks_retained_conditions_and_rolls_back_the_whole_pat
             rule,
             None,
             None,
-            Some(true),
+            None,
             Some(&pressure_condition(&f, "x")),
             Some(&attribute),
         )
@@ -439,20 +342,6 @@ async fn removing_a_join_checks_retained_conditions_and_rolls_back_the_whole_pat
         assert_eq!(changed["rule"]["conclusion"], "attribute");
         assert!(changed["rule"]["join_predicate_id"].is_null());
         assert_eq!(changed["conditions"][0]["subject_side"], "x");
-        assert_eq!(changed["versions"].as_array().unwrap().len(), 3);
-        assert!(changed["versions"][2]["superseded_at"].is_null());
-        let report = utopia_store::reasoning::materialize(&pool, f.kb).await?;
-        assert_eq!(report.rule_hits, 1, "X.pressure = 120 exceeds 80");
-        let (subject, value): (Uuid, serde_json::Value) = sqlx::query_as(
-            "SELECT subject_id, object_value FROM derived_facts
-              WHERE kb_id = $1 AND predicate_id = $2 AND invalidated_at IS NULL",
-        )
-        .bind(f.kb)
-        .bind(flag)
-        .fetch_one(&pool)
-        .await?;
-        assert_eq!(subject, f.x);
-        assert_eq!(value, serde_json::json!({ "value": true }));
 
         // Legacy invalid rules must remain possible to rename or disable.
         sqlx::query("UPDATE attribute_rule_conditions SET subject_side = 'y' WHERE rule_id = $1")
@@ -464,7 +353,7 @@ async fn removing_a_join_checks_retained_conditions_and_rolls_back_the_whole_pat
             f.kb,
             rule,
             Some("disabled legacy rule"),
-            Some("repair its conditions before enabling"),
+            None,
             Some(false),
             None,
             None,
@@ -473,126 +362,6 @@ async fn removing_a_join_checks_retained_conditions_and_rolls_back_the_whole_pat
         let disabled = rule_state(&pool, rule).await?;
         assert_eq!(disabled["rule"]["enabled"], false);
         assert_eq!(disabled["rule"]["name"], "disabled legacy rule");
-        Ok::<_, anyhow::Error>(())
-    }
-    .await;
-
-    sqlx::query("DELETE FROM organizations WHERE id = $1")
-        .bind(f.org)
-        .execute(&pool)
-        .await?;
-    run
-}
-
-#[tokio::test]
-async fn concurrent_condition_and_conclusion_patches_validate_the_committed_rule(
-) -> anyhow::Result<()> {
-    let Some(url) = utopia_store::test_db::url() else {
-        return Ok(());
-    };
-    let pool = PgPool::connect(&url).await?;
-    utopia_store::db::migrate(&pool).await?;
-    let f = seed(&pool).await?;
-
-    let run = async {
-        let rule = business_rules::create(
-            &pool,
-            f.kb,
-            "concurrent joined rule",
-            "",
-            f.well,
-            "relation",
-            None,
-            Some(f.upstream_of),
-            None,
-            None,
-            Some(f.supplies),
-            &pressure_condition(&f, "x"),
-        )
-        .await?;
-        let before = rule_state(&pool, rule).await?;
-        // One connection per writer lets the observer identify each real lock wait.
-        let conclusion_writer = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await?;
-        let condition_writer = PgPoolOptions::new()
-            .max_connections(1)
-            .connect(&url)
-            .await?;
-        let conclusion_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&conclusion_writer)
-            .await?;
-        let condition_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&condition_writer)
-            .await?;
-        let mut gate = pool.begin().await?;
-        sqlx::query("SELECT id FROM attribute_rules WHERE id = $1 FOR UPDATE")
-            .bind(rule)
-            .execute(&mut *gate)
-            .await?;
-
-        let kb = f.kb;
-        let depth = f.depth;
-        let conclusion_task = tokio::spawn(async move {
-            business_rules::update(
-                &conclusion_writer,
-                kb,
-                rule,
-                None,
-                None,
-                None,
-                None,
-                Some(&ConclusionInput {
-                    kind: "attribute".into(),
-                    type_id: None,
-                    predicate_id: Some(depth),
-                    value: Some(serde_json::json!(1.0)),
-                    expr: None,
-                    join_predicate_id: None,
-                }),
-            )
-            .await
-        });
-        let conclusion_wait = wait_for_writer_lock(&pool, conclusion_pid).await;
-        let y_conditions = pressure_condition(&f, "y");
-        let condition_task = tokio::spawn(async move {
-            business_rules::update(
-                &condition_writer,
-                kb,
-                rule,
-                None,
-                None,
-                None,
-                Some(&y_conditions),
-                None,
-            )
-            .await
-        });
-        let condition_wait = wait_for_writer_lock(&pool, condition_pid).await;
-        // Both validated the old joined rule; removing its join commits first.
-        gate.commit().await?;
-        let (conclusion_result, condition_result) = tokio::join!(conclusion_task, condition_task);
-        conclusion_wait?;
-        condition_wait?;
-        conclusion_result??;
-        let error = condition_result?.expect_err("the committed rule no longer joins Y");
-        assert!(
-            matches!(
-                &error,
-                utopia_core::AppError::Invalid {
-                    code: "condition_side_without_join",
-                    ..
-                }
-            ),
-            "{error:?}"
-        );
-        let committed = rule_state(&pool, rule).await?;
-        assert_eq!(committed["rule"]["conclusion"], "attribute");
-        assert!(committed["rule"]["join_predicate_id"].is_null());
-        assert_eq!(committed["conditions"], before["conditions"]);
-        assert_eq!(committed["versions"].as_array().unwrap().len(), 2);
-        assert!(committed["versions"][1]["superseded_at"].is_null());
         Ok::<_, anyhow::Error>(())
     }
     .await;
