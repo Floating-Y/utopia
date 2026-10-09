@@ -153,6 +153,7 @@ By domain; the domains are the files of [../design/](../design/README.md). **Sta
 | | Record | Status | Overtaken |
 |---|---|---|---|
 | 0016 | [Close the open seams before cutting new ones](0016-close-the-open-seams-before-cutting-new-ones.md) | In progress | partly (by 0036) |
+| 0067 | [A job result belongs to its claim](0067-a-job-result-belongs-to-its-claim.md) | Proposed |  |
 
 ## Not a decision record
 

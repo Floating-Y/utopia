@@ -81,6 +81,17 @@ notification-loss polling, old-aligner/new-handler overlap, and production route
 permissions/status reads/UI E2E remain explicit acceptance work. Existing temporal
 and evidence tests must pass after any extraction; the experiment is not a substitute.
 
+**Revision 2026-10-09 (proposed result persistence).** The paragraph above records
+the queue's recovery limit at the time of this experiment: a failed acknowledgement
+could strand `running` until restart. [Issue #1106](https://github.com/deeplethe/utopia/issues/1106)
+exposes that same gap outside this experiment; [0067](0067-a-job-result-belongs-to-its-claim.md)
+proposes retrying the already computed outcome with capped backoff and a separate
+claim generation. It would remove the need to restart after a transient result-write
+failure while the worker remains alive, without rerunning the handler or spending
+another business attempt. This is a proposal awaiting ADR merge and implementation,
+not new runtime evidence. Pending outcomes would remain in memory, so process exit,
+startup replay, and the single-process ownership limit above would still apply.
+
 After contract approval, wire the route's existing authorization and binding lookup
 to a same-transaction decision+job function; register the pure handler in main;
 add job status authorization and completion/failure events; update Review and both
