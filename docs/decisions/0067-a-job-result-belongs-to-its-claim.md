@@ -1,6 +1,6 @@
 # 0067 · A job result belongs to its claim
 
-- **Status**: Proposed · 2026-10-09 · migration 0107 planned, PR pending · open: ADR review and merge before the schema and worker implementation; verification on the current `dev` baseline
+- **Status**: Proposed · 2026-10-09 · [PR #1130](https://github.com/deeplethe/utopia/pull/1130) · open: ADR review and merge before the schema and worker implementation; verification on the current `dev` baseline
 - **Written**: 2026-10-09 (conventions in the [README](README.md))
 - **Related**: [0051](0051-a-human-phrase-decision-carries-its-materialization-work.md) (durable materialization delivery); [#1106](https://github.com/deeplethe/utopia/issues/1106), including the [maintainer's reply](https://github.com/deeplethe/utopia/issues/1106#issuecomment-6073749092)
 
