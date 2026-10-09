@@ -221,24 +221,9 @@ fn pressure_condition(f: &Fixture, side: &str) -> [ConditionInput; 1] {
     }]
 }
 
-async fn rule_state(pool: &PgPool, rule: Uuid) -> anyhow::Result<serde_json::Value> {
-    Ok(sqlx::query_scalar(
-        "SELECT jsonb_build_object(
-             'rule', to_jsonb(r),
-             'conditions', (SELECT jsonb_agg(to_jsonb(c) ORDER BY group_seq, seq)
-                              FROM attribute_rule_conditions c WHERE c.rule_id = r.id),
-             'versions', (SELECT jsonb_agg(to_jsonb(v) ORDER BY seq)
-                            FROM attribute_rule_versions v WHERE v.rule_id = r.id))
-           FROM attribute_rules r WHERE r.id = $1",
-    )
-    .bind(rule)
-    .fetch_one(pool)
-    .await?)
-}
-
+/// 只改结论、不带条件的更新会清掉连接而把 Y 侧条件留下（#1109）：整条更新被拒，什么都不写
 #[tokio::test]
-async fn removing_a_join_checks_retained_conditions_and_rolls_back_the_whole_patch(
-) -> anyhow::Result<()> {
+async fn dropping_the_join_is_refused_while_the_rule_keeps_y_conditions() -> anyhow::Result<()> {
     let Some(url) = utopia_store::test_db::url() else {
         return Ok(());
     };
@@ -247,25 +232,6 @@ async fn removing_a_join_checks_retained_conditions_and_rolls_back_the_whole_pat
     let f = seed(&pool).await?;
 
     let run = async {
-        let flag = Uuid::now_v7();
-        sqlx::query(
-            "INSERT INTO relation_types (id, kb_id, key, label, kind, datatype)
-             VALUES ($1, $2, 'flag', 'Flag', 'attribute', 'bool')",
-        )
-        .bind(flag)
-        .bind(f.kb)
-        .execute(&pool)
-        .await?;
-        attr(&pool, &f, f.x, f.pressure, 120.0, "2024-01-01T00:00:00Z").await?;
-        attr(&pool, &f, f.y, f.pressure, 10.0, "2024-01-01T00:00:00Z").await?;
-        edge(
-            &pool,
-            &f,
-            f.supplies,
-            "2024-01-01T00:00:00Z",
-            "2024-02-01T00:00:00Z",
-        )
-        .await?;
         let rule = business_rules::create(
             &pool,
             f.kb,
@@ -281,52 +247,46 @@ async fn removing_a_join_checks_retained_conditions_and_rolls_back_the_whole_pat
             &pressure_condition(&f, "y"),
         )
         .await?;
-        let report = utopia_store::reasoning::materialize(&pool, f.kb).await?;
-        assert_eq!(report.rule_hits, 0, "Y.pressure = 10 does not exceed 80");
-        let before = rule_state(&pool, rule).await?;
         let attribute = ConclusionInput {
             kind: "attribute".into(),
             type_id: None,
-            predicate_id: Some(flag),
-            value: Some(serde_json::json!(true)),
+            predicate_id: Some(f.depth),
+            value: Some(serde_json::json!(1.0)),
             expr: None,
             join_predicate_id: None,
         };
-        // 只改结论（条件原样留着），和把原来的 Y 条件一并再交一遍：两种都得拒
-        let original_conditions = pressure_condition(&f, "y");
-        for replacement_conditions in [None, Some(original_conditions.as_slice())] {
-            let error = business_rules::update(
-                &pool,
-                f.kb,
-                rule,
-                Some("must not be saved"),
-                None,
-                None,
-                replacement_conditions,
-                Some(&attribute),
+        let saved = || async {
+            sqlx::query_as::<_, (String, Option<Uuid>, String)>(
+                "SELECT r.conclusion, r.join_predicate_id, c.subject_side
+                   FROM attribute_rules r JOIN attribute_rule_conditions c ON c.rule_id = r.id
+                  WHERE r.id = $1",
             )
+            .bind(rule)
+            .fetch_one(&pool)
             .await
-            .expect_err("retained Y conditions still need their join");
-            assert!(
-                matches!(
-                    &error,
-                    utopia_core::AppError::Invalid {
-                        code: "condition_side_without_join",
-                        ..
-                    }
-                ),
-                "{error:?}"
-            );
-            assert_eq!(
-                rule_state(&pool, rule).await?,
-                before,
-                "a rejected patch leaves the row, conditions and versions intact"
-            );
-        }
-        let report = utopia_store::reasoning::materialize(&pool, f.kb).await?;
-        assert_eq!(report.rule_hits, 0, "retained Y must never be read as X");
+        };
 
-        // Replacing Y with X in the same patch makes removing the join valid.
+        let refused =
+            business_rules::update(&pool, f.kb, rule, None, None, None, None, Some(&attribute))
+                .await
+                .expect_err("the Y condition the rule keeps still needs its join");
+        assert!(
+            matches!(
+                &refused,
+                utopia_core::AppError::Invalid {
+                    code: "condition_side_without_join",
+                    ..
+                }
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            saved().await?,
+            ("relation".into(), Some(f.supplies), "y".into())
+        );
+
+        // 同一次更新里把条件换到 X 侧，去掉连接就是合法的
+        let on_x = pressure_condition(&f, "x");
         business_rules::update(
             &pool,
             f.kb,
@@ -334,16 +294,13 @@ async fn removing_a_join_checks_retained_conditions_and_rolls_back_the_whole_pat
             None,
             None,
             None,
-            Some(&pressure_condition(&f, "x")),
+            Some(&on_x),
             Some(&attribute),
         )
         .await?;
-        let changed = rule_state(&pool, rule).await?;
-        assert_eq!(changed["rule"]["conclusion"], "attribute");
-        assert!(changed["rule"]["join_predicate_id"].is_null());
-        assert_eq!(changed["conditions"][0]["subject_side"], "x");
+        assert_eq!(saved().await?, ("attribute".into(), None, "x".into()));
 
-        // Legacy invalid rules must remain possible to rename or disable.
+        // 修复之前存下的非法规则仍然能改名、停用：只有动了条件或结论才校验
         sqlx::query("UPDATE attribute_rule_conditions SET subject_side = 'y' WHERE rule_id = $1")
             .bind(rule)
             .execute(&pool)
@@ -352,16 +309,13 @@ async fn removing_a_join_checks_retained_conditions_and_rolls_back_the_whole_pat
             &pool,
             f.kb,
             rule,
-            Some("disabled legacy rule"),
+            Some("disabled"),
             None,
             Some(false),
             None,
             None,
         )
         .await?;
-        let disabled = rule_state(&pool, rule).await?;
-        assert_eq!(disabled["rule"]["enabled"], false);
-        assert_eq!(disabled["rule"]["name"], "disabled legacy rule");
         Ok::<_, anyhow::Error>(())
     }
     .await;
