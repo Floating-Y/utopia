@@ -1,6 +1,6 @@
 # 0067 · A job result belongs to its claim
 
-- **Status**: Proposed · 2026-10-09 · [PR #1130](https://github.com/deeplethe/utopia/pull/1130) · open: ADR review and merge before the schema and worker implementation; verification on the current `dev` baseline
+- **Status**: Proposed · 2026-10-09 · [PR #1130](https://github.com/deeplethe/utopia/pull/1130) · open: `claim_generation` column, worker result persistence, and regression coverage
 - **Written**: 2026-10-09 (conventions in the [README](README.md))
 - **Related**: [0051](0051-a-human-phrase-decision-carries-its-materialization-work.md) (durable materialization delivery); [#1106](https://github.com/deeplethe/utopia/issues/1106), including the [maintainer's reply](https://github.com/deeplethe/utopia/issues/1106#issuecomment-6073749092)
 
@@ -52,9 +52,7 @@ later claim of the same job.
 The implementation should stay in the existing queue, with its existing handler
 signature and HTTP `JobStatus` shape. Adding a field to the public Rust `Job` struct
 is a source compatibility change: all struct constructors, test fixtures, and
-synthetic claim queries must supply the generation. Migration `0107` is the proposed
-next number after `0106` on the checked `main` and `dev`; check both branches again
-before implementation and submission to avoid a collision.
+synthetic claim queries must supply the generation.
 
 ## Why this and not the alternatives
 
@@ -89,14 +87,9 @@ the guarded worker acknowledgement sees no running row and stops, including RSS
 worker's outcome writes, not handler business side effects across different claims;
 this is not a new ownership protocol for RSS or other handlers.
 
-The current `dev` worker and schema do not implement this proposal.
-Under the contribution rules, this ADR must land before the data-model implementation.
+## Acceptance checks
 
-## Verification required for implementation
-
-Use a dedicated, otherwise idle database and the existing `test_db::url()` guard with
-`UTOPIA_TEST_REQUIRE_DB=1`. Fault injection and real queue workers must not share a
-database with unrelated tests.
+Fault injection and real queue workers must use a dedicated, otherwise idle test database.
 
 - Fail outcome writes, restore writes, and verify success, ordinary failure,
   Terminal, and Deferred outcomes. The handler runs once; the original error,
@@ -108,6 +101,3 @@ database with unrelated tests.
 - Observe a concurrency slot retained during persistence failure and released after
   recovery or stale-claim detection; cover a handler that already marks its job done
   and pool closure while persistence is waiting.
-- Update all `Job` constructors and synthetic claim queries, then run the required
-  workspace formatting, Clippy, tests, SQL-backed regressions, and web build against
-  the implementing head. Record only checks actually executed on that head.

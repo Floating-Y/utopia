@@ -112,6 +112,7 @@ By domain; the domains are the files of [../design/](../design/README.md). **Sta
 | 0052 | [Document content is a read contract over the retained ledger](0052-document-content-is-a-read-contract.md) | Proposed |  |
 | 0054 | [A source may push statements in the open contract](0054-a-source-may-push-statements-in-the-open-contract.md) | Implemented |  |
 | 0065 | [The OCR reader chooses its provider](0065-readers-choose-their-provider.md) | Implemented |  |
+| 0067 | [A job result belongs to its claim](0067-a-job-result-belongs-to-its-claim.md) | Proposed |  |
 
 ### [lakehouse-and-actions](../design/lakehouse-and-actions.md)
 
@@ -153,7 +154,6 @@ By domain; the domains are the files of [../design/](../design/README.md). **Sta
 | | Record | Status | Overtaken |
 |---|---|---|---|
 | 0016 | [Close the open seams before cutting new ones](0016-close-the-open-seams-before-cutting-new-ones.md) | In progress | partly (by 0036) |
-| 0067 | [A job result belongs to its claim](0067-a-job-result-belongs-to-its-claim.md) | Proposed |  |
 
 ## Not a decision record
 
