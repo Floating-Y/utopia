@@ -1,6 +1,6 @@
 # 0051 · A human phrase decision carries its materialization work
 
-- **Status**: Implemented · 2026-09-23 (#876) · revised 2026-10-10
+- **Status**: Implemented · 2026-09-23 (#876) · revised 2026-10-10 ([#1137](https://github.com/deeplethe/utopia/pull/1137))
 - **Written**: 2026-09-21
 - **Related**: [0044](0044-the-ontology-is-a-view-over-what-documents-say.md); [PR #841](https://github.com/deeplethe/utopia/pull/841).
 
@@ -125,6 +125,18 @@ bounded deferral window. Cover repeated acknowledgement after commit, replaced
 claims with equal attempt counts, expired-window fallback, retained and released
 slots, handlers that settle their own jobs, and pool closure while waiting. These
 checks must report their own head and results rather than reuse historical counts.
+
+Validation at `5e60e2702d37dbffeccd0551c8895222c9b85d29` on Windows / PostgreSQL
+16.15 passed the eight module-local writeback tests and the opt-in real-worker
+writeback regression, including failed UPDATEs followed by recovery, all outcome
+classes, stale claims, slot backpressure, connection release and pool closure.
+Repeated acknowledgement retries an already committed result; it does not inject
+a network acknowledgement failure. The two retained delivery parents, three
+actual killed subprocesses and Busy-lock test passed separately on an idle
+database. The database-required workspace suite passed 1,485 tests; fmt, Clippy,
+web build and 235 web tests also passed. This evidence belongs to
+[the writeback implementation](https://github.com/deeplethe/utopia/pull/1137), not
+the historical experiment above.
 
 After contract approval, wire the route's existing authorization and binding lookup
 to a same-transaction decision+job function; register the pure handler in main;
