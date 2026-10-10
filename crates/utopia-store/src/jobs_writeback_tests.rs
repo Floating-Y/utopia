@@ -21,6 +21,18 @@ async fn running_job(pool: &PgPool, attempts: i32) -> anyhow::Result<Job> {
     .await?)
 }
 
+async fn claim_job(pool: &PgPool, id: i64) -> anyhow::Result<Job> {
+    Ok(sqlx::query_as(
+        "UPDATE jobs SET status = 'running', attempts = attempts + 1,
+                         locked_at = now(), updated_at = now()
+         WHERE id = $1 AND status = 'queued'
+         RETURNING id, kind, payload, attempts, max_attempts, locked_at",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await?)
+}
+
 #[derive(Debug, PartialEq, sqlx::FromRow)]
 struct JobState {
     status: String,
@@ -75,15 +87,7 @@ async fn an_old_claim_cannot_overwrite_any_new_running_result() -> anyhow::Resul
             .bind(payload)
             .execute(&pool)
             .await?;
-        let new_job: Job = sqlx::query_as(
-            "UPDATE jobs SET status = 'running', attempts = attempts + 1,
-                             locked_at = now(), updated_at = now()
-             WHERE id = $1 AND status = 'queued'
-             RETURNING id, kind, payload, attempts, max_attempts, locked_at",
-        )
-        .bind(job.id)
-        .fetch_one(&pool)
-        .await?;
+        let new_job = claim_job(&pool, job.id).await?;
         assert_eq!(new_job.attempts, job.attempts);
         assert_ne!(new_job.locked_at, job.locked_at);
         let new_execution = state(&pool, job.id).await?;
@@ -129,15 +133,7 @@ async fn manual_requeue_changes_claim_time_after_resetting_attempts() -> anyhow:
     assert_eq!(requeued.locked_at, Some(old_job.locked_at));
 
     // 只认领本测试已经提交重排的行，使用数据库返回的原始时间。
-    let new_job: Job = sqlx::query_as(
-        "UPDATE jobs SET status = 'running', attempts = attempts + 1,
-                         locked_at = now(), updated_at = now()
-         WHERE id = $1 AND status = 'queued'
-         RETURNING id, kind, payload, attempts, max_attempts, locked_at",
-    )
-    .bind(old_job.id)
-    .fetch_one(&pool)
-    .await?;
+    let new_job = claim_job(&pool, old_job.id).await?;
     assert_eq!(new_job.attempts, old_job.attempts);
     assert_ne!(new_job.locked_at, old_job.locked_at);
     let new_execution = state(&pool, new_job.id).await?;
@@ -161,53 +157,53 @@ async fn a_repeated_ack_preserves_the_first_writeback() -> anyhow::Result<()> {
     let pool = PgPool::connect(&url).await?;
     let completed_at = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
     let deferred = anyhow::anyhow!("index busy").context(Deferred::new(Duration::from_secs(17)));
-    let ordinary = anyhow::anyhow!("network failure").context("provider request");
+    let ordinary =
+        anyhow::anyhow!("provider detail: request rejected").context("outer request context");
     let terminal = anyhow::anyhow!("balance gone").context(Terminal);
+    let terminal_and_deferred = anyhow::anyhow!("balance gone after waiting")
+        .context(Deferred::new(Duration::from_secs(17)))
+        .context(Terminal)
+        .context("outer request context");
 
-    for error in [None, Some(&ordinary), Some(&terminal), Some(&deferred)] {
-        let job = running_job(&pool, 2).await?;
+    for (attempts, error, expected_status, expected_attempts, retry_secs) in [
+        (2, None, "done", 2, None),
+        (2, Some(&ordinary), "queued", 2, Some(120)),
+        (3, Some(&ordinary), "failed", 3, None),
+        (2, Some(&terminal), "failed", 2, None),
+        (1, Some(&terminal_and_deferred), "failed", 1, None),
+        (2, Some(&deferred), "queued", 1, Some(17)),
+    ] {
+        let job = running_job(&pool, attempts).await?;
+        let before = state(&pool, job.id).await?;
         let outcome = match error {
             Some(error) => JobOutcome::failed(&job, error),
             None => JobOutcome::Done,
         };
         assert!(persist_outcome(&pool, &job, &outcome, completed_at).await?);
         let first_ack = state(&pool, job.id).await?;
-        match error {
-            None => {
-                assert_eq!(first_ack.status, "done");
-                assert_eq!(first_ack.last_error, None);
-                assert_eq!(first_ack.attempts, 2);
-            }
-            Some(error) if utopia_core::is_terminal(error) => {
-                assert_eq!(first_ack.status, "failed");
-                assert_eq!(first_ack.attempts, 2);
-            }
-            Some(error) if utopia_core::is_deferred(error).is_some() => {
-                assert_eq!(first_ack.status, "queued");
-                assert_eq!(first_ack.attempts, 1);
-                assert_eq!(
-                    first_ack.run_at,
-                    completed_at + chrono::Duration::seconds(17)
-                );
-                let since: DateTime<Utc> = sqlx::query_scalar(
-                    "SELECT (payload->>'deferred_since')::timestamptz FROM jobs WHERE id = $1",
-                )
-                .bind(job.id)
-                .fetch_one(&pool)
-                .await?;
-                assert_eq!(since, completed_at);
-            }
-            Some(_) => {
-                assert_eq!(first_ack.status, "queued");
-                assert_eq!(first_ack.attempts, 2);
-                assert_eq!(
-                    first_ack.run_at,
-                    completed_at + chrono::Duration::seconds(120)
-                );
-            }
+        assert_eq!(first_ack.status, expected_status);
+        assert_eq!(first_ack.attempts, expected_attempts);
+        assert_eq!(
+            first_ack.last_error,
+            error.map(|error| format!("{error:#}"))
+        );
+        if let Some(retry_secs) = retry_secs {
+            assert_eq!(
+                first_ack.run_at,
+                completed_at + chrono::Duration::seconds(retry_secs)
+            );
         }
-        if let Some(error) = error {
-            assert_eq!(first_ack.last_error, Some(format!("{error:#}")));
+        if expected_attempts == attempts {
+            assert_eq!(first_ack.payload, before.payload);
+        } else {
+            // 只有有效 Deferred 退还预算，并首次写入等待窗口起点。
+            let since: DateTime<Utc> = sqlx::query_scalar(
+                "SELECT (payload->>'deferred_since')::timestamptz FROM jobs WHERE id = $1",
+            )
+            .bind(job.id)
+            .fetch_one(&pool)
+            .await?;
+            assert_eq!(since, completed_at);
         }
         let duplicate_ack = persist_outcome(
             &pool,
@@ -257,46 +253,6 @@ async fn deferred_window_uses_completion_time_and_current_database_payload() -> 
                 written.attempts, 2,
                 "expired Deferred spends ordinary budget"
             );
-            assert_eq!(
-                written.run_at,
-                completed_at + chrono::Duration::seconds(120)
-            );
-        }
-        remove(&pool, job.id).await?;
-    }
-    pool.close().await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn failure_writeback_keeps_full_error_and_terminal_priority() -> anyhow::Result<()> {
-    let Some(url) = crate::test_db::url() else {
-        return Ok(());
-    };
-    let pool = PgPool::connect(&url).await?;
-    let completed_at = DateTime::<Utc>::from_timestamp(1_700_000_000, 0).unwrap();
-    let ordinary =
-        anyhow::anyhow!("provider detail: request rejected").context("outer request context");
-    let terminal = anyhow::anyhow!("balance gone after waiting")
-        .context(Deferred::new(Duration::from_secs(17)))
-        .context(Terminal)
-        .context("outer request context");
-
-    for (attempts, error, expected_status) in [
-        (2, &ordinary, "queued"),
-        (3, &ordinary, "failed"),
-        (1, &terminal, "failed"),
-    ] {
-        let job = running_job(&pool, attempts).await?;
-        let before = state(&pool, job.id).await?;
-        let outcome = JobOutcome::failed(&job, error);
-        assert!(persist_outcome(&pool, &job, &outcome, completed_at).await?);
-        let written = state(&pool, job.id).await?;
-        assert_eq!(written.status, expected_status);
-        assert_eq!(written.attempts, attempts);
-        assert_eq!(written.last_error, Some(format!("{error:#}")));
-        assert_eq!(written.payload, before.payload);
-        if expected_status == "queued" {
             assert_eq!(
                 written.run_at,
                 completed_at + chrono::Duration::seconds(120)

@@ -214,13 +214,9 @@ async fn a_job_result_survives_a_writeback_failure() -> anyhow::Result<()> {
             let waiting = if mode == "success" {
                 let waiting = jobs::enqueue(&control, KIND, json!({"mode": "success"})).await?;
                 tokio::time::sleep(Duration::from_millis(300)).await;
-                let (status, attempts): (String, i32) =
-                    sqlx::query_as("SELECT status, attempts FROM jobs WHERE id = $1")
-                        .bind(waiting)
-                        .fetch_one(&control)
-                        .await?;
+                let waiting_state = state(&control, waiting).await?;
                 anyhow::ensure!(
-                    status == "queued" && attempts == 0,
+                    waiting_state.status == "queued" && waiting_state.attempts == 0,
                     "writeback lost its slot"
                 );
                 Some(waiting)
