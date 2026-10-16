@@ -404,7 +404,7 @@ async fn lock_account_organization(
     // 撤权与停用共用组织锁；拿锁后再读账号、数管理员，不能信任请求鉴权时的快照。
     sqlx::query_scalar(
         "SELECT id FROM organizations
-         WHERE id = (SELECT org_id FROM users WHERE id = $1) FOR UPDATE",
+         WHERE id = (SELECT org_id FROM users WHERE id = $1) FOR NO KEY UPDATE",
     )
     .bind(target)
     .fetch_optional(&mut **tx)

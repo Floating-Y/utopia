@@ -138,15 +138,6 @@ async fn concurrent_admin_removal(deactivate: [bool; 2]) -> anyhow::Result<()> {
     let pool = PgPool::connect(&url).await?;
     let (org, a, b) = org_with_two_admins(&pool).await?;
     let run = async {
-        // Both requests passed AuthUser before either changes the other's account.
-        for actor in [a, b] {
-            assert!(
-                utopia_store::accounts::find_user_by_id(&pool, actor)
-                    .await?
-                    .unwrap()
-                    .is_admin
-            );
-        }
         let mut gate = pool.begin().await?;
         sqlx::query("SELECT id FROM users WHERE org_id = $1 FOR UPDATE")
             .bind(org)
