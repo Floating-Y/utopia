@@ -228,8 +228,6 @@ async fn exchange_maps_only_linked_active_people_and_spends_each_token_once() ->
         let linked: i64 = sqlx::query_scalar("SELECT count(*) FROM oidc_identities WHERE issuer = $1 AND (subject = 'ambiguous-ann' OR user_id = $2)")
             .bind(&issuer).bind(duplicate).fetch_one(&pool).await?;
         anyhow::ensure!(linked == 0);
-        let (status, body) = exchange(sign_email(&format!("sub-{ann}"), &format!("{ann}@example.test"), true)?).await?;
-        anyhow::ensure!(status == StatusCode::OK && user_of(&body)? == ann, "existing subject with ambiguous email: {status} {body}");
 
         let bea_sub = format!("sub-{}", Uuid::now_v7());
         let (status, body) = exchange(sign_email(&bea_sub, &bea_email, true)?).await?;

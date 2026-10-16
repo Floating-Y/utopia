@@ -41,7 +41,7 @@ async fn ambiguous_active_emails_leave_accounts_and_identities_unchanged() -> an
                 let result = utopia_store::accounts::account_for_sso(
                     &pool, ISSUER, &format!("new-{first}"), address, "Changed",
                 ).await;
-                assert!(matches!(result, Err(utopia_core::AppError::Conflict(ref reason)) if reason == "Multiple active accounts match the SSO email"));
+                assert!(matches!(result, Err(utopia_core::AppError::CodedConflict { code: "unlinked", ref message }) if message == "Multiple active accounts match the SSO email"));
                 assert_eq!(snapshot().await?, before);
             }
         }

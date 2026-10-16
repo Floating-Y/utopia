@@ -391,8 +391,7 @@ pub async fn account_for_sso(
     display_name: &str,
 ) -> AppResult<Option<User>> {
     let mut tx = pool.begin().await?;
-    // 大小写不同的活动邮箱可以共存；必须先排除歧义，不能优先挑精确匹配或未绑定的账号。
-    // shortcut: 只检查查询快照中的账号；全局邮箱唯一性需要所有开户路径与数据库约束一起治理。
+    // 本次只拒绝快照中已有的歧义；阻止并发开户产生重复邮箱需要另行迁移并处理存量重复。
     let mut active: Vec<User> = sqlx::query_as(
         "SELECT * FROM users WHERE lower(email) = lower($1) AND deactivated_at IS NULL LIMIT 2",
     )
@@ -400,9 +399,10 @@ pub async fn account_for_sso(
     .fetch_all(&mut *tx)
     .await?;
     if active.len() > 1 {
-        return Err(AppError::Conflict(
-            "Multiple active accounts match the SSO email".into(),
-        ));
+        return Err(AppError::CodedConflict {
+            code: "unlinked",
+            message: "Multiple active accounts match the SSO email".into(),
+        });
     }
     let user = match active.pop() {
         Some(u) => u,
