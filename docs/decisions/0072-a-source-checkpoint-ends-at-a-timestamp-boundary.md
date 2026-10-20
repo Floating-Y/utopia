@@ -27,23 +27,24 @@ This follows the [maintainer's decision](https://github.com/deeplethe/utopia/iss
 
 ### GitHub and Jira
 
-Read items in ascending update-time order. Count the existing 200-item
-processing budget and ten-page listing budget as before. When either budget
-is exhausted inside a group, continue reading and processing until that group
-is complete. Stop before consuming the next timestamp group, then save the
-completed group's time as the checkpoint. Reading ahead to identify the next
-group does not make that group consumed.
+Read items in ascending update-time order. Skip items at or before the
+checkpoint before counting either budget. When the 200-item processing budget
+or ten-page listing budget is exhausted inside a group, continue reading and
+processing until that group is complete. Stop before consuming the next
+timestamp group, then save the completed group's time as the checkpoint.
+Reading ahead to identify the next group does not make that group consumed.
 
 For example, if item 200 belongs to a group ending at item 240, consume all
 240 items and leave the next group for the next run. The 1,001-item GitHub
 and 501-item Jira groups above must each arrive in full on the first run.
 
-The next run starts logically after the completed group. Map that boundary
-to each provider's query semantics: GitHub's `since` is exclusive, while the
-current Jira query uses `>=` and formats its lower bound to a minute. Query
-overlap caused by provider precision must neither skip newer items nor trap
-the run in an already consumed prefix. Test the actual query parameters and
-returned timestamps rather than assuming the providers share one boundary.
+The next run consumes only items updated strictly after the checkpoint.
+GitHub's `since` is inclusive in practice, and Jira's `updated >=` bound is
+rounded to the minute, so either provider can return items already consumed.
+Skip every returned item at or before the checkpoint; these items count against
+neither the 200-item processing budget nor the ten-page listing budget.
+Pages containing only skipped items therefore cannot exhaust the listing
+budget. For GitHub, `since` can be the checkpoint plus one second.
 
 Store the completed timestamp on the source, independently of retained sync
 audit rows. Do not derive it from a run's start or finish time, or advance it
@@ -103,12 +104,6 @@ that checkpoints never cross unread data.
 - **Advance to the run's start time after partial work, or use custom
   `doc_time`.** Neither proves that the remaining source changes were consumed.
 
-Revision 2026-10-19: the original draft required hard budgets and persisted
-continuation. The maintainer accepted longer runs for equal-time groups, so
-this revision replaces that design and moves the record from reserved 0067
-to 0072. The suggested 0071 was subsequently taken by
-[PR #1319](https://github.com/deeplethe/utopia/pull/1319).
-
 ## Acceptance
 
 Reuse the real readers and existing HTTP/database fixtures. The implementation
@@ -118,8 +113,11 @@ must demonstrate:
   in the first run, beyond ten pages.
 - Exhausting either budget completes the current group but leaves the next
   group for the next run, with the correct persisted checkpoint and queries.
-- GitHub's exclusive boundary and Jira's minute-level query overlap preserve
-  progress without omissions or duplicate versions and processing jobs.
+- After importing the 1,001-item group at time T, the next run skips any
+  returned items at or before T without charging either budget, imports a
+  later group and advances the checkpoint past T.
+- GitHub's inclusive boundary and Jira's minute-rounded query bound preserve
+  this progress without omissions or duplicate versions and processing jobs.
 - A failed page fetch, detail fetch or write cannot advance the checkpoint;
   retry recovers the whole group. Updates during pagination remain reachable.
 - Custom's 201 changed items finish on the second run; 450 finish over three
@@ -128,5 +126,4 @@ must demonstrate:
   sync. GitHub replacements retain complete discussion content.
 
 Database assertions must run with PostgreSQL/pgvector and
-`UTOPIA_TEST_REQUIRE_DB=1`. This ADR and its index are the only changes in #1213;
-the production fix and these regression tests follow separately.
+`UTOPIA_TEST_REQUIRE_DB=1`.
