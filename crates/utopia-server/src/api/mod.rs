@@ -14,7 +14,7 @@ mod kbs;
 mod mapping_routes;
 mod mcp;
 mod members_routes;
-mod oidc_routes;
+pub mod oidc_routes;
 mod ontology_regression_routes;
 pub(crate) mod ontology_routes;
 mod question_routes;
@@ -196,7 +196,8 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
         .route(
             "/admin/users/{id}",
             axum::routing::delete(admin_routes::deactivate_user)
-                .post(admin_routes::reactivate_user),
+                .post(admin_routes::reactivate_user)
+                .put(admin_routes::set_system_admin),
         )
         // 管理员看得见谁绑了哪个 subject，也能解绑；**不能替人绑定**（0056）
         .route("/admin/oidc/identities", get(oidc_routes::identities))
@@ -473,6 +474,11 @@ pub fn router(state: AppState, cfg: &AppConfig) -> Router {
             "/kbs/{id}/sources/{source_id}/runs",
             get(sources_routes::runs),
         )
+        // 按推送时的 external_id 读回文档（#1276）：id 里可能有 `/`，所以走查询参数
+        .route(
+            "/kbs/{id}/sources/{source_id}/documents/by-external-id",
+            get(documents_routes::by_external_id),
+        )
         .route(
             "/kbs/{id}/sources/{source_id}/re-extract",
             post(sources_routes::re_extract),
@@ -652,7 +658,16 @@ async fn jobs_noop(
 mod rule_metadata_tests;
 
 #[cfg(test)]
+mod system_admin_tests;
+
+#[cfg(test)]
 mod oidc_exchange_tests;
+
+#[cfg(test)]
+mod token_setup_tests;
+
+#[cfg(test)]
+mod token_read_tests;
 
 #[cfg(test)]
 mod rule_expression_tests;

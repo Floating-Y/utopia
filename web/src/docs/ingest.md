@@ -107,7 +107,9 @@ The response tells you what happened:
 { "action": "created" }
 ```
 
-`created` · `updated` · `moved` (same content, new name) · `unchanged` · `marked_missing`.
+`created` · `updated` · `moved` (same content, new name) · `unchanged` · `marked_missing` · `duplicate` (the base already holds this exact content as another document, named by `duplicate_of`, which may be a document in the trash; nothing was created or changed).
+
+With `external_id`, the id is the identity: the same content under a new id never takes over a live id's document. To rename an id, tombstone the old one (`"deleted": true`), then push the new id with the same content; the new id takes over the document, with its history, and answers `moved`.
 
 Example with curl:
 
@@ -156,7 +158,42 @@ Two things to know before wiring a system to it:
 - **Send events, not state.** A row that *is* the current state of a system belongs on a mounted database, read at query time. Pushing it here copies state into the ledger and the two drift.
 - **A new push under the same identity does not close the old statement.** The earlier one becomes stale and goes to review; deciding that an interval ended is done on the typed layer, by alignment and the temporal engine, not by the push.
 
-The response is the API push's: `{ "action": "created" }` · `updated` · `unchanged` · `marked_missing`.
+The response is the API push's: `{ "action": "created" }` · `updated` · `unchanged` · `marked_missing` · `duplicate` (with `duplicate_of`). It is never `moved`: the stored document carries its `external_id`, so two identities never share content.
+
+---
+
+## Reading a pushed document back
+
+An API or Statements source's document can be read back by the identity it was pushed under: its `external_id`, or for an API push without one, its `filename`. The identity goes in the query string, URL-encoded, so it may contain `/`.
+
+```
+GET {your-utopia-base}/api/v1/kbs/{kb_id}/sources/{source_id}/documents/by-external-id?external_id=note-42
+Authorization: Bearer utp_pat_…
+```
+
+The credential is a personal access token (or a signed-in session) of someone who can view the base; a token limited to other bases gets `404`. The source's push token is **not** accepted here, so a leaked push token can only push.
+
+```json
+{
+  "id": "0199…",
+  "external_id": "note-42",
+  "filename": "runbook.md",
+  "mime": "text/plain",
+  "sha256": "9f2c…",
+  "size_bytes": 57,
+  "status": "ready",
+  "doc_time": "2026-08-20T09:00:00Z",
+  "updated_at": "2026-08-20T09:00:04Z",
+  "version": 2,
+  "content": "# Runbook v2 …",
+  "versions": [
+    { "version": 1, "sha256": "41aa…", "size_bytes": 54, "ingested_at": "2026-08-19T10:00:00Z" },
+    { "version": 2, "sha256": "9f2c…", "size_bytes": 57, "ingested_at": "2026-08-20T09:00:04Z" }
+  ]
+}
+```
+
+`content` is the current version's text; older versions are at `GET /api/v1/documents/{id}/content?version=N`. An identity marked "Not in source", a document in the trash or purged, and an identity this source never pushed are all `404`.
 
 ---
 

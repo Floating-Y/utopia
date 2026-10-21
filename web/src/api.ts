@@ -225,10 +225,13 @@ export interface SourceView {
     feed_url?: string;
     content_mode?: "feed" | "full_new_items";
     endpoint?: string;
-    /** github_issues：owner/name */
+    /** github_issues / github_repo：owner/name */
     repo?: string;
     /** github_issues：PR 在 GitHub 模型里也是工单，默认不收 */
     include_pull_requests?: boolean;
+    /** github_repo：给了就整列替换默认的 glob（markdown；隐藏目录、node_modules、vendor） */
+    include?: string[];
+    exclude?: string[];
     /** jira_issues：站点地址，如 https://issues.apache.org/jira */
     base_url?: string;
     /** jira_issues：项目 key，如 KAFKA */
@@ -1071,6 +1074,8 @@ export interface GraphEdge {
   blocked: boolean;
   /** 边上的属性（0037） */
   qualifiers: FactQualifier[];
+  /** 文档的角色词（0044）：不是本体属性，另放一处 */
+  statement_qualifiers: StatementQualifier[];
 }
 
 /** 实体的一个名字（0041）。`canonical` 是面板标题上那个；曾用名在世界轴上有结束 */
@@ -1085,6 +1090,14 @@ export interface NameView {
   valid_to_precision: string | null;
   document_ids: string[];
   evidence_count: number;
+}
+
+/** 开放陈述按文档角色词记的限定（0044）：值或实体 */
+export interface StatementQualifier {
+  role: string;
+  value: unknown | null;
+  entity_id: string | null;
+  entity_name: string | null;
 }
 
 export interface EntityFact {
@@ -1106,6 +1119,8 @@ export interface EntityFact {
   object_value: Record<string, unknown> | null;
   /** 边上的属性（0037） */
   qualifiers: FactQualifier[];
+  /** 文档的角色词（0044）：不是本体属性，另放一处 */
+  statement_qualifiers: StatementQualifier[];
   valid_from: string | null;
   valid_to: string | null;
   /** 读出来的区间（0022），与 GraphEdge 同义：「此刻成立」按它判 */
@@ -1840,6 +1855,12 @@ export const api = {
     request<{ ok: boolean }>(`/api/v1/admin/users/${userId}`, {
       method: "DELETE",
     }),
+  /** 授予或收回系统管理员（#1233） */
+  adminSetSystemAdmin: (userId: string, isAdmin: boolean) =>
+    request<{ ok: boolean }>(`/api/v1/admin/users/${userId}`, {
+      method: "PUT",
+      body: JSON.stringify({ is_admin: isAdmin }),
+    }),
   adminDataSources: () =>
     request<{ data_sources: DataSourceView[] }>("/api/v1/admin/data-sources"),
   adminCreateDataSource: (body: { name: string; conn_string: string }) =>
@@ -2324,12 +2345,13 @@ export const api = {
   /** 上次算出来、还没人表态的提案（0049）。刷新页面靠它，不必重跑模型 */
   storedProposals: (kbId: string) =>
     request<OntologyProposals>(`/api/v1/kbs/${kbId}/ontology/proposals`),
-  /** 一条提案有人表态了。改状态不删行——拒绝留痕，下一轮 Suggest 不再刷回待看 */
+  /** 一条提案有人拒绝了。改状态不删行——拒绝留痕，下一轮 Suggest 不再刷回待看。
+   *  只收拒绝：采纳走 adoptProposal，元素和采纳的状态一起提交（0061 决定 3） */
   decideProposal: (
     kbId: string,
     section: string,
     key: string,
-    status: "adopted" | "rejected",
+    status: "rejected",
     /** 拒绝的理由（0061）：下一轮代理读得到 */
     reason?: string,
   ) =>
@@ -2343,7 +2365,7 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
-  /** 采纳代理的一条提案（0061 决定 3）：服务端建元素、标记、排对齐 */
+  /** 采纳代理的一条提案（0061 决定 3）：元素、回归用例、采纳的状态和后续任务一次提交 */
   adoptProposal: (
     kbId: string,
     section: string,
@@ -2357,7 +2379,11 @@ export const api = {
       parents?: string[];
     },
   ) =>
-    request<{ id: string }>(`/api/v1/kbs/${kbId}/ontology/proposals/adopt`, {
+    request<{
+      id: string;
+      /** 复用时留着没写的形状或类别词，各带人定成了什么：代理读过之后人另定了、和提案不一样的 */
+      skipped: ({ phrase: string } | { kind_word: string })[];
+    }>(`/api/v1/kbs/${kbId}/ontology/proposals/adopt`, {
       method: "POST",
       body: JSON.stringify({ section, key, ...(edits ?? {}) }),
     }),
@@ -2755,7 +2781,8 @@ export const api = {
 
   /** 是否配置了单点登录（0056）。四项环境变量缺一个都是 false——
    *  登录页据此决定要不要露出那个按钮 */
-  oidcStatus: () => request<{ enabled: boolean }>("/api/v1/auth/oidc/status"),
+  oidcStatus: () =>
+    request<{ enabled: boolean; password_login: boolean }>("/api/v1/auth/oidc/status"),
   /** 谁的哪个身份提供方 subject 绑定到了这个部署的哪个账号（只读 + 解绑） */
   oidcIdentities: () =>
     request<{

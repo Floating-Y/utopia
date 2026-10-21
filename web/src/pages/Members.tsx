@@ -3,8 +3,10 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Pencil, Plus, Search } from "lucide-react";
 import { api } from "../api";
 import { S } from "../i18n";
+import { memberChanges } from "./memberChanges";
 import {
   Button,
+  Checkbox,
   Chip,
   DangerConfirm,
   Dialog,
@@ -25,6 +27,7 @@ import {
   cn,
   pageSlice,
 } from "../ui";
+import { fetchMe } from "../authSession";
 
 const ROLES = ["owner", "admin", "editor", "viewer"] as const;
 const ROLE_OPTIONS = ROLES.map((r) => ({ value: r, label: S.members.roles[r] }));
@@ -48,21 +51,27 @@ type Person = {
 function MemberDialog({
   member,
   canDeactivate,
+  canSetAdmin,
+  isSelf,
   busy,
-  onSaveRole,
+  onSave,
   onDeactivate,
   onRemove,
   onClose,
 }: {
   member: Person;
   canDeactivate: boolean;
+  canSetAdmin: boolean;
+  isSelf: boolean;
   busy: boolean;
-  onSaveRole: (role: string) => void;
+  onSave: (changes: ReturnType<typeof memberChanges>) => void;
   onDeactivate: () => void;
   onRemove: () => void;
   onClose: () => void;
 }) {
   const [role, setRole] = useState(member.role);
+  const [isAdmin, setIsAdmin] = useState(member.is_admin);
+  const changes = memberChanges(member, { role, is_admin: isAdmin });
   return (
     <FormDialog
       title={member.display_name}
@@ -71,9 +80,9 @@ function MemberDialog({
       closeLabel={S.members.close}
       saveLabel={S.members.save}
       cancelLabel={S.members.cancel}
-      canSave={role !== member.role}
+      canSave={Object.keys(changes).length > 0}
       busy={busy}
-      onSave={() => onSaveRole(role)}
+      onSave={() => onSave(changes)}
       onCancel={onClose}
       danger={[
         ...(canDeactivate
@@ -96,6 +105,15 @@ function MemberDialog({
           options={ROLE_OPTIONS}
         />
       </Field>
+      {canSetAdmin && (
+        <Checkbox
+          label={S.members.systemAdmin}
+          hint={S.members.systemAdminHint}
+          checked={isAdmin}
+          disabled={isSelf && member.is_admin}
+          onChange={setIsAdmin}
+        />
+      )}
     </FormDialog>
   );
 }
@@ -113,7 +131,7 @@ export function Members({ workspaceId }: { workspaceId: string }) {
   // 角色平时是一行字，点了才变成下拉——同时只有一行在编辑
   // 按角色筛
   const [role, setRole] = useState("all");
-  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const me = useQuery({ queryKey: ["me"], queryFn: fetchMe });
   const [error, setError] = useState<string | null>(null);
 
   const members = useQuery({
@@ -139,6 +157,12 @@ export function Members({ workspaceId }: { workspaceId: string }) {
   const setRole_ = useMutation({
     mutationFn: ({ userId, role }: { userId: string; role: string }) =>
       api.setMemberRole(workspaceId, userId, role),
+    onSuccess: refresh,
+    onError,
+  });
+  const setSystemAdmin = useMutation({
+    mutationFn: ({ userId, isAdmin }: { userId: string; isAdmin: boolean }) =>
+      api.adminSetSystemAdmin(userId, isAdmin),
     onSuccess: refresh,
     onError,
   });
@@ -400,10 +424,13 @@ export function Members({ workspaceId }: { workspaceId: string }) {
         <MemberDialog
           member={editing}
           canDeactivate={!!me.data?.is_admin && me.data.id !== editing.user_id}
-          busy={setRole_.isPending || remove.isPending}
-          onSaveRole={(role) => {
-            if (role !== editing.role)
-              setRole_.mutate({ userId: editing.user_id, role });
+          canSetAdmin={!!me.data?.is_admin}
+          isSelf={me.data?.id === editing.user_id}
+          busy={setRole_.isPending || setSystemAdmin.isPending || remove.isPending}
+          onSave={({ role, is_admin }) => {
+            if (role !== undefined) setRole_.mutate({ userId: editing.user_id, role });
+            if (is_admin !== undefined)
+              setSystemAdmin.mutate({ userId: editing.user_id, isAdmin: is_admin });
             setEditing(null);
           }}
           onDeactivate={() => {
