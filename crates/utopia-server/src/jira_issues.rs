@@ -57,6 +57,7 @@ const FIELDS: &str = "summary,status,issuetype,priority,created,updated,resoluti
 pub struct SearchPage {
     #[serde(default)]
     pub issues: Vec<Issue>,
+    // total 用来识别提前结束的分页，缺失时不能把空页当作完整结果。
     pub total: i64,
 }
 
@@ -457,8 +458,8 @@ fn rate_limit_delay(headers: &reqwest::header::HeaderMap, now: DateTime<Utc>) ->
                 .ok()
                 .map(|at| at.signed_duration_since(now).to_std().unwrap_or_default())
         })?;
-    // 超过一天的指示直接报错，不缩短服务端要求的等待，也不让 worker 无限挂住。
-    (delay <= Duration::from_secs(24 * 60 * 60)).then_some(delay)
+    // shortcut: 长等待走普通失败重试；严格遵循跨任务的 Retry-After 需要持久化调度时间。
+    (delay <= Duration::from_secs(30)).then_some(delay)
 }
 
 /// 工单上的一个时刻，写进正文的样子：到秒、带 `Z`
@@ -499,6 +500,8 @@ mod tests {
         for (value, expected) in [
             ("2", Some(2)),
             ("0", Some(0)),
+            ("30", Some(30)),
+            ("31", None),
             ("-1", None),
             ("broken", None),
             ("86401", None),
@@ -509,17 +512,35 @@ mod tests {
                 expected.map(Duration::from_secs)
             );
         }
-        headers.insert(
-            reqwest::header::RETRY_AFTER,
-            (now + chrono::Duration::seconds(3))
-                .to_rfc2822()
-                .parse()
-                .unwrap(),
-        );
-        assert_eq!(
-            rate_limit_delay(&headers, now),
-            Some(Duration::from_secs(3))
-        );
+        for (seconds, expected) in [(3, Some(3)), (30, Some(30)), (31, None)] {
+            headers.insert(
+                reqwest::header::RETRY_AFTER,
+                (now + chrono::Duration::seconds(seconds))
+                    .to_rfc2822()
+                    .parse()
+                    .unwrap(),
+            );
+            assert_eq!(
+                rate_limit_delay(&headers, now),
+                expected.map(Duration::from_secs)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_rate_limit_wait_fails_without_holding_the_sync_slot() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "31"))
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = reqwest::Url::parse(&server.uri()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(1), fetch_page(&http, url, None))
+            .await
+            .expect("a long Retry-After must return an error without waiting");
+        assert!(result.unwrap_err().to_string().contains("HTTP 429"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -631,7 +652,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_update_that_moves_a_read_issue_to_the_tail_rejects_the_window() {
+    async fn a_moved_issue_rejects_the_window_and_a_stable_retry_recovers_every_issue() {
         let server = MockServer::start().await;
         let moved = Arc::new(AtomicBool::new(false));
         Mock::given(method("GET"))
@@ -659,6 +680,29 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("changed during pagination"));
+
+        let recovered = fetch_window(&http, &server.uri(), "X", None, 100, None)
+            .await
+            .unwrap();
+        let mut keys: Vec<_> = recovered.issues.iter().map(|issue| &issue.key).collect();
+        keys.sort();
+        let mut expected_keys: Vec<_> = (2..=101).map(|number| format!("X-{number}")).collect();
+        expected_keys.sort();
+        assert_eq!(keys, expected_keys.iter().collect::<Vec<_>>());
+        assert_eq!(
+            recovered.checkpoint,
+            Some("2026-01-02T00:00:00Z".parse().unwrap())
+        );
+
+        let next = fetch_window(&http, &server.uri(), "X", recovered.checkpoint, 100, None)
+            .await
+            .unwrap();
+        assert_eq!(next.issues.len(), 1);
+        assert_eq!(next.issues[0].key, "X-1");
+        assert_eq!(
+            next.checkpoint,
+            Some("2026-01-03T00:00:00Z".parse().unwrap())
+        );
     }
 
     #[tokio::test]

@@ -44,8 +44,8 @@ impl Provider {
 struct Feed {
     rows: Vec<Value>,
     fail_page: Option<usize>,
-    fail_detail: bool,
-    oversized_discussion: Option<&'static str>,
+    oversized_discussion: Option<(&'static str, usize)>,
+    fail_detail_page: Option<usize>,
 }
 
 struct Fixture {
@@ -119,13 +119,22 @@ impl Fixture {
                 .map(|(_, value)| value.parse::<usize>().unwrap()).unwrap_or(default);
             let path = request.url.path();
             if path.ends_with("/comments") || path.ends_with("/events") {
-                if feed.fail_detail { return ResponseTemplate::new(503); }
-                if feed.oversized_discussion.is_some_and(|kind| path.ends_with(kind)) {
-                    let row = if path.ends_with("/comments") {
-                        json!({"issue_url":"https://api.github.com/repos/test/repo/issues/1",
-                            "created_at":FIRST, "body":"Full discussion"})
-                    } else { json!({"event":"closed", "created_at":FIRST}) };
-                    return ResponseTemplate::new(200).set_body_json(vec![row; 100]);
+                if let Some((kind, count)) = feed.oversized_discussion {
+                    if path.ends_with(kind) && path.contains("/issues/1/") {
+                        let page = query_number("page", 1);
+                        if feed.fail_detail_page == Some(page) {
+                            return ResponseTemplate::new(503);
+                        }
+                        let rows: Vec<_> = (1..=count).skip((page - 1) * 100).take(100)
+                            .map(|number| if kind == "comments" {
+                                json!({"issue_url":"https://api.github.com/repos/test/repo/issues/1",
+                                    "created_at":FIRST, "body":format!("Discussion item {number}")})
+                            } else {
+                                json!({"event":"closed", "created_at":FIRST,
+                                    "actor":{"login":format!("Discussion item {number}")}})
+                            }).collect();
+                        return ResponseTemplate::new(200).set_body_json(rows);
+                    }
                 }
                 return ResponseTemplate::new(200).set_body_json(json!([]));
             }
@@ -311,25 +320,27 @@ async fn failed_listing_does_not_advance_and_retry_deduplicates() -> anyhow::Res
 }
 
 #[tokio::test]
-async fn github_failed_or_truncated_discussion_preserves_the_document() -> anyhow::Result<()> {
-    let Some(fixture) = Fixture::new(Provider::Github).await? else {
-        return Ok(());
-    };
-    fixture.set_rows(1, 0);
-    fixture.sync().await?;
-    let original: String = sqlx::query_scalar("SELECT sha256 FROM documents WHERE source_id=$1")
-        .bind(fixture.source_id)
-        .fetch_one(&fixture.state.pool)
-        .await?;
-    fixture.feed.lock().unwrap().rows = vec![Provider::Github.row(1, NEXT)];
-    fixture.feed.lock().unwrap().fail_detail = true;
-    assert!(fixture.sync().await.is_err());
-    fixture.feed.lock().unwrap().fail_detail = false;
-    for endpoint in ["comments", "events"] {
-        fixture.feed.lock().unwrap().oversized_discussion = Some(endpoint);
+async fn github_failed_discussion_tail_preserves_the_document_and_recovers() -> anyhow::Result<()> {
+    for (endpoint, count) in [("comments", 1001), ("events", 1100)] {
+        let Some(fixture) = Fixture::new(Provider::Github).await? else {
+            return Ok(());
+        };
+        fixture.set_rows(1, 0);
+        fixture.sync().await?;
+        let original: String =
+            sqlx::query_scalar("SELECT sha256 FROM documents WHERE source_id=$1")
+                .bind(fixture.source_id)
+                .fetch_one(&fixture.state.pool)
+                .await?;
+        {
+            let mut feed = fixture.feed.lock().unwrap();
+            feed.rows = vec![Provider::Github.row(1, NEXT), Provider::Github.row(2, NEXT)];
+            feed.oversized_discussion = Some((endpoint, count));
+            feed.fail_detail_page = Some(11);
+        }
         assert!(
             fixture.sync().await.is_err(),
-            "truncated {endpoint} must not replace a document"
+            "failed {endpoint} tail must not replace a document"
         );
         assert_eq!(fixture.checkpoint().await?, Some(time(FIRST)));
         let current: String = sqlx::query_scalar("SELECT sha256 FROM documents WHERE source_id=$1")
@@ -338,11 +349,23 @@ async fn github_failed_or_truncated_discussion_preserves_the_document() -> anyho
             .await?;
         assert_eq!(current, original);
         assert_eq!(fixture.counts().await?, (1, 1, 1));
+        fixture.feed.lock().unwrap().fail_detail_page = None;
+        fixture.sync().await?;
+        assert_eq!(fixture.checkpoint().await?, Some(time(NEXT)));
+        assert_eq!(fixture.counts().await?, (2, 3, 3));
+        let updated: String = sqlx::query_scalar(
+            "SELECT sha256 FROM documents WHERE source_id=$1 AND external_key='github:test/repo#1'",
+        )
+        .bind(fixture.source_id)
+        .fetch_one(&fixture.state.pool)
+        .await?;
+        let body = String::from_utf8(fixture.state.blob.get(&updated).await?)?;
+        assert!(body.contains(&format!("Discussion item {count}")));
+        fixture.sync().await?;
+        assert_eq!(fixture.counts().await?, (2, 3, 3));
+        fixture.cleanup().await?;
     }
-    fixture.feed.lock().unwrap().oversized_discussion = None;
-    fixture.sync().await?;
-    assert_eq!(fixture.checkpoint().await?, Some(time(NEXT)));
-    fixture.cleanup().await
+    Ok(())
 }
 
 #[tokio::test]

@@ -1,19 +1,12 @@
 # A source checkpoint ends at a timestamp boundary
 
-In progress 2026-10-22 (#1212, #1213): GitHub/Jira timestamp checkpoints implemented;
+In progress 2026-10-23 (#1212, #1213): GitHub/Jira timestamp checkpoints implemented;
 Custom batch progression and recovery remain in #1246.
 
 GitHub/Jira store their watermark in `sources.sync_checkpoint`, initially NULL even
 when successful audit rows exist. Progress and the successful run commit together.
-Readers verify the selected timestamp prefix with a second pass before ingestion;
-changed identities or timestamps fail the run without advancing progress. This adds
-listing requests but does not extend the selected window. It detects observed page
-movement, not an atomic snapshot guarantee from either provider. Comment/event
-histories that exceed GitHub's detail-page limit fail instead of replacing a
-document with truncated history.
-Explicit rate-limit responses wait and retry the current request (up to three
-retries), preserving the in-memory position. Invalid or over-one-day wait hints
-fail the run instead of retrying before the provider permits it.
+The 2026-10-23 revision below records the listing verification, complete GitHub
+discussion reads and bounded waits used by these readers.
 
 ## Context
 
@@ -70,6 +63,45 @@ An unusually large timestamp group makes one run longer. Do not add a separate
 group cap or a group-size alert; use the existing rate-limit backoff. The
 exception applies to source listing and processing, not permission to replace
 a GitHub document with a truncated comments or events history.
+
+### Revision 2026-10-23: verification, complete discussions and bounded waits
+
+Keep the second listing pass before ingestion. Re-read through the selected
+timestamp boundary and compare the listed identities and update times with the
+first pass, including skipped old rows and excluded GitHub PRs. Those rows can
+still move offsets. For example, after reading issues 1–100, updating issue 1
+can move it to the tail; the next page then starts at issue 102 and silently
+misses issue 101. Advancing the checkpoint without detecting that movement can
+make issue 101 unreachable on later incremental runs. Jira has the same risk.
+
+The second pass roughly doubles requests for the selected listing prefix, not
+GitHub's per-ticket comments and events requests. It does not extend the chosen
+window, and changes only beyond that boundary do not invalidate the prefix.
+Comparison ignores ordering within one timestamp group. A changed identity or
+update time fails the run before ingestion, preserves the previous checkpoint,
+sets `last_sync_status` to `failed` and raises the existing `source.sync_failed`
+alert. A later run starts at the same checkpoint. Keep this failure behavior;
+do not add repeated scans inside the same run. This detects observed movement,
+not an atomic snapshot. A continuously changing prefix can repeatedly fail;
+progress under sustained concurrent updates is not guaranteed.
+
+GitHub comments and events must be read to the end, even beyond ten pages.
+The listing budget is not a limit on a selected ticket's discussion history.
+Do not skip a large discussion, return truncated content or advance progress
+past a ticket whose details could not be read completely. A detail-page failure
+keeps the old document and checkpoint. Large discussions therefore increase
+requests, memory use and run duration. Jira's search `total` remains required:
+without it, a premature empty page could be mistaken for a complete group.
+
+For explicit rate limits, keep at most three retries of the current request,
+preserving its in-memory position. Honor a valid wait hint only when it is at
+most 30 seconds per retry, retaining the existing minimum backoff. An invalid
+or longer hint fails the run immediately without sleeping or shortening the
+provider's requested wait. This prevents one long wait from occupying a sync
+slot for hours; it is not a total run-duration limit. The existing job retry
+and source schedule govern later attempts and do not persist `Retry-After`, so
+they do not guarantee that a later attempt waits until the provider's deadline.
+Strict cross-job rate-limit scheduling remains outside this revision.
 
 ### Custom
 
@@ -133,6 +165,12 @@ must demonstrate:
   this progress without omissions or duplicate versions and processing jobs.
 - A failed page fetch, detail fetch or write cannot advance the checkpoint;
   retry recovers the whole group. Updates during pagination remain reachable.
+- A page-moving update rejects the window; once the listing stabilizes, a
+  retry recovers the skipped issue and a later run reads the moved issue.
+- GitHub comments and events beyond ten pages are fully read; failure on a
+  later detail page preserves the old document and checkpoint.
+- A 30-second rate-limit hint is accepted; a 31-second hint returns an error
+  without sleeping or retrying that request. Cover seconds and HTTP-date hints.
 - Custom's 201 changed items finish on the second run; 450 finish over three
   capped runs. Cover an unchanged prefix and no custom update field.
 - The one-time recovery scan preserves existing data and returns to incremental

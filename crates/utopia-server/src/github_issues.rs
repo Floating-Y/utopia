@@ -43,10 +43,11 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-/// 列表预算可在完整时间组边界延长；单张工单的详情仍须在上限内完整读取。
-const MAX_PAGES: u32 = 10;
+/// 列表预算可在完整时间组边界延长；单张工单的详情不受此预算限制。
+const MAX_LISTING_PAGES: u32 = 10;
 const PER_PAGE: u32 = 100;
 const MAX_RATE_LIMIT_RETRIES: u32 = 3;
+const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
 pub struct Issue {
@@ -302,8 +303,8 @@ fn rate_limit_delay(headers: &reqwest::header::HeaderMap, now: DateTime<Utc>) ->
                 .unwrap_or_default(),
         )
     })?;
-    // 离谱的响应头不能挂住 worker；拒绝本次重试，而不是早于服务端允许的时间重发。
-    (delay <= Duration::from_secs(24 * 60 * 60)).then_some(delay)
+    // 长等待不能占住 worker；拒绝本次重试，而不是早于服务端允许的时间重发。
+    (delay <= MAX_RATE_LIMIT_WAIT).then_some(delay)
 }
 
 pub struct IssueWindow {
@@ -410,7 +411,7 @@ async fn fetch_window_pass(
                 window.issues.push(issue);
             }
             if through.is_none()
-                && (window.issues.len() >= item_limit || listing_pages >= MAX_PAGES)
+                && (window.issues.len() >= item_limit || listing_pages >= MAX_LISTING_PAGES)
             {
                 stop_after = Some(updated);
             }
@@ -422,7 +423,7 @@ async fn fetch_window_pass(
     }
 }
 
-/// 详情不能用截断的评论或事件覆盖已有完整正文；第十一页只探测是否溢出。
+/// 详情必须读到末页，不能用截断的评论或事件覆盖已有完整正文。
 pub async fn fetch_all<T: for<'de> Deserialize<'de>>(
     http: &reqwest::Client,
     base: &str,
@@ -430,7 +431,8 @@ pub async fn fetch_all<T: for<'de> Deserialize<'de>>(
     auth: Option<&str>,
 ) -> anyhow::Result<Vec<T>> {
     let mut out = Vec::new();
-    for page in 1..=MAX_PAGES + 1 {
+    let mut page = 1;
+    loop {
         // 自己拼 query：这套 reqwest 特性组合里没有 RequestBuilder::query，
         // 而 sync_custom 本来也是这么拼的
         let mut url = reqwest::Url::parse(base)?;
@@ -445,17 +447,11 @@ pub async fn fetch_all<T: for<'de> Deserialize<'de>>(
         let resp = get_checked(http, url, auth, None).await?;
         let batch: Vec<T> = resp.json().await?;
         let n = batch.len();
-        if page > MAX_PAGES {
-            anyhow::ensure!(
-                n == 0,
-                "GitHub discussion exceeds the ten-page limit; refusing a truncated document"
-            );
-            break;
-        }
         out.extend(batch);
         if n < PER_PAGE as usize {
             break;
         }
+        page += 1;
     }
     Ok(out)
 }
@@ -495,6 +491,8 @@ mod tests {
         for (value, expected) in [
             ("2", Some(2)),
             ("0", Some(0)),
+            ("30", Some(30)),
+            ("31", None),
             ("-1", None),
             ("broken", None),
             ("86401", None),
@@ -516,17 +514,31 @@ mod tests {
             rate_limit_delay(&headers, now),
             Some(Duration::from_secs(3))
         );
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            (now + chrono::Duration::seconds(31))
+                .to_rfc2822()
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(rate_limit_delay(&headers, now), None);
         headers.remove(reqwest::header::RETRY_AFTER);
         headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
         headers.insert(
             "x-ratelimit-reset",
-            (now.timestamp() + 60).to_string().parse().unwrap(),
+            (now.timestamp() + 30).to_string().parse().unwrap(),
         );
         assert_eq!(
             rate_limit_delay(&headers, now),
-            Some(Duration::from_secs(60))
+            Some(Duration::from_secs(30))
         );
         headers.insert("x-ratelimit-remaining", "1".parse().unwrap());
+        assert_eq!(rate_limit_delay(&headers, now), None);
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert(
+            "x-ratelimit-reset",
+            (now.timestamp() + 31).to_string().parse().unwrap(),
+        );
         assert_eq!(rate_limit_delay(&headers, now), None);
     }
 
@@ -594,6 +606,42 @@ mod tests {
                 .is_err()
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn long_rate_limit_waits_fail_without_sleeping_or_retrying() {
+        let server = MockServer::start().await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        for status in [403, 429] {
+            let responses = [
+                ResponseTemplate::new(status).insert_header("Retry-After", "31"),
+                ResponseTemplate::new(status).insert_header(
+                    "Retry-After",
+                    (Utc::now() + chrono::Duration::seconds(60)).to_rfc2822(),
+                ),
+                ResponseTemplate::new(status)
+                    .insert_header("x-ratelimit-remaining", "0")
+                    .insert_header(
+                        "x-ratelimit-reset",
+                        (Utc::now().timestamp() + 60).to_string(),
+                    ),
+            ];
+            for response in responses {
+                server.reset().await;
+                Mock::given(method("GET"))
+                    .respond_with(response)
+                    .mount(&server)
+                    .await;
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    get_checked(&http, server.uri().parse().unwrap(), None, None),
+                )
+                .await
+                .expect("a long rate-limit wait must fail immediately");
+                assert!(result.is_err());
+                assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            }
+        }
     }
 
     #[tokio::test]
@@ -672,7 +720,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_update_that_moves_a_read_issue_to_the_tail_rejects_the_window() {
+    async fn a_moved_issue_rejects_the_window_and_is_read_after_pagination_stabilizes() {
         let server = MockServer::start().await;
         let moved = Arc::new(AtomicBool::new(false));
         Mock::given(method("GET"))
@@ -700,12 +748,31 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("changed during pagination"));
+
+        let recovered = fetch_window(&http, &server.uri(), None, 200, false, None)
+            .await
+            .unwrap();
+        let recovered_numbers: Vec<_> = recovered.issues.iter().map(|issue| issue.number).collect();
+        assert_eq!(recovered_numbers, (2..=201).collect::<Vec<_>>());
+        assert_eq!(
+            recovered.checkpoint,
+            Some("2026-01-02T00:00:00Z".parse().unwrap())
+        );
+        let next = fetch_window(&http, &server.uri(), recovered.checkpoint, 200, false, None)
+            .await
+            .unwrap();
+        assert_eq!(next.issues.len(), 1);
+        assert_eq!(next.issues[0].number, 1);
+        assert_eq!(
+            next.checkpoint,
+            Some("2026-01-03T00:00:00Z".parse().unwrap())
+        );
     }
 
     #[tokio::test]
-    async fn a_discussion_must_not_be_returned_with_an_unread_eleventh_page() {
+    async fn a_complete_discussion_is_read_beyond_ten_pages() {
         let server = MockServer::start().await;
-        for count in [1001, 1000] {
+        for count in [1000, 1001, 1100] {
             server.reset().await;
             Mock::given(method("GET"))
                 .respond_with(move |request: &Request| {
@@ -716,16 +783,33 @@ mod tests {
                 .mount(&server)
                 .await;
             let http = reqwest::Client::builder().no_proxy().build().unwrap();
-            let result = fetch_all::<u32>(&http, &server.uri(), &[], None).await;
-            if count == 1001 {
-                assert!(result
-                    .unwrap_err()
-                    .to_string()
-                    .contains("truncated document"));
-            } else {
-                assert_eq!(result.unwrap().len(), 1000);
-            }
+            let result = fetch_all::<u32>(&http, &server.uri(), &[], None)
+                .await
+                .unwrap();
+            assert_eq!(result, (0..count).collect::<Vec<_>>());
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), count as usize / 100 + 1);
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_discussion_page_does_not_return_a_partial_history() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(|request: &Request| {
+                let page = requested_page(request);
+                if page == 11 {
+                    return ResponseTemplate::new(503);
+                }
+                let rows: Vec<_> = (0..1001).skip((page - 1) * 100).take(100).collect();
+                ResponseTemplate::new(200).set_body_json(rows)
+            })
+            .mount(&server)
+            .await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let result = fetch_all::<u32>(&http, &server.uri(), &[], None).await;
+        assert!(result.unwrap_err().to_string().contains("503"));
+        assert_eq!(server.received_requests().await.unwrap().len(), 11);
     }
 
     fn issue(json: serde_json::Value) -> Issue {
