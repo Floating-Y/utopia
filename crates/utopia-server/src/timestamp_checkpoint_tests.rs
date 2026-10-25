@@ -53,7 +53,6 @@ struct Fixture {
     state: crate::state::AppState,
     source_id: Uuid,
     org_id: Uuid,
-    kb_id: Uuid,
     server: MockServer,
     feed: Arc<Mutex<Feed>>,
     _directory: tempfile::TempDir,
@@ -158,7 +157,6 @@ impl Fixture {
             state,
             source_id,
             org_id,
-            kb_id,
             server,
             feed,
             _directory: directory,
@@ -219,10 +217,6 @@ impl Fixture {
     async fn cleanup(self) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM jobs WHERE payload->>'document_id' IN (SELECT id::text FROM documents WHERE source_id=$1)")
             .bind(self.source_id).execute(&self.state.pool).await?;
-        sqlx::query("DELETE FROM knowledge_bases WHERE id=$1")
-            .bind(self.kb_id)
-            .execute(&self.state.pool)
-            .await?;
         sqlx::query("DELETE FROM organizations WHERE id=$1")
             .bind(self.org_id)
             .execute(&self.state.pool)
@@ -285,17 +279,7 @@ async fn jira_imports_501_equal_time_items_then_skips_the_rounded_prefix() -> an
 #[tokio::test]
 async fn processing_budget_finishes_item_240_and_leaves_the_next_group() -> anyhow::Result<()> {
     for provider in [Provider::Github, Provider::Jira] {
-        let Some(fixture) = Fixture::new(provider).await? else {
-            return Ok(());
-        };
-        fixture.set_rows(240, 1);
-        fixture.sync().await?;
-        assert_eq!(fixture.counts().await?.0, 240);
-        assert_eq!(fixture.checkpoint().await?, Some(time(FIRST)));
-        fixture.sync().await?;
-        assert_eq!(fixture.counts().await?, (241, 241, 241));
-        assert_eq!(fixture.checkpoint().await?, Some(time(NEXT)));
-        fixture.cleanup().await?;
+        large_group_progress(provider, 240).await?;
     }
     Ok(())
 }

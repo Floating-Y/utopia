@@ -438,10 +438,7 @@ fn rate_limit_delay(headers: &reqwest::header::HeaderMap, now: DateTime<Utc>) ->
 mod tests {
     use super::*;
     use serde_json::{json, Value};
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
+    use std::sync::atomic::{AtomicBool, Ordering};
     use wiremock::{matchers::method, Mock, MockServer, Request, ResponseTemplate};
 
     fn listing_row(number: i64, updated: &str) -> Value {
@@ -570,65 +567,70 @@ mod tests {
 
     #[tokio::test]
     async fn a_large_timestamp_group_finishes_and_the_next_run_passes_its_old_pages() {
-        let server = MockServer::start().await;
-        let group_time = "2026-01-02T12:34:56Z";
-        let later_time = "2026-01-02T12:34:57Z";
-        let mut rows: Vec<_> = (1..=501)
-            .map(|number| listing_row(number, group_time))
-            .collect();
-        rows.push(listing_row(502, later_time));
-        Mock::given(method("GET"))
-            .respond_with(move |request: &Request| {
-                let offset = requested_offset(request);
-                let page: Vec<_> = rows.iter().skip(offset).take(50).cloned().collect();
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"issues": page, "total": rows.len()}))
-            })
-            .mount(&server)
-            .await;
-        let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        for limit in [200, usize::MAX] {
-            let first = fetch_window(&http, &server.uri(), "X", None, limit, None)
+        // Jira may return fewer items per page than the requested maxResults.
+        for (group_size, page_size) in [(501, 50), (101, 10)] {
+            let server = MockServer::start().await;
+            let group_time = "2026-01-02T12:34:56Z";
+            let later_time = "2026-01-02T12:34:57Z";
+            let mut rows: Vec<_> = (1..=group_size)
+                .map(|number| listing_row(number, group_time))
+                .collect();
+            rows.push(listing_row(group_size + 1, later_time));
+            Mock::given(method("GET"))
+                .respond_with(move |request: &Request| {
+                    let offset = requested_offset(request);
+                    let page: Vec<_> = rows.iter().skip(offset).take(page_size).cloned().collect();
+                    ResponseTemplate::new(200).set_body_json(
+                        json!({"issues": page, "total": rows.len(), "maxResults": page_size}),
+                    )
+                })
+                .mount(&server)
+                .await;
+            let http = reqwest::Client::builder().no_proxy().build().unwrap();
+            let first = fetch_window(&http, &server.uri(), "X", None, 200, None)
                 .await
                 .unwrap();
-            assert_eq!(first.issues.len(), 501);
+            assert_eq!(first.issues.len(), group_size as usize);
+            assert_eq!(
+                first
+                    .issues
+                    .iter()
+                    .map(|issue| issue.key.clone())
+                    .collect::<Vec<_>>(),
+                (1..=group_size)
+                    .map(|number| format!("X-{number}"))
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(first.checkpoint, Some(group_time.parse().unwrap()));
-        }
-        let next = fetch_window(
-            &http,
-            &server.uri(),
-            "X",
-            Some(group_time.parse().unwrap()),
-            200,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(next.issues.len(), 1);
-        assert_eq!(next.issues[0].key, "X-502");
-        assert_eq!(next.checkpoint, Some(later_time.parse().unwrap()));
-        let requests = server.received_requests().await.unwrap();
-        assert!(requests.iter().any(|request| {
-            requested_offset(request) == 500
-                && request.url.query_pairs().any(|(key, value)| {
-                    key == "jql"
+            let next = fetch_window(&http, &server.uri(), "X", first.checkpoint, 200, None)
+                .await
+                .unwrap();
+            assert_eq!(next.issues.len(), 1);
+            assert_eq!(next.issues[0].key, format!("X-{}", group_size + 1));
+            assert_eq!(next.checkpoint, Some(later_time.parse().unwrap()));
+            let requests = server.received_requests().await.unwrap();
+            assert!(requests.iter().any(|request| {
+                requested_offset(request) == 10 * page_size
+                    && request.url.query_pairs().any(|(key, value)| {
+                        key == "jql"
                     && value
                         == "project = X AND updated >= \"2026-01-02 12:34\" ORDER BY updated ASC"
-                })
-        }));
+                    })
+            }));
+        }
     }
 
     #[tokio::test]
     async fn a_moved_issue_rejects_the_window_and_a_stable_retry_recovers_every_issue() {
         let server = MockServer::start().await;
-        let moved = Arc::new(AtomicBool::new(false));
+        let moved = AtomicBool::new(false);
         Mock::given(method("GET"))
             .respond_with(move |request: &Request| {
                 let offset = requested_offset(request);
                 if offset == 50 {
                     moved.store(true, Ordering::SeqCst);
                 }
-                let mut rows: Vec<_> = (1..=101)
+                let mut rows: Vec<_> = (1..=201)
                     .map(|number| listing_row(number, "2026-01-02T00:00:00Z"))
                     .collect();
                 if moved.load(Ordering::SeqCst) {
@@ -636,24 +638,24 @@ mod tests {
                     rows.push(listing_row(1, "2026-01-03T00:00:00Z"));
                 }
                 let page: Vec<_> = rows.into_iter().skip(offset).take(50).collect();
-                ResponseTemplate::new(200).set_body_json(json!({"issues": page, "total": 101}))
+                ResponseTemplate::new(200).set_body_json(json!({"issues": page, "total": 201}))
             })
             .mount(&server)
             .await;
         let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        let result = fetch_window(&http, &server.uri(), "X", None, 100, None).await;
+        let result = fetch_window(&http, &server.uri(), "X", None, 200, None).await;
         assert!(result
             .err()
             .unwrap()
             .to_string()
             .contains("changed during pagination"));
 
-        let recovered = fetch_window(&http, &server.uri(), "X", None, 100, None)
+        let recovered = fetch_window(&http, &server.uri(), "X", None, 200, None)
             .await
             .unwrap();
         let mut keys: Vec<_> = recovered.issues.iter().map(|issue| &issue.key).collect();
         keys.sort();
-        let mut expected_keys: Vec<_> = (2..=101).map(|number| format!("X-{number}")).collect();
+        let mut expected_keys: Vec<_> = (2..=201).map(|number| format!("X-{number}")).collect();
         expected_keys.sort();
         assert_eq!(keys, expected_keys.iter().collect::<Vec<_>>());
         assert_eq!(
@@ -661,7 +663,7 @@ mod tests {
             Some("2026-01-02T00:00:00Z".parse().unwrap())
         );
 
-        let next = fetch_window(&http, &server.uri(), "X", recovered.checkpoint, 100, None)
+        let next = fetch_window(&http, &server.uri(), "X", recovered.checkpoint, 200, None)
             .await
             .unwrap();
         assert_eq!(next.issues.len(), 1);

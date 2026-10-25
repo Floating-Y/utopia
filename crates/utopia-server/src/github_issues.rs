@@ -433,10 +433,7 @@ pub async fn fetch_all<T: for<'de> Deserialize<'de>>(
 mod tests {
     use super::*;
     use serde_json::{json, Value};
-    use std::sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
-    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use wiremock::{matchers::method, Mock, MockServer, Request, ResponseTemplate};
 
     fn listing_row(number: i64, updated: &str) -> Value {
@@ -476,25 +473,19 @@ mod tests {
                 expected.map(Duration::from_secs)
             );
         }
-        headers.insert(
-            reqwest::header::RETRY_AFTER,
-            (now + chrono::Duration::seconds(3))
-                .to_rfc2822()
-                .parse()
-                .unwrap(),
-        );
-        assert_eq!(
-            rate_limit_delay(&headers, now),
-            Some(Duration::from_secs(3))
-        );
-        headers.insert(
-            reqwest::header::RETRY_AFTER,
-            (now + chrono::Duration::seconds(31))
-                .to_rfc2822()
-                .parse()
-                .unwrap(),
-        );
-        assert_eq!(rate_limit_delay(&headers, now), None);
+        for (seconds, expected) in [(3, Some(3)), (31, None)] {
+            headers.insert(
+                reqwest::header::RETRY_AFTER,
+                (now + chrono::Duration::seconds(seconds))
+                    .to_rfc2822()
+                    .parse()
+                    .unwrap(),
+            );
+            assert_eq!(
+                rate_limit_delay(&headers, now),
+                expected.map(Duration::from_secs)
+            );
+        }
         headers.remove(reqwest::header::RETRY_AFTER);
         headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
         headers.insert(
@@ -637,65 +628,71 @@ mod tests {
     #[tokio::test]
     async fn a_large_timestamp_group_finishes_and_the_next_run_passes_its_old_pages() {
         let server = MockServer::start().await;
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
         let group_time = "2026-01-02T00:00:00Z";
         let later_time = "2026-01-03T00:00:00Z";
-        let mut rows: Vec<_> = (1..=1001)
-            .map(|number| listing_row(number, group_time))
-            .collect();
-        rows.push(listing_row(1002, later_time));
-        Mock::given(method("GET"))
-            .respond_with(move |request: &Request| {
-                let page = requested_page(request);
-                let rows: Vec<_> = rows
-                    .iter()
-                    .skip((page - 1) * 100)
-                    .take(100)
-                    .cloned()
-                    .collect();
-                ResponseTemplate::new(200).set_body_json(rows)
-            })
-            .mount(&server)
-            .await;
-        let http = reqwest::Client::builder().no_proxy().build().unwrap();
-        for limit in [200, usize::MAX] {
-            let first = fetch_window(&http, &server.uri(), None, limit, false, None)
+        // PR 多时先耗尽十页预算；全是工单时先耗尽 200 条预算。
+        for issue_interval in [1, 100] {
+            server.reset().await;
+            let mut rows: Vec<_> = (1..=1001)
+                .map(|number| {
+                    let mut row = listing_row(number, group_time);
+                    if (number - 1) % issue_interval as i64 != 0 {
+                        row["pull_request"] = json!({});
+                    }
+                    row
+                })
+                .collect();
+            rows.push(listing_row(1002, later_time));
+            Mock::given(method("GET"))
+                .respond_with(move |request: &Request| {
+                    let page = requested_page(request);
+                    let rows: Vec<_> = rows
+                        .iter()
+                        .skip((page - 1) * 100)
+                        .take(100)
+                        .cloned()
+                        .collect();
+                    ResponseTemplate::new(200).set_body_json(rows)
+                })
+                .mount(&server)
+                .await;
+            let first = fetch_window(&http, &server.uri(), None, 200, false, None)
                 .await
                 .unwrap();
-            assert_eq!(first.issues.len(), 1001);
+            let numbers: Vec<_> = first.issues.iter().map(|issue| issue.number).collect();
+            assert_eq!(
+                numbers,
+                (1..=1001).step_by(issue_interval).collect::<Vec<_>>()
+            );
             assert_eq!(first.checkpoint, Some(group_time.parse().unwrap()));
-        }
-        // 模拟端点仍返回 inclusive 下界；十页旧记录不应耗尽新一轮的任一预算。
-        let next = fetch_window(
-            &http,
-            &server.uri(),
-            Some(group_time.parse().unwrap()),
-            200,
-            false,
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(next.issues.len(), 1);
-        assert_eq!(next.issues[0].number, 1002);
-        assert_eq!(next.checkpoint, Some(later_time.parse().unwrap()));
-        let requests = server.received_requests().await.unwrap();
-        assert!(requests.iter().all(|request| {
-            request
-                .url
-                .query_pairs()
-                .any(|(key, value)| key == "sort" && value == "updated")
-                && request
+
+            // 模拟端点仍返回 inclusive 下界；十页旧记录不应耗尽新一轮的任一预算。
+            let next = fetch_window(&http, &server.uri(), first.checkpoint, 200, false, None)
+                .await
+                .unwrap();
+            assert_eq!(next.issues.len(), 1);
+            assert_eq!(next.issues[0].number, 1002);
+            assert_eq!(next.checkpoint, Some(later_time.parse().unwrap()));
+            let requests = server.received_requests().await.unwrap();
+            assert!(requests.iter().all(|request| {
+                request
                     .url
                     .query_pairs()
-                    .any(|(key, value)| key == "direction" && value == "asc")
-        }));
-        assert!(requests.iter().any(|request| requested_page(request) == 11));
+                    .any(|(key, value)| key == "sort" && value == "updated")
+                    && request
+                        .url
+                        .query_pairs()
+                        .any(|(key, value)| key == "direction" && value == "asc")
+            }));
+            assert!(requests.iter().any(|request| requested_page(request) == 11));
+        }
     }
 
     #[tokio::test]
     async fn a_moved_issue_rejects_the_window_and_is_read_after_pagination_stabilizes() {
         let server = MockServer::start().await;
-        let moved = Arc::new(AtomicBool::new(false));
+        let moved = AtomicBool::new(false);
         Mock::given(method("GET"))
             .respond_with(move |request: &Request| {
                 let page = requested_page(request);
