@@ -245,7 +245,7 @@ pub fn jql(project: &str, since: Option<DateTime<Utc>>) -> String {
             t.format("%Y-%m-%d %H:%M")
         ));
     }
-    q.push_str(" ORDER BY updated ASC");
+    q.push_str(" ORDER BY updated ASC, key ASC");
     q
 }
 
@@ -614,7 +614,7 @@ mod tests {
                     && request.url.query_pairs().any(|(key, value)| {
                         key == "jql"
                     && value
-                        == "project = X AND updated >= \"2026-01-02 12:34\" ORDER BY updated ASC"
+                        == "project = X AND updated >= \"2026-01-02 12:34\" ORDER BY updated ASC, key ASC"
                     })
             }));
         }
@@ -751,13 +751,14 @@ mod tests {
         let t = DateTime::parse_from_rfc3339("2026-08-30T12:34:56Z")
             .unwrap()
             .with_timezone(&Utc);
-        let q = jql("KAFKA", Some(t));
-        assert!(q.contains("project = KAFKA"), "{q}");
-        assert!(q.contains("updated >= \"2026-08-30 12:34\""), "{q}");
-        assert!(q.contains("ORDER BY updated ASC"), "{q}");
-        // 没有 since 时不该带上 updated 子句。**查子句不查词**——
-        // ORDER BY updated ASC 里也有 "updated"，第一版断言就栽在这上面
-        assert!(!jql("KAFKA", None).contains("updated >="));
+        assert_eq!(
+            jql("KAFKA", Some(t)),
+            "project = KAFKA AND updated >= \"2026-08-30 12:34\" ORDER BY updated ASC, key ASC"
+        );
+        assert_eq!(
+            jql("KAFKA", None),
+            "project = KAFKA ORDER BY updated ASC, key ASC"
+        );
     }
 
     /// **拿真实响应钉住字段形状。**

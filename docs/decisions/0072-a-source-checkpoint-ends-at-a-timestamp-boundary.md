@@ -1,12 +1,6 @@
 # A source checkpoint ends at a timestamp boundary
 
-In progress 2026-10-23 (#1212, #1213): GitHub/Jira timestamp checkpoints implemented;
-Custom batch progression and recovery remain in #1246.
-
-GitHub/Jira store their watermark in `sources.sync_checkpoint`, initially NULL even
-when successful audit rows exist. Progress and the successful run commit together.
-The 2026-10-23 revision below records the listing verification, complete GitHub
-discussion reads and bounded waits used by these readers.
+In progress 2026-10-25 (#1359, migration 0119); open: custom batch progression and recovery (#1397).
 
 ## Context
 
@@ -33,8 +27,14 @@ This follows the [maintainer's decision](https://github.com/deeplethe/utopia/iss
 
 ### GitHub and Jira
 
-Read items in ascending update-time order. Skip items at or before the
-checkpoint before counting either budget. When the 200-item processing budget
+GitHub/Jira store their watermark in `sources.sync_checkpoint`, initially NULL even
+when successful audit rows exist. Progress and the successful run commit together.
+The 2026-10-23 revision below records the listing verification, complete GitHub
+discussion reads and bounded waits used by these readers.
+
+Read items in ascending update-time order. Jira breaks ties by key so an unchanged
+result keeps the same page boundaries. Skip items at or before the checkpoint
+before counting either budget. When the 200-item processing budget
 or ten-page listing budget is exhausted inside a group, continue reading and
 processing until that group is complete. Stop before consuming the next
 timestamp group, then save the completed group's time as the checkpoint.
@@ -118,7 +118,7 @@ incomplete runs. No source-update field, pagination token or saved response is
 added to the custom protocol; `doc_time` remains document time.
 
 The custom fix is being reviewed in
-[PR #1246](https://github.com/deeplethe/utopia/pull/1246). It does not resolve
+[PR #1397](https://github.com/deeplethe/utopia/pull/1397). It does not resolve
 the GitHub and Jira parts of #1212.
 
 ## Recovery and tradeoffs

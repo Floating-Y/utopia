@@ -42,7 +42,7 @@ ten pages, before replacing a document. Explicit rate limits retry the current
 request at most three times with waits of at most 30 seconds each; longer hints
 fail immediately. Later ordinary job retries and source schedules do not preserve
 the provider's `Retry-After` deadline. Jira requires the search `total` to detect
-premature pagination endings. Custom batch progression is separate work in #1246
+premature pagination endings. Custom batch progression is separate work in #1397
 [0072, revision 2026-10-23].
 
 **Statements.** A `statements` source takes the open extraction contract itself (`e`, `s`, `n`) on `POST /sources/{id}/statements`, with the `api` push's identity, versions, tombstones and run history; the payload is the document and its single chunk, and extraction parses the chunk instead of prompting a model, then runs the unchanged path, so a pushed statement is an open statement with the item as its evidence (null offsets) and reaches the typed graph only through alignment. The contract has no slot for a property or a class and unknown keys are refused; a second push under the same identity marks the earlier statements stale rather than closing them; tables belong on a mount, not here [0054].
