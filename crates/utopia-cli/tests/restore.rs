@@ -7,23 +7,24 @@ use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgConnectOptions, ConnectOptions, Connection, Executor, PgConnection};
 
 fn pg_restore_stub() -> PathBuf {
-    static BIN: OnceLock<tempfile::TempDir> = OnceLock::new();
-    let dir = BIN.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
+    static BIN: OnceLock<PathBuf> = OnceLock::new();
+    BIN.get_or_init(|| {
+        // Keep the shared executable with the build artifacts so cargo clean removes it.
+        let binary = std::env::current_exe().unwrap().with_file_name(format!(
+            "utopia-pg-restore-test-{}{}",
+            std::process::id(),
+            std::env::consts::EXE_SUFFIX
+        ));
         let status = Command::new("rustc")
             .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/pg_restore.rs"))
             .arg("-o")
-            .arg(
-                dir.path()
-                    .join(format!("pg_restore{}", std::env::consts::EXE_SUFFIX)),
-            )
+            .arg(&binary)
             .status()
             .unwrap();
         assert!(status.success(), "compile the recording pg_restore double");
-        dir
-    });
-    dir.path()
-        .join(format!("pg_restore{}", std::env::consts::EXE_SUFFIX))
+        binary
+    })
+    .clone()
 }
 
 struct RestoreTest {
@@ -732,7 +733,22 @@ async fn real_postgres_backup_and_restore_require_force_and_preserve_files_on_sq
     assert!(!fixture.target().join("files/old.bin").exists());
     assert!(!fixture.target().join("secret.key").exists());
 
-    connection.execute("CREATE FUNCTION fail_restore(integer) RETURNS integer LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN IF current_setting('restore.test_source', true) IS DISTINCT FROM 'yes' THEN RAISE EXCEPTION 'simulated index restore failure'; END IF; RETURN $1; END $$; SET restore.test_source='yes'; CREATE INDEX restore_failure ON restored (fail_restore(value))").await.unwrap();
+    // The source session permits index creation; pg_restore's new session deliberately fails.
+    connection
+        .execute(
+            "CREATE FUNCTION fail_restore(integer) RETURNS integer
+             LANGUAGE plpgsql IMMUTABLE AS $$
+             BEGIN
+                 IF current_setting('restore.test_source', true) IS DISTINCT FROM 'yes' THEN
+                     RAISE EXCEPTION 'simulated index restore failure';
+                 END IF;
+                 RETURN $1;
+             END $$;
+             SET restore.test_source='yes';
+             CREATE INDEX restore_failure ON restored (fail_restore(value))",
+        )
+        .await
+        .unwrap();
     let failing_archive = fixture.root.path().join("failing-backup.tar.gz");
     assert_success(&backup(&failing_archive));
     connection
