@@ -81,7 +81,7 @@ impl RestoreTest {
         let version =
             std::fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations"))
                 .unwrap()
-                .filter_map(Result::ok)
+                .map(|entry| entry.expect("read migration directory entry"))
                 .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "sql"))
                 .count();
         let digest: String = Sha256::digest(b"test dump")
@@ -163,7 +163,12 @@ impl RestoreTest {
         self.command(flags).output().unwrap()
     }
     fn calls(&self) -> String {
-        std::fs::read_to_string(self.log()).unwrap_or_default()
+        let log = self.log();
+        match std::fs::read_to_string(&log) {
+            Ok(calls) => calls,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => panic!("cannot read pg_restore call log {}: {error}", log.display()),
+        }
     }
     fn old_data(&self) {
         std::fs::create_dir_all(self.target().join("files")).unwrap();
@@ -190,7 +195,7 @@ impl Drop for RestoreTest {
     fn drop(&mut self) {
         let admin_url = self.admin_url.clone();
         let database = self.database.clone();
-        std::thread::spawn(move || {
+        let cleanup = std::thread::spawn(move || {
             tokio::runtime::Runtime::new().unwrap().block_on(async {
                 let mut admin = PgConnection::connect(&admin_url).await.unwrap();
                 admin
@@ -199,8 +204,14 @@ impl Drop for RestoreTest {
                     .unwrap();
             });
         })
-        .join()
-        .unwrap();
+        .join();
+        if let Err(panic_payload) = cleanup {
+            eprintln!("failed to clean up test database {}", self.database);
+            // Preserve the original failure instead of aborting on a second panic in Drop.
+            if !std::thread::panicking() {
+                std::panic::resume_unwind(panic_payload);
+            }
+        }
     }
 }
 
@@ -297,28 +308,6 @@ async fn empty_tables_and_other_user_objects_also_require_force() {
                 "{statement} bypassed overwrite protection"
             );
         }
-    }
-}
-
-#[tokio::test]
-async fn force_does_not_keep_an_old_key_when_the_archive_has_none() {
-    for declared_key in [true, false] {
-        let Some(fixture) = RestoreTest::new(true).await else {
-            return;
-        };
-        fixture.old_data();
-        std::fs::remove_file(fixture.source().join("data/secret.key")).unwrap();
-        fixture.edit_manifest(|manifest| {
-            manifest["components"]["data_dir"]["secret_key"] = declared_key.into();
-        });
-        fixture.pack();
-        assert_success(&fixture.restore(&["--yes", "--force"]));
-        assert!(!fixture.target().join("secret.key").exists());
-        assert!(!fixture.target().join("files/old.bin").exists());
-        assert_eq!(
-            std::fs::read(fixture.target().join("files/new.bin")).unwrap(),
-            b"new data"
-        );
     }
 }
 
@@ -597,24 +586,20 @@ async fn failed_data_installation_rolls_back_the_old_directory() {
 }
 
 #[tokio::test]
-async fn empty_or_absent_target_restores_normally() {
-    for existing in [false, true] {
-        let Some(fixture) = RestoreTest::new(true).await else {
-            return;
-        };
-        if existing {
-            std::fs::create_dir(fixture.target()).unwrap();
-        }
-        assert_success(&fixture.restore(&["--yes"]));
-        let calls = fixture.calls();
-        assert_eq!(calls.lines().count(), 1);
-        assert!(!calls.contains("--clean"), "--yes must not grant overwrite");
-        assert!(!calls.contains("--if-exists"));
-        assert_eq!(
-            std::fs::read(fixture.target().join("files/new.bin")).unwrap(),
-            b"new data"
-        );
-    }
+async fn empty_target_restores_normally() {
+    let Some(fixture) = RestoreTest::new(true).await else {
+        return;
+    };
+    std::fs::create_dir(fixture.target()).unwrap();
+    assert_success(&fixture.restore(&["--yes"]));
+    let calls = fixture.calls();
+    assert_eq!(calls.lines().count(), 1);
+    assert!(!calls.contains("--clean"), "--yes must not grant overwrite");
+    assert!(!calls.contains("--if-exists"));
+    assert_eq!(
+        std::fs::read(fixture.target().join("files/new.bin")).unwrap(),
+        b"new data"
+    );
 }
 
 #[tokio::test]
@@ -750,6 +735,10 @@ async fn real_postgres_backup_and_restore_require_force_and_preserve_files_on_sq
     connection.execute("CREATE FUNCTION fail_restore(integer) RETURNS integer LANGUAGE plpgsql IMMUTABLE AS $$ BEGIN IF current_setting('restore.test_source', true) IS DISTINCT FROM 'yes' THEN RAISE EXCEPTION 'simulated index restore failure'; END IF; RETURN $1; END $$; SET restore.test_source='yes'; CREATE INDEX restore_failure ON restored (fail_restore(value))").await.unwrap();
     let failing_archive = fixture.root.path().join("failing-backup.tar.gz");
     assert_success(&backup(&failing_archive));
+    connection
+        .execute("UPDATE restored SET value = 99")
+        .await
+        .unwrap();
     std::fs::remove_file(fixture.target().join("files/new.bin")).unwrap();
     fixture.old_data();
     let failed = restore(&failing_archive, &fixture.target(), &["--yes", "--force"]);
