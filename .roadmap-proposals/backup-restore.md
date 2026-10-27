@@ -92,22 +92,25 @@ must exist in the archive. `--force` is required for a database containing user
 objects (even empty tables, schemas, functions or types), and for a non-empty
 data directory when the archive includes data. `--yes` only skips confirmation.
 `--dry-run` uses the same preflight, including a read-only database check; it
-extracts temporary staging files but never restores the database or writes the
-target data directory.
+extracts temporary staging files in the current working directory but never
+restores the database or writes the target data directory. After confirmation
+and data preparation, restore repeats component, target-path and overwrite
+checks immediately before running `pg_restore`.
 
 Database-only archives leave the data directory untouched. Otherwise, data is
 prepared separately and replaces the old directory after `pg_restore` succeeds;
 files and keys are never merged with the old directory. A database restore
 failure preserves the old files. With `--force`, `pg_restore --clean --if-exists`
 replaces objects in the archive without removing unrelated database objects.
-`--exit-on-error` stops on the first error.
+Every restore uses `--single-transaction --exit-on-error`: a SQL execution error
+rolls back the database restore instead of leaving partial SQL changes.
 
 Stop all writers and retain a backup of both targets before restoring. Preflight
 does not prevent concurrent changes or later permission and disk failures.
 Database and filesystem restoration are **not atomic**: the database may be
-partially changed on failure. Failed directory installation attempts to put the
-old directory back; a failed rollback reports its retained location. After an
-interruption, also check the target's parent for
+committed before a later directory installation fails. Failed installation
+attempts to put the old directory back; a failed rollback reports its retained
+location. After an interruption, also check the target's parent for
 `.utopia-restore-data-*/previous`. Keep the service stopped, resolve the error,
 and retry the archive with `--force`, or restore both targets from the previous
 backup. Moving old files back alone does not undo database changes.
@@ -197,9 +200,10 @@ binary first, the image second.
 
 Unit tests cover parsing, manifests, versions, checksums and key-copy policy.
 The CLI integration suite runs in `cargo test --workspace`: a recording
-`pg_restore` double checks preflight ordering, overwrite guards, replacement,
-rollback, dry runs and database-only archives. Real `pg_dump`/`pg_restore` tests
-exercise database restoration and failure using disposable test databases.
+`pg_restore` double checks preflight ordering, post-confirmation validation,
+overwrite guards, replacement, rollback, dry runs and database-only archives.
+Real `pg_dump`/`pg_restore` tests exercise database restoration and SQL rollback
+using disposable test databases.
 CI provides PostgreSQL 16 clients; the double also needs `rustc`, and
 archive operations need `tar`.
 

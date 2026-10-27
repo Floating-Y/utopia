@@ -18,6 +18,11 @@ fn main() {
         "pg_restore dump argument must name a file: {}",
         dump.display()
     );
+    assert!(
+        dump.starts_with(std::env::current_dir().unwrap()),
+        "restore staging must stay in current working directory: {}",
+        dump.display()
+    );
     if let Some(old_file) = std::env::var_os("UTOPIA_RESTORE_TEST_OLD_FILE") {
         assert!(
             std::path::Path::new(&old_file).is_file(),

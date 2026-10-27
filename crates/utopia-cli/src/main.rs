@@ -495,7 +495,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// restore
+// 恢复
 // ---------------------------------------------------------------------------
 
 async fn run_restore(args: RestoreArgs) -> anyhow::Result<()> {
@@ -521,7 +521,7 @@ async fn run_restore(args: RestoreArgs) -> anyhow::Result<()> {
 
     let stage = tempfile::Builder::new()
         .prefix(".utopia-restore-")
-        .tempdir()?;
+        .tempdir_in(std::env::current_dir()?)?;
     let manifest_path = stage.path().join("manifest.json");
     let manifest = extract_and_verify(&tar_bin, from, stage.path(), &manifest_path)?;
 
@@ -600,7 +600,8 @@ async fn run_restore(args: RestoreArgs) -> anyhow::Result<()> {
         stage.path(),
         &manifest,
         args.force,
-    )?;
+    )
+    .await?;
 
     tracing::info!(path = %from.display(), "restore complete");
     Ok(())
@@ -678,10 +679,10 @@ fn check_restore_data_target(target: &Path, force: bool) -> anyhow::Result<PathB
             target.display()
         );
     }
-    // Strip trailing separators and `/.` before lstat, which would otherwise follow a link.
+    // 先移除末尾分隔符和 `/.`，否则 lstat 也会跟随符号链接。
     let normalized: PathBuf = target.components().collect();
     let absolute = std::path::absolute(normalized)?;
-    // Missing parents are allowed, but a file or dangling link cannot become a parent.
+    // 允许父目录尚未创建，但文件或悬空链接不能充当父目录。
     let mut resolved = None;
     for parent in absolute.ancestors().skip(1) {
         match std::fs::metadata(parent) {
@@ -696,8 +697,7 @@ fn check_restore_data_target(target: &Path, force: bool) -> anyhow::Result<PathB
                         target.display()
                     );
                 }
-                // Do not keep a path through the old directory: moving it would make
-                // both the prepared files and the rollback path inaccessible.
+                // 固定实际父路径，避免移走旧目录后无法访问暂存文件和回滚路径。
                 resolved = Some(parent.canonicalize()?.join(suffix));
                 break;
             }
@@ -762,8 +762,7 @@ async fn preflight_restore(
     let mut connection = PgConnection::connect(target_db)
         .await
         .context("cannot connect to target database for restore preflight")?;
-    // Objects, including empty tables and schemas, count as data. Namespace dependencies
-    // also cover functions, types, operators and collations without listing each catalog.
+    // 空表、schema 等用户对象也算非空；命名空间依赖还能覆盖函数、类型等对象。
     let nonempty: bool = sqlx::query_scalar(
         "SELECT EXISTS (
             SELECT 1 FROM pg_catalog.pg_namespace n
@@ -791,7 +790,7 @@ async fn preflight_restore(
     Ok(target_data_dir)
 }
 
-fn apply_restore(
+async fn apply_restore(
     pg_restore_bin: &Path,
     target_db: &str,
     target_data_dir: &Path,
@@ -803,8 +802,7 @@ fn apply_restore(
         .components()
         .collect();
     let pg_dump_path = stage.join(dump_relative);
-    // Prepare on the target filesystem before changing the database; the old directory
-    // stays in place throughout pg_restore, even if copying or restoring fails.
+    // 先在目标文件系统准备新目录；复制或数据库恢复失败时，旧目录仍保留原位。
     let prepared = if manifest.components.data_dir.present {
         let parent = target_data_dir
             .parent()
@@ -822,6 +820,22 @@ fn apply_restore(
     } else {
         None
     };
+    // 等待确认和准备文件期间目标可能变化，启动 pg_restore 前必须重新检查。
+    let checked_target = preflight_restore(
+        pg_restore_bin,
+        target_db,
+        target_data_dir,
+        stage,
+        manifest,
+        force,
+    )
+    .await?;
+    // 暂存文件已绑定首次解析的物理路径，复查不能悄悄切换到另一个目标。
+    if checked_target.as_path() != target_data_dir {
+        anyhow::bail!(
+            "target data dir resolved to a different location after confirmation; retry with writers stopped"
+        );
+    }
     tracing::info!(
         archive_pg_dump = %pg_dump_path.display(),
         force,
@@ -832,7 +846,7 @@ fn apply_restore(
         command.args(["--clean", "--if-exists"]);
     }
     let status = command
-        .arg("--exit-on-error")
+        .args(["--exit-on-error", "--single-transaction"])
         .arg("--dbname")
         .arg(target_db)
         .arg(&pg_dump_path)
@@ -840,7 +854,7 @@ fn apply_restore(
         .status()?;
     if !status.success() {
         anyhow::bail!(
-            "pg_restore exited with status {}; database may be in a partial state — verify with a follow-up pg_dump",
+            "pg_restore exited with status {}; SQL restore errors are rolled back; verify the database before retrying",
             status
         );
     }

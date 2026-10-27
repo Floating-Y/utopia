@@ -1,7 +1,9 @@
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::str::FromStr;
-use std::sync::OnceLock;
+use std::sync::{mpsc, OnceLock};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgConnectOptions, ConnectOptions, Connection, Executor, PgConnection};
@@ -9,7 +11,7 @@ use sqlx::{postgres::PgConnectOptions, ConnectOptions, Connection, Executor, PgC
 fn pg_restore_stub() -> PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {
-        // Keep the shared executable with the build artifacts so cargo clean removes it.
+        // 共享替身放在构建目录，由 cargo clean 统一清理。
         let binary = std::env::current_exe().unwrap().with_file_name(format!(
             "utopia-pg-restore-test-{}{}",
             std::process::id(),
@@ -50,13 +52,13 @@ impl RestoreTest {
         .to_lowercase();
         let options = PgConnectOptions::from_str(&admin_url).unwrap();
         let mut admin = PgConnection::connect_with(&options).await.unwrap();
-        // Only this generated database is ever modified or dropped; the guard's DB is untouched.
+        // 只修改和删除本例新建的数据库，不触碰 guard 提供的数据库。
         admin
             .execute(format!("CREATE DATABASE {database}").as_str())
             .await
             .unwrap();
         let mut target_url = options.database(&database).to_url_lossy();
-        // SQLx adds this client-only option; pg_dump/pg_restore use libpq instead.
+        // SQLx 自动追加的客户端参数不被 libpq 的 pg_dump/pg_restore 接受。
         let parameters: Vec<_> = target_url
             .query_pairs()
             .filter(|(name, _)| name != "statement-cache-capacity")
@@ -163,6 +165,50 @@ impl RestoreTest {
     fn restore(&self, flags: &[&str]) -> Output {
         self.command(flags).output().unwrap()
     }
+    fn awaiting_confirmation(&self) -> Child {
+        let mut child = self
+            .command(&[])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let (sender, receiver) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let mut prompt = Vec::new();
+            let result = loop {
+                let mut byte = [0];
+                if let Err(error) = stderr.read_exact(&mut byte) {
+                    break Err(error);
+                }
+                prompt.push(byte[0]);
+                if prompt.ends_with(b"Continue? [y/N] ") {
+                    break Ok(());
+                }
+            };
+            // 超时后接收端会关闭，此时发送失败属于正常清理。
+            let _ = sender.send((result, stderr, prompt));
+        });
+        let error = match receiver.recv_timeout(Duration::from_secs(30)) {
+            Ok((Ok(()), stderr, _)) => {
+                reader.join().unwrap();
+                child.stderr = Some(stderr);
+                return child;
+            }
+            Ok((Err(error), _, prompt)) => {
+                format!("{error}; stderr: {}", String::from_utf8_lossy(&prompt))
+            }
+            Err(error) => format!("confirmation wait failed: {error}"),
+        };
+        drop(receiver);
+        let _ = child.kill();
+        let status = child
+            .wait()
+            .expect("reap restore after confirmation failure");
+        reader.join().unwrap();
+        panic!("restore did not reach confirmation: {error}; child status: {status}");
+    }
     fn calls(&self) -> String {
         let log = self.log();
         match std::fs::read_to_string(&log) {
@@ -208,7 +254,7 @@ impl Drop for RestoreTest {
         .join();
         if let Err(panic_payload) = cleanup {
             eprintln!("failed to clean up test database {}", self.database);
-            // Preserve the original failure instead of aborting on a second panic in Drop.
+            // 清理失败时保留最初的测试错误，避免 Drop 中二次 panic 中止整个进程。
             if !std::thread::panicking() {
                 std::panic::resume_unwind(panic_payload);
             }
@@ -252,6 +298,55 @@ async fn nonempty_directory_requires_force_before_database_restore() {
 }
 
 #[tokio::test]
+async fn database_changed_during_confirmation_is_rejected_before_restore() {
+    let Some(fixture) = RestoreTest::new(false).await else {
+        return;
+    };
+    let mut child = fixture.awaiting_confirmation();
+    let mut connection = fixture.connection().await;
+    connection
+        .execute(
+            "CREATE TABLE confirmation_sentinel (value integer);
+             INSERT INTO confirmation_sentinel VALUES (99)",
+        )
+        .await
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+    assert_failure(
+        &child.wait_with_output().unwrap(),
+        "target database is non-empty",
+    );
+    assert_eq!(
+        fixture.calls(),
+        "",
+        "confirmation must not bypass the database overwrite guard"
+    );
+    let unchanged: i32 = sqlx::query_scalar("SELECT value FROM confirmation_sentinel")
+        .fetch_one(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(unchanged, 99);
+    assert!(!fixture.target().exists());
+}
+
+#[tokio::test]
+async fn data_directory_changed_during_confirmation_is_rejected_before_restore() {
+    let Some(fixture) = RestoreTest::new(true).await else {
+        return;
+    };
+    let mut child = fixture.awaiting_confirmation();
+    fixture.old_data();
+    child.stdin.take().unwrap().write_all(b"y\n").unwrap();
+    assert_failure(&child.wait_with_output().unwrap(), "--force");
+    assert_eq!(
+        fixture.calls(),
+        "",
+        "confirmation must not bypass the directory overwrite guard"
+    );
+    fixture.assert_old_data();
+}
+
+#[tokio::test]
 async fn force_replaces_old_files_and_key_instead_of_merging() {
     let Some(fixture) = RestoreTest::new(true).await else {
         return;
@@ -271,7 +366,12 @@ async fn force_replaces_old_files_and_key_instead_of_merging() {
     assert_success(&output);
     let calls = fixture.calls();
     assert_eq!(calls.lines().count(), 1);
-    for flag in ["--clean", "--if-exists", "--exit-on-error"] {
+    for flag in [
+        "--clean",
+        "--if-exists",
+        "--exit-on-error",
+        "--single-transaction",
+    ] {
         assert!(calls.contains(flag), "{calls}");
     }
     assert!(!fixture.target().join("files/old.bin").exists());
@@ -550,7 +650,7 @@ async fn pg_restore_failure_preserves_the_entire_old_directory() {
         .output()
         .unwrap();
     assert_failure(&output, "pg_restore exited");
-    assert!(String::from_utf8_lossy(&output.stderr).contains("partial"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("rolled back"));
     assert_eq!(fixture.calls().lines().count(), 1);
     fixture.assert_old_data();
 }
@@ -597,6 +697,7 @@ async fn empty_target_restores_normally() {
     assert_eq!(calls.lines().count(), 1);
     assert!(!calls.contains("--clean"), "--yes must not grant overwrite");
     assert!(!calls.contains("--if-exists"));
+    assert!(calls.contains("--single-transaction"));
     assert_eq!(
         std::fs::read(fixture.target().join("files/new.bin")).unwrap(),
         b"new data"
@@ -652,7 +753,7 @@ async fn real_postgres_backup_and_restore_require_force_and_preserve_files_on_sq
         .execute("CREATE TABLE restored (value integer); INSERT INTO restored VALUES (7)")
         .await
         .unwrap();
-    // Environment-key deployments legitimately have no secret.key even when its flag was set.
+    // 使用环境密钥的部署即使要求备份密钥，也可能没有磁盘 secret.key。
     std::fs::remove_file(fixture.source().join("data/secret.key")).unwrap();
     let backup = |archive: &Path| {
         fixture
@@ -733,7 +834,7 @@ async fn real_postgres_backup_and_restore_require_force_and_preserve_files_on_sq
     assert!(!fixture.target().join("files/old.bin").exists());
     assert!(!fixture.target().join("secret.key").exists());
 
-    // The source session permits index creation; pg_restore's new session deliberately fails.
+    // 准备连接的会话设置允许建索引；pg_restore 的新连接没有该设置，索引重建会失败。
     connection
         .execute(
             "CREATE FUNCTION fail_restore(integer) RETURNS integer
@@ -759,13 +860,13 @@ async fn real_postgres_backup_and_restore_require_force_and_preserve_files_on_sq
     fixture.old_data();
     let failed = restore(&failing_archive, &fixture.target(), &["--yes", "--force"]);
     assert_failure(&failed, "pg_restore exited");
-    assert!(String::from_utf8_lossy(&failed.stderr).contains("partial"));
     assert!(String::from_utf8_lossy(&failed.stderr).contains("simulated index restore failure"));
     fixture.assert_old_data();
-    // The SQL failure occurs after table data was restored; there is no cross-system rollback.
-    let partial: i32 = sqlx::query_scalar("SELECT value FROM restored")
+    // 索引重建错误应回滚整次数据库恢复，恢复前的值和原数据目录都必须保留。
+    let unchanged: i32 = sqlx::query_scalar("SELECT value FROM restored")
         .fetch_one(&mut connection)
         .await
         .unwrap();
-    assert_eq!(partial, 7);
+    assert_eq!(unchanged, 99);
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("rolled back"));
 }
